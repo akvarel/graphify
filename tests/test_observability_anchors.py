@@ -41,6 +41,12 @@ def _write_js(tmp_path, name: str, src: str) -> None:
     return p
 
 
+def _fingerprint(template: str) -> str:
+    """Versioned fingerprint material from the Gate 1 contract
+    (contracts-v1.md section 7): sha256(version + "\\n" + canonical_template)."""
+    return hashlib.sha256(f"{CANONICALIZATION_VERSION}\n{template}".encode("utf-8")).hexdigest()
+
+
 # ── classification helpers (pure) ────────────────────────────────────────────
 
 def _first_call(src: str, lang: str = "javascript"):
@@ -162,7 +168,7 @@ def test_extract_static_console_template_node_shape(tmp_path):
     assert a["anchor_kind"] == ANCHOR_KIND_LOG_TEMPLATE
     assert a["canonicalization_version"] == CANONICALIZATION_VERSION
     assert a["canonical_template"] == "job started"
-    assert a["sha256"] == hashlib.sha256(b"job started").hexdigest()
+    assert a["sha256"] == _fingerprint("job started")
     assert a["source_file"] == str(f)
     assert a["source_location"] == "L2"
     md = a["metadata"]
@@ -175,6 +181,24 @@ def test_extract_static_console_template_node_shape(tmp_path):
     assert validate_extraction(result) == []
 
 
+def test_golden_fingerprint_matches_frozen_contract(tmp_path):
+    """Golden regression for the Gate 1 fingerprint contract
+    (contracts-v1.md section 7): sha256(version + "\\n" + canonical_template).
+
+    The hard-coded digest below is the value computed once from the frozen
+    version string ``runtime-code-canonicalization/v1``; it must stay byte-for-
+    byte identical to what Incident Context (fingerprint.fingerprint_template)
+    produces for the same template. Changing either the version constant or the
+    fingerprint material must fail this test until the contract is updated.
+    """
+    f = _write_js(tmp_path, "golden.js", 'function go() {\n  console.info("job started");\n}\n')
+    result = extract_js(f)
+    a = _anchors(result)[0]
+    assert a["canonicalization_version"] == "runtime-code-canonicalization/v1"
+    assert a["canonical_template"] == "job started"
+    assert a["sha256"] == "6131dc16f7109ae8896d6fecd72fff99c4bed345227f94876fd487016a4d8b2a"
+
+
 def test_extract_template_literal_interpolation(tmp_path):
     f = _write_js(tmp_path, "app.ts", "export function go(id: string) {\n  console.warn(`user ${id} ready`);\n}\n")
     result = extract_js(f)
@@ -184,7 +208,7 @@ def test_extract_template_literal_interpolation(tmp_path):
     assert a["anchor_kind"] == ANCHOR_KIND_LOG_TEMPLATE
     assert a["canonical_template"] == "user <arg> ready"
     assert a["metadata"]["language"] == "typescript"
-    assert a["sha256"] == hashlib.sha256(b"user <arg> ready").hexdigest()
+    assert a["sha256"] == _fingerprint("user <arg> ready")
 
 
 def test_extract_dynamic_concatenation_never_guessed(tmp_path):
@@ -378,7 +402,7 @@ def test_build_preserves_anchor_node_attributes(tmp_path):
     assert attrs["anchor_kind"] == ANCHOR_KIND_LOG_TEMPLATE
     assert attrs["canonicalization_version"] == CANONICALIZATION_VERSION
     assert attrs["canonical_template"] == "job started"
-    assert attrs["sha256"] == hashlib.sha256(b"job started").hexdigest()
+    assert attrs["sha256"] == _fingerprint("job started")
     assert attrs["source_location"] == "L2"
     assert attrs["metadata"]["framework"] == "console"
     go_nid = [n["id"] for n in result["nodes"] if n["label"] == "go()"][0]

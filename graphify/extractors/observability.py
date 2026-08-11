@@ -53,7 +53,13 @@ __all__ = [
 # Canonicalization contract for anchor canonical_template / fingerprint values.
 # Bump only when the template/fingerprint derivation rules change in a way that
 # would make values produced under an older version un-comparable with newer
-# ones (the fingerprint is the SHA-256 of the canonical_template bytes).
+# ones. The public fingerprint material is frozen by the Gate 1 contract
+# (contracts-v1.md section 7):
+#
+#   sha256(canonicalization_version + "\n" + canonical_template)
+#
+# The version is mixed into the digest, so a version bump immediately yields
+# different fingerprint values for identical templates.
 CANONICALIZATION_VERSION = "runtime-code-canonicalization/v1"
 
 ANCHOR_KIND_LOG_TEMPLATE = "LOG_TEMPLATE"
@@ -263,9 +269,17 @@ def canonicalize_log_message(kind: str, template: str | None) -> str:
     return "<dynamic-callsite>"
 
 
-def sha256_hex(text: str) -> str:
-    """Hex SHA-256 digest of the canonical template bytes."""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def sha256_hex(canonical_template: str) -> str:
+    """Hex SHA-256 fingerprint of the versioned canonical-template material.
+
+    The digest covers ``canonicalization_version + "\\n" + canonical_template``
+    exactly as frozen by the Gate 1 contract (contracts-v1.md section 7), so the
+    value matches the fingerprint Incident Context computes for the same
+    template. Line, file, repository, runtime values, timestamp, pod, request ID,
+    and tenant are excluded.
+    """
+    material = f"{CANONICALIZATION_VERSION}\n{canonical_template}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def shorten_anchor_label(text: str, width: int = 80) -> str:
