@@ -129,8 +129,10 @@ def load_orders(tenant_id):
     ...
 ```
 
-Run the normal update command to include the lattice in `graph.json`, then
-validate referential integrity separately when needed:
+Run the normal update command to include the lattice in `graph.json`. Projects
+with a `lat.md/` directory are validated automatically after every successful
+update; invalid knowledge makes the command exit nonzero. The standalone command
+is useful for CI checks and structured JSON diagnostics:
 
 ```bash
 graphify update .
@@ -140,8 +142,9 @@ graphify query "tenant isolation constraints"
 ```
 
 `check-knowledge` reports broken or ambiguous wiki links, missing source files,
-and leaf sections marked `require-code-mention: true` that have no matching
-`@lat` reference. The supported format is compatible with the public lat.md
+stale or ambiguous `@lat` code mentions, and leaf sections marked
+`require-code-mention: true` that have no matching `@lat` reference. The
+supported format is compatible with the public lat.md
 heading, wiki-link, source-reference, and code-mention conventions while
 remaining fully local and deterministic.
 
