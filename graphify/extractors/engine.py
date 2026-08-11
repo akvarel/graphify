@@ -2742,9 +2742,10 @@ def _extract_generic(
 
     ``emit_observability_anchors`` additionally extracts runtime-observability
     anchor nodes (``observability_anchor``) for recognized logging callsites in
-    plain JS/TS files (``extract_js``). Deliberately off for container formats
-    (Svelte/Astro/Vue) and every other language: their call-walk differs or
-    fails wholesale, and anchoring there is a later refinement.
+    plain JS/TS files (``extract_js``) and Java files (``extract_java``).
+    Deliberately off for container formats (Svelte/Astro/Vue) and every other
+    language: their call-walk differs or fails wholesale, and anchoring there is
+    a later refinement.
     """
     try:
         mod = importlib.import_module(config.ts_module)
@@ -2830,6 +2831,12 @@ def _extract_generic(
     # `let vm = VM()`) live outside function bodies, so the call-walk never
     # reaches them. Collect (owner_nid, call_node) here and walk them too.
     initializer_nodes: list[tuple[str, object]] = []
+    # Java only: class-scope executable code (static initializer blocks and
+    # field initializer values) collected during the walk for the post-walk
+    # observability-anchor scan. Not part of the call graph — Java field
+    # initializers/static blocks were never walked for call edges — so this is
+    # anchor-only, attributed to the enclosing class node.
+    java_class_scope_nodes: list[tuple[str, object]] = []
     # Ruby include/extend/prepend mixins collected during the node walk (#1668),
     # merged into raw_calls after the call-walk populates it (raw_calls does not
     # exist yet while walk() runs). Resolved cross-file by the Ruby resolver.
@@ -2945,7 +2952,9 @@ def _extract_generic(
     # editing a call on another line never renumbers this anchor.
     obs_line_counters: dict[int, int] = {}
     obs_anchor_ids: set[str] = set()
-    obs_language = "typescript" if path.suffix.lower() in (".ts", ".tsx", ".mts", ".cts") else "javascript"
+    obs_language = "java" if path.suffix.lower() == ".java" else (
+        "typescript" if path.suffix.lower() in (".ts", ".tsx", ".mts", ".cts") else "javascript"
+    )
 
     def _emit_obs_anchor(node, caller_nid: str, caller_label: str) -> None:
         classified = classify_log_callsite(node, source)
@@ -3761,7 +3770,29 @@ def _extract_generic(
                     if target_nid != parent_class_nid:
                         add_edge(parent_class_nid, target_nid, "references",
                                  line, context=ctx)
+            # Observability: a log call inside a field initializer is class-scope
+            # executable code (walk_calls never reaches it — field initializers
+            # are not function bodies), so scan each initializer value for
+            # anchors attributed to the class, mirroring the static-block scan.
+            # The LoggerFactory.getLogger(...) initializer itself is a
+            # method_invocation on a non-logger receiver, so it never anchors.
+            if emit_observability_anchors:
+                for declarator in node.children:
+                    if declarator.type != "variable_declarator":
+                        continue
+                    value = declarator.child_by_field_name("value")
+                    if value is not None:
+                        java_class_scope_nodes.append((parent_class_nid, value))
             return
+
+        if (config.ts_module == "tree_sitter_java"
+                and t == "static_initializer"
+                and parent_class_nid):
+            # Class-scope executable block: collect it for the post-walk anchor
+            # scan (attributed to the class), then fall through so anonymous
+            # classes declared inside it are still walked as usual.
+            if emit_observability_anchors:
+                java_class_scope_nodes.append((parent_class_nid, node))
 
         if (config.ts_module == "tree_sitter_php"
                 and t == "property_declaration"
@@ -4857,8 +4888,14 @@ def _extract_generic(
             # JS/TS observability anchors: every call expression walked inside a
             # function body (incl. #1630 inline closures and class-field
             # initializers) is attributed to its exact enclosing symbol here.
-            if (emit_observability_anchors and node.type == "call_expression"
-                    and config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript")):
+            # Java: every method_invocation in a walked method/constructor body
+            # is attributed the same way (SLF4J calls; the object_creation
+            # constructor callsite is never a log call).
+            if (emit_observability_anchors
+                    and ((node.type == "call_expression"
+                          and config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"))
+                         or (node.type == "method_invocation"
+                             and config.ts_module == "tree_sitter_java"))):
                 _emit_obs_anchor(
                     node, caller_nid, nid_to_label.get(caller_nid, caller_nid)
                 )
@@ -5604,6 +5641,27 @@ def _extract_generic(
                     _scan_module_observability(c)
 
             _scan_module_observability(root)
+
+    # Java class-scope observability anchors: SLF4J calls written in
+    # static initializer blocks or field initializers (class-level
+    # executable code walk_calls never reaches) are attributed to the
+    # enclosing class node, keeping the anchor's enclosing symbol the same
+    # boundary rule the method/constructor walk uses. Method and
+    # constructor bodies are skipped here — walk_calls already walked them
+    # with their exact symbol and must not be double-attributed.
+    if emit_observability_anchors and config.ts_module == "tree_sitter_java":
+        def _scan_java_class_scope(n, owner_nid: str, owner_label: str) -> None:
+            if n.type in ("method_declaration", "constructor_declaration"):
+                return  # walked separately with the exact enclosing symbol
+            if n.type == "method_invocation":
+                _emit_obs_anchor(n, owner_nid, owner_label)
+            for c in n.children:
+                _scan_java_class_scope(c, owner_nid, owner_label)
+
+        for owner_nid, scope_node in java_class_scope_nodes:
+            _scan_java_class_scope(
+                scope_node, owner_nid, nid_to_label.get(owner_nid, owner_nid)
+            )
 
     # ── Clean edges ───────────────────────────────────────────────────────────
     valid_ids = seen_ids
