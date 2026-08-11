@@ -22,6 +22,8 @@ from graphify.extractors.observability import (
     CANONICALIZATION_VERSION,
     classify_log_callsite,
     extract_log_message,
+    normalize_template_whitespace,
+    sha256_hex,
 )
 from graphify.validate import validate_extraction
 
@@ -154,6 +156,62 @@ class TestMessageRecovery:
     def test_loki_message_interpolation(self):
         node, source = _first_call("loki.log({ message: `run ${id} done` });")
         assert extract_log_message(node, source, "bugzero_loki") == ("static", "run <arg> done")
+
+
+# ── whitespace convergence (frozen invariant) ────────────────────────────────
+
+class TestWhitespaceConvergence:
+    """Static source templates and Incident Context runtime messages normalize
+    whitespace identically (contracts-v1.md section 7 whitespace rule), so the
+    canonical template and the versioned fingerprint converge."""
+
+    def test_leading_repeated_whitespace_collapses_in_static_string(self):
+        node, source = _first_call('console.info(" job   started ");')
+        assert extract_log_message(node, source, "console") == ("static", "job started")
+
+    def test_bugzero_style_template_collapses_and_substitutes(self):
+        # Real BugZero-style callsite: ` ⚠️  Graphify evidence index: ${index}`.
+        node, source = _first_call("console.warn(`  ⚠️  Graphify evidence index: ${index}`);")
+        assert extract_log_message(node, source, "console") == (
+            "static",
+            "⚠️ Graphify evidence index: <arg>",
+        )
+
+    def test_multiline_template_collapses_like_runtime(self):
+        node, source = _first_call("logger.warn(`line one\nline two ${id}`);")
+        assert extract_log_message(node, source, "logger") == ("static", "line one line two <arg>")
+
+    def test_normalize_helper_is_idempotent_and_matches_runtime_rule(self):
+        padded = "  ⚠️  Graphify evidence index: 42"
+        assert normalize_template_whitespace(padded) == "⚠️ Graphify evidence index: 42"
+        assert normalize_template_whitespace(normalize_template_whitespace(padded)) == (
+            normalize_template_whitespace(padded)
+        )
+
+    def test_fingerprint_digest_is_whitespace_invariant(self):
+        # sha256_hex must digest the same material as Incident Context's
+        # fingerprint_template for the same canonical template.
+        assert sha256_hex(" job started ") == sha256_hex("job started")
+
+    def test_bugzero_style_anchor_matches_frozen_cross_repo_fingerprint(self, tmp_path):
+        """End-to-end: the anchor emitted for the real BugZero-style callsite
+        carries the collapsed canonical template and the frozen contract digest
+        that Incident Context asserts for the same template."""
+        f = _write_js(
+            tmp_path,
+            "app.ts",
+            "export function go() {\n"
+            "  if (options.verbose) console.warn(`  ⚠️  Graphify evidence index: ${index}`);\n"
+            "}\n",
+        )
+        result = extract_js(f)
+        (anchor,) = _anchors(result)
+        assert anchor["anchor_kind"] == ANCHOR_KIND_LOG_TEMPLATE
+        assert anchor["canonical_template"] == "⚠️ Graphify evidence index: <arg>"
+        assert anchor["sha256"] == _fingerprint("⚠️ Graphify evidence index: <arg>")
+        # Hard-coded frozen-contract digest; Incident Context's
+        # fingerprint_template regression asserts the identical value.
+        assert anchor["sha256"] == "04396c276aefb5be306f09bf25b529ee980335395261223c5e24df3e4714ad50"
 
 
 # ── extraction end to end ────────────────────────────────────────────────────

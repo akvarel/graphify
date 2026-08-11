@@ -74,6 +74,11 @@ Message canonicalization:
 - Plain string literal → raw `string_content` text.
 - Untagged template literal → literal fragments verbatim, every `${...}`
   substitution becomes `<arg>` (`` `user ${id} ready` `` → `user <arg> ready`).
+- Static templates are whitespace-normalized exactly like Incident Context
+  runtime messages (`normalize_template_whitespace`): every run of whitespace
+  collapses to a single space and leading/trailing whitespace is trimmed, so a
+  template literal written with alignment converges with the runtime message
+  it produces and both sides fingerprint the same collapsed text.
 - Tagged template, `+` concatenation, call/identifier/member expressions and
   any other computed message → `DYNAMIC_LOG_CALLSITE` (no template is invented).
 - Calls with no message-bearing argument are not anchored.
