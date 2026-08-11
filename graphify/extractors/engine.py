@@ -4,9 +4,19 @@ from __future__ import annotations
 import hashlib
 import importlib
 from graphify.extractors.base import _LANGUAGE_BUILTIN_GLOBALS, _file_stem, _make_id, _read_text
-from graphify.ids import normalize_id
 from graphify.extractors.models import LanguageConfig
+from graphify.extractors.observability import (
+    ANCHOR_KIND_DYNAMIC_CALLSITE,
+    ANCHOR_KIND_LOG_TEMPLATE,
+    CANONICALIZATION_VERSION,
+    canonicalize_log_message,
+    classify_log_callsite,
+    extract_log_message,
+    sha256_hex,
+    shorten_anchor_label,
+)
 from graphify.extractors.resolution import _resolve_js_import_target
+from graphify.ids import normalize_id
 from graphify.security import sanitize_metadata
 from pathlib import Path
 
@@ -2772,13 +2782,20 @@ def _ruby_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: st
     return True
 
 def _extract_generic(
-    path: Path, config: LanguageConfig, *, source_override: bytes | None = None
+    path: Path, config: LanguageConfig, *, source_override: bytes | None = None,
+    emit_observability_anchors: bool = False,
 ) -> dict:
     """Generic AST extractor driven by LanguageConfig.
 
     ``source_override`` parses the given bytes instead of reading ``path``, while
     still keying nodes/edges off ``path``. Lets container formats (e.g. Vue SFCs)
     mask the wrapper and parse just the embedded ``<script>``.
+
+    ``emit_observability_anchors`` additionally extracts runtime-observability
+    anchor nodes (``observability_anchor``) for recognized logging callsites in
+    plain JS/TS files (``extract_js``). Deliberately off for container formats
+    (Svelte/Astro/Vue) and every other language: their call-walk differs or
+    fails wholesale, and anchoring there is a later refinement.
     """
     try:
         mod = importlib.import_module(config.ts_module)
@@ -2965,6 +2982,84 @@ def _extract_generic(
 
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
+
+    # ── Observability anchors (JS/TS runtime log callsites) ──────────────────
+    # Emitted only for plain .js/.ts/.tsx/.mjs/.cjs/.mts/.cts files
+    # (emit_observability_anchors=True from extract_js); Svelte/Astro/Vue and
+    # other languages keep their pre-anchor output unchanged. One anchor node
+    # per recognized logging CALLSITE — never one per template — so duplicate
+    # templates at distinct callsites stay distinct nodes and identical
+    # templates on the same line get deterministic positional suffixes.
+    # Node ids are deterministic within a repository/revision: the file stem,
+    # the anchor kind, a content digest (static templates), and the line, with
+    # a per-line counter appended only to disambiguate same-line collisions —
+    # editing a call on another line never renumbers this anchor.
+    obs_line_counters: dict[int, int] = {}
+    obs_anchor_ids: set[str] = set()
+    obs_language = "typescript" if path.suffix.lower() in (".ts", ".tsx", ".mts", ".cts") else "javascript"
+
+    def _emit_obs_anchor(node, caller_nid: str, caller_label: str) -> None:
+        classified = classify_log_callsite(node, source)
+        if classified is None:
+            return
+        framework, method = classified
+        msg = extract_log_message(node, source, framework)
+        if msg is None:
+            return  # no message-bearing argument — nothing to anchor
+        kind, canonical = msg
+        is_static = kind == "static" and canonical is not None
+        line = node.start_point[0] + 1
+        anchor_kind = ANCHOR_KIND_LOG_TEMPLATE if is_static else ANCHOR_KIND_DYNAMIC_CALLSITE
+        relation = "emits_log_template" if is_static else "has_dynamic_log_callsite"
+        if is_static:
+            canonical_text = canonicalize_log_message(kind, canonical)
+            digest = sha256_hex(canonical_text)
+            base = _make_id(stem, "observability", "log_template", digest[:12], str(line))
+            label = f"log_template {shorten_anchor_label(canonical_text)}"
+        else:
+            digest = None
+            base = _make_id(stem, "observability", "dynamic_log_callsite", str(line))
+            label = "dynamic_log_callsite"
+        counter = obs_line_counters.get(line, 0) + 1
+        obs_line_counters[line] = counter
+        nid = base if counter == 1 else _make_id(base, str(counter))
+        if nid in obs_anchor_ids:
+            return
+        obs_anchor_ids.add(nid)
+        metadata = {
+            "language": obs_language,
+            "framework": framework,
+            "method": method,
+            "enclosing_symbol": caller_nid,
+            "enclosing_symbol_label": caller_label,
+        }
+        node_dict = {
+            "id": nid,
+            "label": label,
+            "file_type": "code",
+            "type": "observability_anchor",
+            "anchor_kind": anchor_kind,
+            "canonicalization_version": CANONICALIZATION_VERSION,
+            "source_file": str_path,
+            "source_location": f"L{line}",
+            "metadata": sanitize_metadata(metadata),
+        }
+        if is_static and digest is not None:
+            node_dict["canonical_template"] = canonical_text
+            node_dict["sha256"] = digest
+        nodes.append(node_dict)
+        seen_ids.add(nid)  # keep the anchor edge in the clean-edges pass below
+        edges.append({
+            "source": caller_nid,
+            "target": nid,
+            "relation": relation,
+            "confidence": "EXTRACTED",
+            "confidence_score": 1.0,
+            "source_file": str_path,
+            "source_location": f"L{line}",
+            "weight": 1.0,
+            "metadata": sanitize_metadata({"framework": framework, "method": method}),
+        })
 
     def walk(node, parent_class_nid: str | None = None) -> None:
         t = node.type
@@ -4596,12 +4691,15 @@ def _extract_generic(
     # ── Call-graph pass ───────────────────────────────────────────────────────
     label_to_nid: dict[str, str] = {}     # case-sensitive (Ruby, C#, Java, Kotlin, etc.)
     label_to_nid_ci: dict[str, str] = {}  # case-insensitive (PHP functions/classes)
+    # nid -> label, for the observability anchor's enclosing_symbol_label.
+    nid_to_label: dict[str, str] = {}
     # nid -> source_file, so the indirect-dispatch guard can tell a genuine local
     # non-callable (reject) from an import-resolved foreign symbol whose definition
     # lives in another file (defer to the cross-file resolver). JS/TS named imports
     # surface the imported symbol's REAL node into this file's label map.
     nid_to_sf: dict[str, str] = {}
     for n in nodes:
+        nid_to_label[n["id"]] = n["label"]
         nid_to_sf[n["id"]] = str(n.get("source_file") or "")
         if n.get("type") == "namespace":
             continue
@@ -4840,6 +4938,14 @@ def _extract_generic(
             _require_imports_js(node, source, caller_nid, stem, edges, str_path)
 
         if node.type in config.call_types:
+            # JS/TS observability anchors: every call expression walked inside a
+            # function body (incl. #1630 inline closures and class-field
+            # initializers) is attributed to its exact enclosing symbol here.
+            if (emit_observability_anchors and node.type == "call_expression"
+                    and config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript")):
+                _emit_obs_anchor(
+                    node, caller_nid, nid_to_label.get(caller_nid, caller_nid)
+                )
             # JS/TS dynamic imports: await import('./foo.js')
             if config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"):
                 if _dynamic_import_js(node, source, caller_nid, str_path,
@@ -5566,6 +5672,22 @@ def _extract_generic(
                 _scan_js_module_dispatch(c)
 
         _scan_js_module_dispatch(root)
+
+        # Module-scope observability anchors: logging calls written at the top
+        # level of the file (not inside any function/class body) are attributed
+        # to the file node — the same boundary rule _scan_js_module_dispatch
+        # uses, so a method/arrow body is never double-attributed (its calls are
+        # already walked with the exact enclosing symbol above).
+        if emit_observability_anchors:
+            def _scan_module_observability(n) -> None:
+                if n.type in _JS_SCOPE_BOUNDARY:
+                    return  # function / class bodies are walked separately
+                if n.type == "call_expression":
+                    _emit_obs_anchor(n, file_nid, path.name)
+                for c in n.children:
+                    _scan_module_observability(c)
+
+            _scan_module_observability(root)
 
     # ── Clean edges ───────────────────────────────────────────────────────────
     valid_ids = seen_ids

@@ -1259,7 +1259,9 @@ def extract_js(path: Path) -> dict:
         config = _TS_CONFIG
     else:
         config = _JS_CONFIG
-    result = _extract_generic(path, config)
+    result = _extract_generic(
+        path, config, emit_observability_anchors=True
+    )
     if "error" not in result:
         _extract_js_rationale(path, result)
         _rescue_js_dynamic_imports(path, result)
@@ -6743,6 +6745,32 @@ def extract(
         _sf = _item.get("source_file")
         if _sf and "\\" in str(_sf):
             _item["source_file"] = PurePath(_sf).as_posix()
+
+    # Reconcile observability-anchor enclosing_symbol metadata with the
+    # canonical ids: the id-remap passes above rewrite node ids and edge
+    # endpoints (absolute-path-derived ids become repo-relative), but a
+    # metadata value stamped at emit time would otherwise keep the stale
+    # pre-remap id. The anchor's own edge names the canonical enclosing
+    # symbol, so derive the metadata from it — consistency by construction.
+    _anchor_sym_labels: dict[str, str] = {
+        n.get("id", ""): n.get("label", "") for n in all_nodes if isinstance(n, dict)
+    }
+    for n in all_nodes:
+        if n.get("type") != "observability_anchor":
+            continue
+        md = n.get("metadata")
+        if not isinstance(md, dict):
+            continue
+        for e in all_edges:
+            if e.get("target") != n.get("id"):
+                continue
+            if e.get("relation") not in ("emits_log_template", "has_dynamic_log_callsite"):
+                continue
+            src = e.get("source")
+            if isinstance(src, str):
+                md["enclosing_symbol"] = src
+                md["enclosing_symbol_label"] = _anchor_sym_labels.get(src, src)
+            break
 
     return {
         "nodes": all_nodes,
