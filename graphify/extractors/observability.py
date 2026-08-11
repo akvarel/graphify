@@ -31,6 +31,14 @@ Message recovery rules ("never guessed"):
   static message with ``" | "`` and degrades to dynamic if any element is not
   statically recoverable.
 - A call with no message-bearing argument is not anchored at all.
+
+Whitespace rule (frozen convergence invariant): static canonical templates are
+whitespace-normalized with ``normalize_template_whitespace`` — every run of
+whitespace collapses to a single space and leading/trailing whitespace is
+trimmed — exactly like Incident Context's runtime message normalization. A
+template literal written with indentation or alignment therefore converges
+with the runtime message it produces, and both sides fingerprint the same
+collapsed text.
 """
 from __future__ import annotations
 
@@ -47,6 +55,7 @@ __all__ = [
     "classify_log_callsite",
     "extract_log_message",
     "canonicalize_log_message",
+    "normalize_template_whitespace",
     "shorten_anchor_label",
 ]
 
@@ -162,6 +171,17 @@ def _static_string_content(node, source: bytes) -> str | None:
     return None
 
 
+def normalize_template_whitespace(text: str) -> str:
+    """Collapse every run of whitespace to one space and trim the edges.
+
+    This is the single whitespace rule for canonical templates, shared with
+    Incident Context's runtime normalization (frozen convergence invariant).
+    Source literals and runtime messages apply it identically so both forms
+    converge to the same canonical template; the transformation is idempotent.
+    """
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _canonicalize_template(node, source: bytes) -> str:
     """Canonical template of an untagged template literal: literal fragments
     verbatim, every ``${...}`` substitution collapsed to ``<arg>``."""
@@ -244,7 +264,9 @@ def extract_log_message(
 
     Returns ``("static", canonical_template)``, ``("dynamic", None)``, or None
     when the callsite carries no recoverable message argument (then it is not
-    anchored at all).
+    anchored at all).  Static templates are whitespace-normalized exactly like
+    Incident Context runtime messages (``normalize_template_whitespace``), so
+    source and runtime forms converge to the same canonical template.
     """
     args = node.child_by_field_name("arguments")
     if args is None:
@@ -253,8 +275,12 @@ def extract_log_message(
     if not named:
         return None
     if framework == "bugzero_loki":
-        return _extract_loki_message(named[0], source)
-    return _classify_message_expr(named[0], source)
+        kind, template = _extract_loki_message(named[0], source)
+    else:
+        kind, template = _classify_message_expr(named[0], source)
+    if kind == "static" and template is not None:
+        template = normalize_template_whitespace(template)
+    return kind, template
 
 
 def canonicalize_log_message(kind: str, template: str | None) -> str:
@@ -275,10 +301,14 @@ def sha256_hex(canonical_template: str) -> str:
     The digest covers ``canonicalization_version + "\\n" + canonical_template``
     exactly as frozen by the Gate 1 contract (contracts-v1.md section 7), so the
     value matches the fingerprint Incident Context computes for the same
-    template. Line, file, repository, runtime values, timestamp, pod, request ID,
-    and tenant are excluded.
+    template.  Line, file, repository, runtime values, timestamp, pod, request
+    ID, and tenant are excluded.  The template is whitespace-normalized before
+    hashing (``normalize_template_whitespace``), matching Incident Context's
+    ``fingerprint_template``, so a padded source literal and its runtime
+    message always yield the same digest.
     """
-    material = f"{CANONICALIZATION_VERSION}\n{canonical_template}"
+    normalized = normalize_template_whitespace(canonical_template)
+    material = f"{CANONICALIZATION_VERSION}\n{normalized}"
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
