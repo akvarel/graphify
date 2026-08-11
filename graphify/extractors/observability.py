@@ -1,10 +1,11 @@
-"""Observability-callsite classification for JS/TS static log callsites.
+"""Observability-callsite classification for JS/TS and Java static log callsites.
 
 Runtime-observability anchors are extracted from plain ``.js``/``.ts``/``.tsx``/
-``.mjs``/``.cjs``/``.mts``/``.cts`` files (``extract_js``) as dedicated
-``observability_anchor`` nodes connected to their enclosing symbol. This module
-holds the pure, unit-testable helpers: recognizing a logging call and recovering
-a *static* first-message template when one exists.
+``.mjs``/``.cjs``/``.mts``/``.cts`` files (``extract_js``) and ``.java`` files
+(``extract_java``) as dedicated ``observability_anchor`` nodes connected to
+their enclosing symbol. This module holds the pure, unit-testable helpers:
+recognizing a logging call and recovering a *static* first-message template
+when one exists.
 
 Supported frameworks (deliberately conservative, no guessing):
 
@@ -17,10 +18,18 @@ Supported frameworks (deliberately conservative, no guessing):
   ``<loki>.push([{...}])`` where the receiver's final identifier segment starts
   with ``loki`` (``loki``, ``lokiClient``, ``LokiClient``, ``loki_client``) and
   the payload is an object/array literal carrying a ``message`` property.
+- ``slf4j``: Java member calls ``<recv>.debug/info/warn/error(...)`` (tree-sitter
+  ``method_invocation``) where the receiver's final identifier segment is
+  ``logger`` or ``log`` (any case) — a plain ``log``/``logger`` identifier,
+  ``this.logger`` field access, or ``Class.log`` static field access. A computed
+  receiver (``getLogger()``) is never a match.
 
 Message recovery rules ("never guessed"):
 
 - A literal string argument is a static template (raw ``string_content`` text).
+  For ``slf4j``, every SLF4J ``{}`` placeholder in that literal canonicalizes
+  to ``<arg>`` (``log.info("Booking created. COR_ID: {}", id)`` ->
+  ``Booking created. COR_ID: <arg>``).
 - A template literal with no tag is static: every ``${...}`` substitution
   becomes ``<arg>`` (```` `user ${id} ready` ```` -> ``user <arg> ready``).
 - A tagged template, a ``+`` concatenation, a call/identifier/member expression
@@ -80,7 +89,9 @@ _LOG_LEVEL_METHODS = frozenset({"debug", "info", "warn", "error"})
 _CONSOLE_RECEIVER = "console"
 
 # Common logger receivers: the final identifier segment of the receiver must be
-# `logger` or `log` (case-insensitive) — pino/winston/NestJS-style instances.
+# `logger` or `log` (case-insensitive) — pino/winston/NestJS-style instances
+# and Java SLF4J loggers (logback/Log4j/Lombok @Slf4j all name the field `log`
+# or `logger`).
 _LOGGER_RECEIVER_RE = re.compile(r"^(?:logger|log)$", re.IGNORECASE)
 
 # BugZero LokiClient instances: `loki`, `lokiClient`, `LokiClient`,
@@ -120,28 +131,66 @@ def _receiver_final_segment(obj, source: bytes) -> str | None:
     return None
 
 
+def _java_receiver_final_segment(obj, source: bytes) -> str | None:
+    """Final identifier segment of a Java ``method_invocation`` receiver.
+
+    ``log``/``logger`` -> itself; ``this.logger`` -> ``logger`` (field access
+    on ``this``); ``Service.LOG`` -> ``LOG`` (static field access on a plain
+    class name). Anything computed — a call result (``getLogger()``), a method
+    chain (``ctx.get().log``), an array access — -> None (never guessed). The
+    final-segment regex (``^log|logger$``) filters the rest, so arbitrary
+    fields like ``client.info`` never classify.
+    """
+    if obj is None:
+        return None
+    if obj.type == "identifier":
+        return _read_text(obj, source)
+    if obj.type == "field_access":
+        owner = obj.child_by_field_name("object")
+        field = obj.child_by_field_name("field")
+        if owner is None or field is None or field.type != "identifier":
+            return None
+        # `this.logger` and static `Class.log` are conservative; any other
+        # owner shape (a call result, a chain) is computed.
+        if owner.type in ("this", "identifier"):
+            return _read_text(field, source)
+        return None
+    return None
+
+
 def classify_log_callsite(node, source: bytes) -> tuple[str, str] | None:
     """Return ``(framework, method)`` when ``node`` is a recognized logging
-    call, else None. ``node`` must be a tree-sitter ``call_expression``."""
-    if node is None or node.type != "call_expression":
+    call, else None. ``node`` must be a tree-sitter ``call_expression``
+    (JS/TS) or ``method_invocation`` (Java)."""
+    if node is None:
         return None
-    fn = node.child_by_field_name("function")
-    if fn is None or fn.type != "member_expression":
+    if node.type == "call_expression":
+        fn = node.child_by_field_name("function")
+        if fn is None or fn.type != "member_expression":
+            return None
+        prop = fn.child_by_field_name("property")
+        obj = fn.child_by_field_name("object")
+        if prop is None or obj is None:
+            return None
+        method = _read_text(prop, source)
+        if not method:
+            return None
+        recv = _receiver_final_segment(obj, source)
+        if recv == _CONSOLE_RECEIVER and method in _LOG_LEVEL_METHODS:
+            return ("console", method)
+        if recv is not None and _LOGGER_RECEIVER_RE.match(recv) and method in _LOG_LEVEL_METHODS:
+            return ("logger", method)
+        if recv is not None and _LOKI_RECEIVER_RE.match(recv) and method in _LOKI_METHODS:
+            return ("bugzero_loki", method)
         return None
-    prop = fn.child_by_field_name("property")
-    obj = fn.child_by_field_name("object")
-    if prop is None or obj is None:
+    if node.type == "method_invocation":
+        method = _read_text(node.child_by_field_name("name"), source)
+        if not method or method not in _LOG_LEVEL_METHODS:
+            return None
+        recv = _java_receiver_final_segment(node.child_by_field_name("object"), source)
+        if recv is not None and _LOGGER_RECEIVER_RE.match(recv):
+            return ("slf4j", method)
         return None
-    method = _read_text(prop, source)
-    if not method:
-        return None
-    recv = _receiver_final_segment(obj, source)
-    if recv == _CONSOLE_RECEIVER and method in _LOG_LEVEL_METHODS:
-        return ("console", method)
-    if recv is not None and _LOGGER_RECEIVER_RE.match(recv) and method in _LOG_LEVEL_METHODS:
-        return ("logger", method)
-    if recv is not None and _LOKI_RECEIVER_RE.match(recv) and method in _LOKI_METHODS:
-        return ("bugzero_loki", method)
     return None
 
 
@@ -203,7 +252,7 @@ def _classify_message_expr(expr, source: bytes) -> tuple[str, str | None]:
     e = _unwrap(expr)
     if e is None:
         return ("dynamic", None)
-    if e.type == "string":
+    if e.type in ("string", "string_literal"):
         content = _static_string_content(e, source)
         return ("static", content if content is not None else "")
     if e.type == "template_string":
@@ -257,6 +306,17 @@ def _extract_loki_message(arg, source: bytes) -> tuple[str, str | None]:
     return ("dynamic", None)  # call / identifier / member — computed at runtime
 
 
+def _slf4j_placeholders(text: str) -> str:
+    """Canonicalize SLF4J ``{}`` placeholders to ``<arg>`` in a static template.
+
+    The literal replacement is exact: no regex, no guessing, and text that
+    merely contains ``{}`` (e.g. a JSON snippet in a message) canonicalizes
+    like any other placeholder — the same position-independent rule the
+    runtime canonicalization applies.
+    """
+    return text.replace("{}", "<arg>")
+
+
 def extract_log_message(
     node, source: bytes, framework: str
 ) -> tuple[str, str | None] | None:
@@ -266,7 +326,10 @@ def extract_log_message(
     when the callsite carries no recoverable message argument (then it is not
     anchored at all).  Static templates are whitespace-normalized exactly like
     Incident Context runtime messages (``normalize_template_whitespace``), so
-    source and runtime forms converge to the same canonical template.
+    source and runtime forms converge to the same canonical template.  For
+    ``slf4j``, SLF4J ``{}`` placeholders are canonicalized to ``<arg>`` before
+    the whitespace rule so the source template and the runtime message
+    fingerprint the same material.
     """
     args = node.child_by_field_name("arguments")
     if args is None:
@@ -279,6 +342,8 @@ def extract_log_message(
     else:
         kind, template = _classify_message_expr(named[0], source)
     if kind == "static" and template is not None:
+        if framework == "slf4j":
+            template = _slf4j_placeholders(template)
         template = normalize_template_whitespace(template)
     return kind, template
 

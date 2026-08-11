@@ -1751,7 +1751,7 @@ def extract_vue(path: Path) -> dict:
 
 def extract_java(path: Path) -> dict:
     """Extract classes, interfaces, methods, constructors, and imports from a .java file."""
-    return _extract_generic(path, _JAVA_CONFIG)
+    return _extract_generic(path, _JAVA_CONFIG, emit_observability_anchors=True)
 
 
 def _is_spock_file(path: Path, ts_result: dict) -> bool:
