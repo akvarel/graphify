@@ -27,7 +27,7 @@ Emitted per recognized logging **callsite** (never per template):
   "source_file": "<repo-relative path>",
   "source_location": "L<line>",
   "canonical_template": "<canonical template>",
-  "sha256": "<hex SHA-256 of canonical_template>",
+  "sha256": "<hex SHA-256 of canonicalization_version + \"\\n\" + canonical_template>",
   "metadata": {
     "language": "typescript" | "javascript",
     "framework": "console" | "logger" | "bugzero_loki",
@@ -85,7 +85,7 @@ and every non-JS/TS language.
 ## Node IDs (deterministic, no callsite collapsing)
 
 `make_id(<file stem>, "observability", ("log_template" | "dynamic_log_callsite"),
-[<first 12 hex of sha256(canonical_template)>], <line>)`, with a per-line
+[<first 12 hex of sha256(canonicalization_version + "\\n" + canonical_template)>], <line>)`, with a per-line
 counter suffix appended only to disambiguate same-line collisions. Within a
 revision IDs are fully deterministic; separate callsites (including duplicate
 templates at different lines, and two calls on the same line) always get
@@ -130,6 +130,11 @@ stale pre-remap id.
   function, module-scope file node), dynamic calls in methods, out-of-scope
   patterns not anchored, deterministic IDs across runs, container formats not
   anchored, batch-extract metadata reconciliation;
+- golden fingerprint regression: the `sha256` value for a fixed template
+  (`job started`) matches the hard-coded digest frozen by the Gate 1 contract
+  (`sha256(canonicalization_version + "\\n" + canonical_template)`), so a change
+  to either the version constant or the fingerprint material fails until the
+  contract is updated;
 - build/export round-trip preserves anchor attributes and the
   `emits_log_template` edge;
 - reindex deletion: re-extracting a changed file drops its stale anchor
