@@ -56,7 +56,7 @@ def test_js_text_templates_cover_constants_interpolation_duplicates_and_filterin
 
     owners = {e["target"]: e["source"] for e in _template_edges(result)}
     file_node = next(n for n in result["nodes"] if n["label"] == "app.ts")
-    render_node = next(n for n in result["nodes"] if n["label"] == "render")
+    render_node = next(n for n in result["nodes"] if n["label"] == "render()")
     assert owners[greeting["id"]] == file_node["id"]
     assert any(e["relation"] == "defines_text" and e["target"] == greeting["id"] for e in _template_edges(result))
     assert owners[next(t for t in templates if t["canonical_template"] == "Hello <arg>")["id"]] == render_node["id"]
