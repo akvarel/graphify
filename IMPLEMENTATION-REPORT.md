@@ -30,7 +30,7 @@ Emitted per recognized logging **callsite** (never per template):
   "sha256": "<hex SHA-256 of canonicalization_version + \"\\n\" + canonical_template>",
   "metadata": {
     "language": "typescript" | "javascript",
-    "framework": "console" | "logger" | "bugzero_loki",
+    "framework": "console" | "logger" | "loki_client",
     "method": "debug" | "info" | "warn" | "error" | "log" | "push",
     "enclosing_symbol": "<canonical nid of enclosing function/method/file>",
     "enclosing_symbol_label": "<label of the enclosing symbol>"
@@ -63,7 +63,7 @@ never double-attributed).
 - **logger**: member calls `<recv>.debug/info/warn/error(...)` whose receiver's
   final identifier segment is `logger` or `log` (case-insensitive), e.g.
   pino/winston `logger.info(...)`, NestJS `this.logger.warn(...)`.
-- **bugzero_loki** (BugZero `LokiClient`): `<loki>.log({ message: ... })` and
+- **loki_client** (Loki-compatible client): `<loki>.log({ message: ... })` and
   `<loki>.push([{ message: ... }, ...])` where the receiver's final identifier
   segment starts with `loki` (`loki`, `lokiClient`, `LokiClient`,
   `loki_client`). Recovered from the object literal's `message` value; the
@@ -168,7 +168,7 @@ Broader validation:
 - `console.log` / `logger.log` are deliberately not anchored yet (method sets
   per slice scope); `console.trace`/`table` and similar are not covered.
 - Svelte/Astro/Vue script blocks and non-JS/TS languages are out of scope.
-- BugZero `LokiClient` calls whose payload is built by a helper
+- Loki-compatible client calls whose payload is built by a helper
   (`loki.log(entry("info", "job started"))`) are correctly dynamic — the
   message is only statically recoverable when the object/array literal is
   written inline.
