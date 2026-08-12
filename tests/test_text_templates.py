@@ -120,3 +120,92 @@ def test_php_text_templates_cover_constants_interpolation_and_filters(tmp_path):
     canonical = [t["canonical_template"] for t in _templates(result)]
     assert canonical == ["Page title", "Hello <arg>"]
     assert next(t for t in _templates(result) if t["canonical_template"] == "Page title")["metadata"]["bound_name"] == "TITLE"
+
+
+def test_text_templates_skip_keys_annotations_types_and_log_descendants(tmp_path):
+    js = tmp_path / "edge.ts"
+    js.write_text(
+        "const obj = {\"keyName\": \"Value text\", propName: \"Another value\"};\n"
+        "class C { @Dec(\"anno\") m(){} }\n"
+        "type T = \"literal-type\";\n"
+        "console.log(\"outer\", format(\"inner literal\"));\n",
+        encoding="utf-8",
+    )
+    js_canonical = [t["canonical_template"] for t in _templates(extract_js(js))]
+    assert "keyName" not in js_canonical
+    assert "anno" not in js_canonical
+    assert "literal-type" not in js_canonical
+    assert "outer" not in js_canonical
+    assert "inner literal" not in js_canonical
+    assert "Value text" in js_canonical
+    assert "Another value" in js_canonical
+
+    py = tmp_path / "edge.py"
+    py.write_text(
+        "from typing import Literal, Annotated\n"
+        "MODE: Literal[\"fast\"] = \"fast\"\n"
+        "def f(x: Annotated[str, \"meta\"]):\n"
+        "    d = {\"key\": \"value text\"}\n"
+        "    logging.info(\"outer %s\", format(\"inner literal\"))\n",
+        encoding="utf-8",
+    )
+    py_canonical = [t["canonical_template"] for t in _templates(extract_python(py))]
+    assert py_canonical.count("fast") == 1
+    assert "meta" not in py_canonical
+    assert "key" not in py_canonical
+    assert "outer <arg>" not in py_canonical
+    assert "inner literal" not in py_canonical
+    assert "value text" in py_canonical
+
+    java = tmp_path / "Edge.java"
+    java.write_text(
+        "class Edge {\n"
+        "  @Named(\"bean\") String f;\n"
+        "  void m(String x) {\n"
+        "    var map = Map.of(\"key\", \"value text\");\n"
+        "    logger.info(\"outer {}\", format(\"inner literal\"));\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    java_canonical = [t["canonical_template"] for t in _templates(extract_java(java))]
+    assert "bean" not in java_canonical
+    assert "outer <arg>" not in java_canonical
+    assert "inner literal" not in java_canonical
+    assert "value text" in java_canonical
+
+    php = tmp_path / "edge.php"
+    php.write_text(
+        "<?php\n"
+        "#[Route(\"/path\")] function f($x) {\n"
+        "  $arr = [\"key\" => \"value text\"];\n"
+        "  error_log(sprintf(\"inner %s\", $x));\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    php_canonical = [t["canonical_template"] for t in _templates(extract_php(php))]
+    assert "/path" not in php_canonical
+    assert "key" not in php_canonical
+    assert "inner %s" not in php_canonical
+    assert "value text" in php_canonical
+
+
+def test_concatenated_templates_preserve_all_literal_fragments(tmp_path):
+    js = tmp_path / "concat.ts"
+    js.write_text("const msg = \"A \" + id + \" B\";\n", encoding="utf-8")
+    assert [t["canonical_template"] for t in _templates(extract_js(js))] == ["A <arg> B"]
+
+    py = tmp_path / "concat.py"
+    py.write_text("msg = \"A \" + id + \" B\"\n", encoding="utf-8")
+    assert [t["canonical_template"] for t in _templates(extract_python(py))] == ["A <arg> B"]
+
+    java = tmp_path / "Concat.java"
+    java.write_text(
+        "class Concat { void m(String id) { String msg = \"A \" + id + \" B\"; } }\n",
+        encoding="utf-8",
+    )
+    assert [t["canonical_template"] for t in _templates(extract_java(java))] == ["A <arg> B"]
+
+    php = tmp_path / "concat.php"
+    php.write_text("<?php $msg = \"A \" . $id . \" B\";\n", encoding="utf-8")
+    assert [t["canonical_template"] for t in _templates(extract_php(php))] == ["A <arg> B"]
