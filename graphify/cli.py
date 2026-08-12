@@ -1060,6 +1060,99 @@ def dispatch_command(cmd: str) -> None:
         )
         _touch_query_stamp(gp)
         print(_result)
+    elif cmd == "semantic":
+        from graphify.semantic_search import (
+            DEFAULT_MODEL,
+            FastEmbedder,
+            SemanticDependencyMissing,
+            SemanticIndexMissing,
+            SemanticIndexStale,
+            build_semantic_index,
+            hybrid_rank,
+            load_semantic_index,
+            semantic_rank,
+        )
+        from networkx.readwrite import json_graph
+        import json as _json
+
+        subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
+        if subcmd not in {"build", "query"}:
+            print("Usage: graphify semantic [build|query] [--graph path] [--model name] [--model-cache dir] [--offline] [--top-k N] [--hybrid] [--expand-context]", file=sys.stderr)
+            sys.exit(1)
+        args = sys.argv[3:]
+        question = ""
+        if subcmd == "query":
+            if not args or args[0].startswith("--"):
+                print("Usage: graphify semantic query \"<question>\" [--graph path] [--model name] [--model-cache dir] [--offline] [--top-k N] [--hybrid] [--expand-context]", file=sys.stderr)
+                sys.exit(1)
+            question = args[0]
+            args = args[1:]
+        graph_path = _default_graph_path()
+        model_name = DEFAULT_MODEL
+        model_cache = None
+        offline = False
+        top_k = 10
+        use_hybrid = "--hybrid" in args
+        expand_context = "--expand-context" in args
+        offline = "--offline" in args
+        i = 0
+        while i < len(args):
+            if args[i] == "--graph" and i + 1 < len(args):
+                graph_path = args[i + 1]
+                i += 2
+            elif args[i].startswith("--graph="):
+                graph_path = args[i].split("=", 1)[1]
+                i += 1
+            elif args[i] == "--model" and i + 1 < len(args):
+                model_name = args[i + 1]
+                i += 2
+            elif args[i].startswith("--model="):
+                model_name = args[i].split("=", 1)[1]
+                i += 1
+            elif args[i] == "--model-cache" and i + 1 < len(args):
+                model_cache = args[i + 1]
+                i += 2
+            elif args[i].startswith("--model-cache="):
+                model_cache = args[i].split("=", 1)[1]
+                i += 1
+            elif args[i] == "--top-k" and i + 1 < len(args):
+                top_k = int(args[i + 1])
+                i += 2
+            elif args[i].startswith("--top-k="):
+                top_k = int(args[i].split("=", 1)[1])
+                i += 1
+            else:
+                i += 1
+        gp = Path(graph_path).resolve()
+        if not gp.exists():
+            print(f"error: graph file not found: {gp}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            raw = _json.loads(gp.read_text(encoding="utf-8"))
+            if "links" not in raw and "edges" in raw:
+                raw = dict(raw, links=raw["edges"])
+            try:
+                G = json_graph.node_link_graph(raw, edges="links")
+            except TypeError:
+                G = json_graph.node_link_graph(raw)
+        except Exception as exc:
+            print(f"error: could not load graph: {exc}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            if subcmd == "build":
+                embedder = FastEmbedder(model_name, cache_dir=model_cache, offline=offline)
+                idx = build_semantic_index(G, graph_path=gp, out_dir=gp.parent, model_name=model_name, model_cache=model_cache, offline=offline, embedder=embedder)
+                print(f"semantic index built: {idx.metadata['indexed_count']} nodes, dim {idx.dimension}, model {idx.metadata['model']}")
+            else:
+                idx = load_semantic_index(G, graph_path=gp, out_dir=gp.parent, model_name=model_name)
+                embedder = FastEmbedder(model_name, cache_dir=model_cache, offline=offline)
+                ranked = hybrid_rank(G, idx, question, embedder, top_k=top_k, expand_context=expand_context) if use_hybrid else semantic_rank(idx, question, embedder, top_k=top_k)
+                for score, nid in ranked:
+                    label = G.nodes[nid].get("label", nid) if nid in G else nid
+                    print(f"{score:.4f}\t{nid}\t{label}")
+        except (SemanticDependencyMissing, SemanticIndexMissing, SemanticIndexStale) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
     elif cmd == "affected":
         if len(sys.argv) < 3:
             print("Usage: graphify affected \"<node-or-label>\" [--relation R] [--depth N] [--graph path]", file=sys.stderr)

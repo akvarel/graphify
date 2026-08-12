@@ -270,6 +270,7 @@ Codex users also need `multi_agent = true` under `[features]` in `~/.codex/confi
 | `pascal` | Pascal / Delphi `.pas`/`.dpr`/`.dpk`/`.inc` AST extraction (more accurate `calls`/`inherits` edges; falls back to a regex extractor when absent) | `uv tool install "graphifyy[pascal]"` |
 | `ocaml` | OCaml `.ml`/`.mli` AST extraction | `uv tool install "graphifyy[ocaml]"` |
 | `chinese` | Chinese query segmentation (jieba) | `uv tool install "graphifyy[chinese]"` |
+| `semantic` | Optional local CPU semantic/hybrid graph search (FastEmbed ONNX Runtime + NumPy, no external API) | `uv tool install "graphifyy[semantic]"` |
 | `all` | Everything above | `uv tool install "graphifyy[all]"` |
 
 </details>
@@ -450,6 +451,12 @@ graphify-out/cost.json        # local only
 # query the graph from the terminal
 graphify query "show the auth flow"
 graphify query "what connects DigestAuth to Response?" --graph graphify-out/graph.json
+
+# optional local CPU semantic index, no external API. FastEmbed uses ONNX Runtime.
+uv tool install "graphifyy[semantic]"
+graphify semantic build --graph graphify-out/graph.json --model-cache .graphify-models
+graphify semantic query "auth token validation" --graph graphify-out/graph.json --top-k 20 --offline --model-cache .graphify-models
+graphify semantic query "auth token validation" --graph graphify-out/graph.json --hybrid --expand-context --offline --model-cache .graphify-models
 
 # expose the graph as an MCP server (for repeated tool-call access)
 python -m graphify.serve graphify-out/graph.json
