@@ -3050,17 +3050,12 @@ def _extract_generic(
             return s[1:-1]
         return s
 
+    _concat_node_types = {"binary_expression", "binary_operator", "concatenation"}
+
     def _canonical_text(n) -> tuple[str, str] | None:
         raw = _node_text(n)
         has_interpolation_child = any(c.type == "interpolation" for c in n.children)
-        if n.type in ("template_string", "template_literal") or has_interpolation_child or "interpolation" in raw or "${" in raw or re.search(r"[$#]\{?\w", raw):
-            body = _strip_string(raw)
-            body = re.sub(r"\$\{[^}]*\}", "<arg>", body)
-            body = re.sub(r"\{[^{}]+\}", "<arg>", body) if re.match(r"\s*[rRuUbB]*[fF]", raw) or has_interpolation_child else body
-            body = re.sub(r"\$[A-Za-z_][A-Za-z0-9_]*", "<arg>", body)
-            body = re.sub(r"#\{[^}]*\}", "<arg>", body)
-            return (canonicalize_log_message("static", body), "TEMPLATE")
-        if n.type in ("binary_expression", "concatenation") and ("+" in raw or "." in raw):
+        if n.type in _concat_node_types and ("+" in raw or "." in raw):
             parts: list[str] = []
             for c in n.children:
                 ct = _canonical_text(c)
@@ -3068,9 +3063,16 @@ def _extract_generic(
                     parts.append(ct[0])
                 elif c.is_named:
                     parts.append("<arg>")
-            if parts and any(p == "<arg>" for p in parts):
+            if parts and any("<arg>" in p for p in parts):
                 return (canonicalize_log_message("static", "".join(parts)), "TEMPLATE")
             return None
+        if n.type in ("template_string", "template_literal") or has_interpolation_child or "interpolation" in raw or "${" in raw or re.search(r"[$#]\{?\w", raw):
+            body = _strip_string(raw)
+            body = re.sub(r"\$\{[^}]*\}", "<arg>", body)
+            body = re.sub(r"\{[^{}]+\}", "<arg>", body) if re.match(r"\s*[rRuUbB]*[fF]", raw) or has_interpolation_child else body
+            body = re.sub(r"\$[A-Za-z_][A-Za-z0-9_]*", "<arg>", body)
+            body = re.sub(r"#\{[^}]*\}", "<arg>", body)
+            return (canonicalize_log_message("static", body), "TEMPLATE")
         if "string" in n.type:
             return (canonicalize_log_message("static", _strip_string(raw)), "CONSTANT")
         return None
@@ -3078,7 +3080,7 @@ def _extract_generic(
     def _is_text_template_candidate(n) -> bool:
         if config.ts_module not in ("tree_sitter_javascript", "tree_sitter_typescript", "tree_sitter_python", "tree_sitter_java", "tree_sitter_php"):
             return False
-        if n.type in ("binary_expression", "concatenation"):
+        if n.type in _concat_node_types:
             return True
         if n.type in ("template_string", "template_literal", "string", "string_fragment", "string_literal", "encapsed_string"):
             return True
@@ -3095,6 +3097,24 @@ def _extract_generic(
     def _skip_text_template(n) -> bool:
         ancestors = _ancestor_types(n)
         if any(t in config.import_types for t in ancestors):
+            return True
+        if any(t in {"decorator", "annotation", "attribute", "type_alias_declaration", "literal_type", "type_annotation", "subscript", "type", "generic_type", "type_parameter", "typed_parameter"} for t in ancestors):
+            return True
+        if n.type in _concat_node_types and n.parent is not None and n.parent.type in _concat_node_types:
+            return True
+        p = n.parent
+        while p is not None:
+            if p.type in {"pair", "array_element_initializer"}:
+                named_children = [c for c in p.children if c.is_named]
+                if named_children and named_children[0].start_byte <= n.start_byte and n.end_byte <= named_children[0].end_byte:
+                    return True
+                break
+            if p.type in config.function_boundary_types or p.type in config.class_types:
+                break
+            p = getattr(p, "parent", None)
+        if n.parent is not None and n.parent.type in _concat_node_types:
+            # The containing concatenation emits the complete template. Emitting
+            # the literal leaves too would duplicate partial fragments.
             return True
         if config.ts_module == "tree_sitter_python" and "expression_statement" in ancestors:
             p = n.parent
