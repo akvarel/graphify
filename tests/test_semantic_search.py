@@ -300,6 +300,56 @@ def test_cli_semantic_build_honors_model_flag(tmp_path, monkeypatch, capsys):
     assert "custom/model" in capsys.readouterr().out
     meta = json.loads((tmp_path / "semantic-index.json").read_text())
     assert meta["model"] == "custom/model"
+    assert meta["mode"] == "incremental"
+
+
+def test_cli_semantic_build_full_forces_rebuild(tmp_path, monkeypatch, capsys):
+    import types
+
+    g = make_graph()
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps(json_graph.node_link_data(g, edges="links")))
+
+    class DummyTextEmbedding:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def embed(self, texts):
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+    monkeypatch.setitem(sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=DummyTextEmbedding))
+    from graphify.cli import dispatch_command
+
+    monkeypatch.setattr(sys, "argv", ["graphify", "semantic", "build", "--graph", str(graph_path)])
+    dispatch_command("semantic")
+    monkeypatch.setattr(sys, "argv", ["graphify", "semantic", "build", "--graph", str(graph_path), "--full"])
+    dispatch_command("semantic")
+    out = capsys.readouterr().out
+    assert "mode full" in out
+    meta = json.loads((tmp_path / "semantic-index.json").read_text())
+    assert meta["mode"] == "full"
+    assert meta["embedded_count"] == 2
+
+
+def test_update_hook_warns_but_succeeds_when_existing_semantic_cache_unavailable(tmp_path, monkeypatch, capsys):
+    from graphify import cli as cli_mod
+    from graphify.cli import dispatch_command
+
+    out = tmp_path / "graphify-out"
+    out.mkdir()
+    g = make_graph()
+    (out / "graph.json").write_text(json.dumps(json_graph.node_link_data(g, edges="links")))
+    (out / "semantic-index.json").write_text(json.dumps({"model": "fake/missing", "dimension": 3}))
+    monkeypatch.setattr(cli_mod, "_GRAPHIFY_OUT", str(out))
+    monkeypatch.setattr(sys, "argv", ["graphify", "update", str(tmp_path)])
+
+    import graphify.watch
+
+    monkeypatch.setattr(graphify.watch, "_rebuild_code", lambda *a, **k: True)
+    dispatch_command("update")
+    captured = capsys.readouterr()
+    assert "Warning: semantic index not refreshed offline" in captured.err
+    assert "Code graph updated" in captured.out
 
 def test_cli_semantic_paths_and_missing_index_error(tmp_path, monkeypatch, capsys):
     g = make_graph()

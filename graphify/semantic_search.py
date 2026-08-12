@@ -26,6 +26,7 @@ INDEX_VERSION = 1
 META_NAME = "semantic-index.json"
 VECTORS_NAME = "semantic-vectors.npy"
 IDS_NAME = "semantic-node-ids.json"
+HASHES_NAME = "semantic-node-hashes.json"
 MAX_QUERY_TOP_K = 1000
 _SAFE_FIELDS = (
     "label",
@@ -154,8 +155,12 @@ def graph_fingerprint(G: nx.Graph) -> str:
     return h.hexdigest()
 
 
-def _index_paths(out_dir: Path) -> tuple[Path, Path, Path]:
-    return out_dir / META_NAME, out_dir / VECTORS_NAME, out_dir / IDS_NAME
+def node_text_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
+def _index_paths(out_dir: Path) -> tuple[Path, Path, Path, Path]:
+    return out_dir / META_NAME, out_dir / VECTORS_NAME, out_dir / IDS_NAME, out_dir / HASHES_NAME
 
 
 def _normalize_rows(arr: np.ndarray) -> np.ndarray:
@@ -183,6 +188,65 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             pass
 
 
+def _load_reusable_index(out: Path, model_name: str, expected_dimension: int | None) -> tuple[dict, list[str], dict[str, str], np.ndarray, str | None]:
+    meta_path, vec_path, ids_path, hashes_path = _index_paths(out)
+    if not (meta_path.exists() and vec_path.exists() and ids_path.exists() and hashes_path.exists()):
+        return {}, [], {}, np.zeros((0, 0), dtype=np.float16), "missing"
+    try:
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        ids = list(map(str, json.loads(ids_path.read_text(encoding="utf-8"))))
+        hashes_raw = json.loads(hashes_path.read_text(encoding="utf-8"))
+        hashes = {str(k): str(v) for k, v in hashes_raw.items()}
+        vectors = np.asarray(np.load(vec_path, allow_pickle=False), dtype=np.float16)
+    except Exception:
+        return {}, [], {}, np.zeros((0, 0), dtype=np.float16), "unreadable"
+    if metadata.get("version") != INDEX_VERSION:
+        return metadata, [], {}, np.zeros((0, 0), dtype=np.float16), "version_mismatch"
+    if metadata.get("model") != model_name:
+        return metadata, [], {}, np.zeros((0, 0), dtype=np.float16), "model_mismatch"
+    dim = int(metadata.get("dimension") or 0)
+    if expected_dimension is not None and dim != int(expected_dimension):
+        return metadata, [], {}, np.zeros((0, 0), dtype=np.float16), "dimension_mismatch"
+    if vectors.ndim != 2 or vectors.shape[0] != len(ids) or (dim and vectors.shape[1] != dim):
+        return metadata, [], {}, np.zeros((0, 0), dtype=np.float16), "shape_mismatch"
+    return metadata, ids, hashes, vectors, None
+
+
+def _atomic_replace_artifacts(out: Path, artifacts: dict[str, bytes]) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    staged: dict[str, Path] = {}
+    backups: dict[str, bytes | None] = {}
+    try:
+        for name, data in artifacts.items():
+            target = out / name
+            backups[name] = target.read_bytes() if target.exists() else None
+            fd, tmp = tempfile.mkstemp(prefix=f".{name}.", dir=str(out))
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            staged[name] = Path(tmp)
+        for name, tmp in staged.items():
+            os.replace(tmp, out / name)
+    except Exception:
+        for name, old in backups.items():
+            target = out / name
+            if old is None:
+                try:
+                    target.unlink()
+                except FileNotFoundError:
+                    pass
+            else:
+                _atomic_write_bytes(target, old)
+        raise
+    finally:
+        for tmp in staged.values():
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def build_semantic_index(
     G: nx.Graph,
     *,
@@ -192,38 +256,80 @@ def build_semantic_index(
     model_cache: str | Path | None = None,
     offline: bool = False,
     embedder: Embedder | None = None,
+    full: bool = False,
+    expected_dimension: int | None = None,
 ) -> SemanticIndex:
     graph_path = Path(graph_path)
     out = Path(out_dir) if out_dir is not None else graph_path.parent
     emb = embedder or FastEmbedder(model_name, cache_dir=model_cache, offline=offline)
     ids: list[str] = []
-    texts: list[str] = []
+    texts_by_id: dict[str, str] = {}
+    hashes: dict[str, str] = {}
     for nid, data in sorted(G.nodes(data=True), key=lambda x: str(x[0])):
         sid = str(nid)
         if should_index_node(sid, data):
             ids.append(sid)
-            texts.append(project_node_text(sid, data))
-    vectors = _normalize_rows(np.asarray(emb.embed(texts), dtype=np.float32)) if texts else np.zeros((0, 0), dtype=np.float32)
-    vectors16 = vectors.astype(np.float16)
+            text = project_node_text(sid, data)
+            texts_by_id[sid] = text
+            hashes[sid] = node_text_hash(text)
+    model = getattr(emb, "model_name", model_name)
+    old_meta, old_ids, old_hashes, old_vectors, reason = _load_reusable_index(out, model, expected_dimension)
+    mode = "full" if full or reason not in (None, "missing") else "incremental"
+    if full:
+        reason = "forced"
+    old_pos = {nid: i for i, nid in enumerate(old_ids)} if mode == "incremental" else {}
+    new_vectors: list[np.ndarray | None] = []
+    embed_ids: list[str] = []
+    embed_texts: list[str] = []
+    reused = 0
+    for sid in ids:
+        pos = old_pos.get(sid)
+        if pos is not None and old_hashes.get(sid) == hashes[sid]:
+            new_vectors.append(np.asarray(old_vectors[pos], dtype=np.float16))
+            reused += 1
+        else:
+            new_vectors.append(None)
+            embed_ids.append(sid)
+            embed_texts.append(texts_by_id[sid])
+    embedded16 = np.zeros((0, expected_dimension or 0), dtype=np.float16)
+    if embed_texts:
+        embedded = _normalize_rows(np.asarray(emb.embed(embed_texts), dtype=np.float32))
+        embedded16 = embedded.astype(np.float16)
+    if embed_texts and expected_dimension is not None and embedded16.shape[1] != int(expected_dimension):
+        raise SemanticIndexStale("semantic embedder dimension does not match expected dimension")
+    dim = int(embedded16.shape[1]) if embed_texts else (int(old_vectors.shape[1]) if old_vectors.ndim == 2 and reused else int(expected_dimension or 0))
+    embed_iter = iter(embedded16)
+    rows = [next(embed_iter) if row is None else row for row in new_vectors]
+    vectors16 = np.vstack(rows).astype(np.float16) if rows else np.zeros((0, dim), dtype=np.float16)
+    removed = len(set(old_ids) - set(ids)) if old_ids else 0
     metadata = {
         "version": INDEX_VERSION,
-        "model": getattr(emb, "model_name", model_name),
+        "model": model,
         "dimension": int(vectors16.shape[1]) if vectors16.ndim == 2 else 0,
         "graph_fingerprint": graph_fingerprint(G),
         "node_count": G.number_of_nodes(),
         "indexed_count": len(ids),
+        "reused_count": reused,
+        "embedded_count": len(embed_ids),
+        "removed_count": removed,
+        "mode": mode,
+        "rebuild_reason": reason,
+        "model_cache": str(model_cache) if model_cache is not None else None,
         "graph_path": str(graph_path.resolve()),
         "dtype": "float16",
         "vectors": VECTORS_NAME,
         "ids": IDS_NAME,
+        "hashes": HASHES_NAME,
     }
-    meta_path, vec_path, ids_path = _index_paths(out)
     import io
     bio = io.BytesIO()
     np.save(bio, vectors16, allow_pickle=False)
-    _atomic_write_bytes(vec_path, bio.getvalue())
-    _atomic_write_bytes(ids_path, (json.dumps(ids, ensure_ascii=False) + "\n").encode())
-    _atomic_write_bytes(meta_path, (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode())
+    _atomic_replace_artifacts(out, {
+        VECTORS_NAME: bio.getvalue(),
+        IDS_NAME: (json.dumps(ids, ensure_ascii=False) + "\n").encode(),
+        HASHES_NAME: (json.dumps(hashes, ensure_ascii=False, sort_keys=False) + "\n").encode(),
+        META_NAME: (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode(),
+    })
     return SemanticIndex(ids=ids, vectors=vectors16, metadata=metadata)
 
 
@@ -235,8 +341,8 @@ def load_semantic_index(
     model_name: str = DEFAULT_MODEL,
 ) -> SemanticIndex:
     out = Path(out_dir) if out_dir is not None else Path(graph_path).parent
-    meta_path, vec_path, ids_path = _index_paths(out)
-    if not meta_path.exists() or not vec_path.exists() or not ids_path.exists():
+    meta_path, vec_path, ids_path, hashes_path = _index_paths(out)
+    if not meta_path.exists() or not vec_path.exists() or not ids_path.exists() or not hashes_path.exists():
         raise SemanticIndexMissing("semantic index is missing; run `graphify semantic build --graph <graph.json>` first")
     metadata = json.loads(meta_path.read_text(encoding="utf-8"))
     ids = json.loads(ids_path.read_text(encoding="utf-8"))
