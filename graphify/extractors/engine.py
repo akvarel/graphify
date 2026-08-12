@@ -3182,7 +3182,7 @@ def _extract_generic(
     def _bound_name(n) -> str | None:
         p = n.parent
         while p is not None:
-            if p.type in ("variable_declarator", "assignment"):
+            if p.type in ("variable_declarator", "assignment", "assignment_expression"):
                 left = p.child_by_field_name("name") or p.child_by_field_name("left")
                 return _read_text(left, source) if left is not None else None
             if p.type in ("local_variable_declaration", "field_declaration"):
