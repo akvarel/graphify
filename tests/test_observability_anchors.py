@@ -83,14 +83,19 @@ class TestClassifyLogCallsite:
             node, source = _first_call(f"console.{method}('x');")
             assert classify_log_callsite(node, source) == ("console", method)
 
-    def test_console_log_out_of_scope(self):
+    def test_console_log_recognized(self):
         node, source = _first_call("console.log('x');")
-        assert classify_log_callsite(node, source) is None
+        assert classify_log_callsite(node, source) == ("console", "log")
 
     def test_logger_receivers(self):
         for recv in ("logger", "log", "Logger", "this.logger", "ctx.logger"):
             node, source = _first_call(f"{recv}.info('x');")
             assert classify_log_callsite(node, source) == ("logger", "info")
+
+    def test_logger_log_recognized(self):
+        for recv in ("logger", "log", "this.logger", "ctx.logger"):
+            node, source = _first_call(f"{recv}.log('x');")
+            assert classify_log_callsite(node, source) == ("logger", "log")
 
     def test_arbitrary_receiver_not_a_logger(self):
         node, source = _first_call("client.info('x');")
