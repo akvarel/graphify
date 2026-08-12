@@ -1,5 +1,5 @@
 import json
-import subprocess
+import os
 import sys
 from pathlib import Path
 
@@ -118,16 +118,95 @@ def test_hybrid_combines_lexical_and_semantic_and_expands_context(tmp_path):
     assert len(ranked) <= 3
 
 
-def test_cli_semantic_paths_and_missing_index_error(tmp_path):
+def test_build_semantic_index_records_requested_model_with_fake_embedder(tmp_path):
     g = make_graph()
     graph_path = tmp_path / "graph.json"
     graph_path.write_text(json.dumps(json_graph.node_link_data(g, edges="links")))
-    missing = subprocess.run(
-        [sys.executable, "-m", "graphify", "semantic", "query", "login", "--graph", str(graph_path)],
-        cwd=Path(__file__).resolve().parents[1], text=True, capture_output=True,
+    idx = build_semantic_index(
+        g,
+        graph_path=graph_path,
+        out_dir=tmp_path,
+        model_name="custom/multilingual-minilm",
+        embedder=FakeEmbedder(),
     )
-    assert missing.returncode != 0
-    assert "semantic index" in missing.stderr.lower()
+    assert idx.metadata["model"] == FakeEmbedder.model_name
+
+
+def test_offline_fastembed_overrides_false_env_and_uses_cache(tmp_path, monkeypatch):
+    import types
+    from graphify.semantic_search import FastEmbedder
+
+    cache = tmp_path / "models"
+    cache.mkdir()
+    (cache / "model.onnx").write_text("placeholder")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "0")
+
+    class DummyTextEmbedding:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def embed(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+    monkeypatch.setitem(sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=DummyTextEmbedding))
+    FastEmbedder(model_name=DEFAULT_MODEL, cache_dir=cache, offline=True)
+    assert os.environ["HF_HUB_OFFLINE"] == "1"
+    assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+    assert os.environ["FASTEMBED_CACHE_PATH"] == str(cache)
+
+
+def test_offline_fastembed_requires_present_cache(tmp_path):
+    from graphify.semantic_search import FastEmbedder, SemanticDependencyMissing
+
+    with pytest.raises(SemanticDependencyMissing) as exc:
+        FastEmbedder(model_name=DEFAULT_MODEL, cache_dir=tmp_path / "models", offline=True)
+    assert "offline" in str(exc.value).lower()
+    assert "prewarm" in str(exc.value).lower()
+
+
+def test_cli_semantic_build_honors_model_flag(tmp_path, monkeypatch, capsys):
+    import types
+
+    g = make_graph()
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps(json_graph.node_link_data(g, edges="links")))
+
+    class DummyTextEmbedding:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def embed(self, texts):
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+    monkeypatch.setitem(sys.modules, "fastembed", types.SimpleNamespace(TextEmbedding=DummyTextEmbedding))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["graphify", "semantic", "build", "--graph", str(graph_path), "--model", "custom/model"],
+    )
+    from graphify.cli import dispatch_command
+
+    dispatch_command("semantic")
+    assert "custom/model" in capsys.readouterr().out
+    meta = json.loads((tmp_path / "semantic-index.json").read_text())
+    assert meta["model"] == "custom/model"
+
+def test_cli_semantic_paths_and_missing_index_error(tmp_path, monkeypatch, capsys):
+    g = make_graph()
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps(json_graph.node_link_data(g, edges="links")))
+    from graphify.cli import dispatch_command
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["graphify", "semantic", "query", "login", "--graph", str(graph_path)],
+    )
+    with pytest.raises(SystemExit) as exc:
+        dispatch_command("semantic")
+    assert exc.value.code != 0
+    assert "semantic index" in capsys.readouterr().err.lower()
 
 
 def test_public_artifact_packaging_mentions_semantic():
@@ -135,3 +214,5 @@ def test_public_artifact_packaging_mentions_semantic():
     text = pyproject.read_text()
     assert "semantic" in text
     assert "fastembed" in text
+    all_line = next(line for line in text.splitlines() if line.startswith("all ="))
+    assert "fastembed" in all_line
