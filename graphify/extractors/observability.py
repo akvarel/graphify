@@ -1,9 +1,9 @@
-"""Observability-callsite classification for JS/TS and Java static log callsites.
+"""Observability-callsite classification for static log callsites.
 
 Runtime-observability anchors are extracted from plain ``.js``/``.ts``/``.tsx``/
-``.mjs``/``.cjs``/``.mts``/``.cts`` files (``extract_js``) and ``.java`` files
-(``extract_java``) as dedicated ``observability_anchor`` nodes connected to
-their enclosing symbol. This module holds the pure, unit-testable helpers:
+``.mjs``/``.cjs``/``.mts``/``.cts`` files (``extract_js``), ``.java`` files,
+Python files, and PHP files as dedicated ``observability_anchor`` nodes
+connected to their enclosing symbol. This module holds the pure, unit-testable helpers:
 recognizing a logging call and recovering a *static* first-message template
 when one exists.
 
@@ -23,6 +23,13 @@ Supported frameworks (deliberately conservative, no guessing):
   ``logger`` or ``log`` (any case) — a plain ``log``/``logger`` identifier,
   ``this.logger`` field access, or ``Class.log`` static field access. A computed
   receiver (``getLogger()``) is never a match.
+- ``python_logging``: Python stdlib ``logging`` calls and conventional
+  ``logger``/``log`` receiver calls across debug/info/warning/error/exception/
+  critical levels. F-strings are static templates with interpolations mapped to
+  ``<arg>``; computed message expressions remain dynamic.
+- ``psr3`` / ``laravel_log`` / ``php_error_log``: conservative PHP logger
+  receivers, Laravel-style ``Log::level(...)`` calls, and ``error_log(...)``.
+  Interpolated PHP strings map embedded values to ``<arg>``.
 
 Message recovery rules ("never guessed"):
 
@@ -86,6 +93,12 @@ ANCHOR_KIND_DYNAMIC_CALLSITE = "DYNAMIC_LOG_CALLSITE"
 # The level methods anchored for console/loggers (slice 1; console.log /
 # logger.log are intentionally out of scope for now).
 _LOG_LEVEL_METHODS = frozenset({"debug", "info", "warn", "error"})
+_PYTHON_LOG_LEVEL_METHODS = frozenset({
+    "debug", "info", "warning", "warn", "error", "exception", "critical", "fatal",
+})
+_PHP_LOG_LEVEL_METHODS = frozenset({
+    "debug", "info", "notice", "warning", "warn", "error", "critical", "alert", "emergency",
+})
 _CONSOLE_RECEIVER = "console"
 
 # Common logger receivers: the final identifier segment of the receiver must be
@@ -103,8 +116,30 @@ _LOKI_METHODS = frozenset({"log", "push"})
 # parens, TS `as`/`satisfies` casts, non-null `!`, and `<T>expr` type assertions.
 _UNWRAP_TYPES = frozenset({
     "parenthesized_expression", "as_expression", "satisfies_expression",
-    "non_null_expression", "type_assertion",
+    "non_null_expression", "type_assertion", "argument",
 })
+
+
+def _python_receiver_final_segment(obj, source: bytes) -> str | None:
+    if obj is None:
+        return None
+    if obj.type == "identifier":
+        return _read_text(obj, source)
+    if obj.type == "attribute":
+        attr = obj.child_by_field_name("attribute")
+        return _read_text(attr, source) if attr is not None else None
+    return None
+
+
+def _php_receiver_final_segment(obj, source: bytes) -> str | None:
+    if obj is None:
+        return None
+    if obj.type in ("name", "variable_name"):
+        return _read_text(obj, source).lstrip("$")
+    if obj.type == "member_access_expression":
+        name = obj.child_by_field_name("name")
+        return _read_text(name, source).lstrip("$") if name is not None else None
+    return None
 
 
 def _receiver_final_segment(obj, source: bytes) -> str | None:
@@ -191,6 +226,38 @@ def classify_log_callsite(node, source: bytes) -> tuple[str, str] | None:
         if recv is not None and _LOGGER_RECEIVER_RE.match(recv):
             return ("slf4j", method)
         return None
+    if node.type == "call":
+        fn = node.child_by_field_name("function")
+        if fn is None or fn.type != "attribute":
+            return None
+        method_node = fn.child_by_field_name("attribute")
+        obj = fn.child_by_field_name("object")
+        method = _read_text(method_node, source) if method_node is not None else ""
+        recv = _python_receiver_final_segment(obj, source)
+        if method in _PYTHON_LOG_LEVEL_METHODS and (
+            recv == "logging" or (recv is not None and _LOGGER_RECEIVER_RE.match(recv))
+        ):
+            return ("python_logging", method)
+        return None
+    if node.type == "member_call_expression":
+        method_node = node.child_by_field_name("name")
+        method = _read_text(method_node, source) if method_node is not None else ""
+        recv = _php_receiver_final_segment(node.child_by_field_name("object"), source)
+        if method in _PHP_LOG_LEVEL_METHODS and recv is not None and _LOGGER_RECEIVER_RE.match(recv):
+            return ("psr3", method)
+        return None
+    if node.type == "scoped_call_expression":
+        method_node = node.child_by_field_name("name")
+        method = _read_text(method_node, source) if method_node is not None else ""
+        recv = _php_receiver_final_segment(node.child_by_field_name("scope"), source)
+        if method in _PHP_LOG_LEVEL_METHODS and recv is not None and _LOGGER_RECEIVER_RE.match(recv):
+            return ("laravel_log", method)
+        return None
+    if node.type == "function_call_expression":
+        fn = node.child_by_field_name("function")
+        if fn is not None and _read_text(fn, source).lstrip("\\") == "error_log":
+            return ("php_error_log", "error_log")
+        return None
     return None
 
 
@@ -252,9 +319,28 @@ def _classify_message_expr(expr, source: bytes) -> tuple[str, str | None]:
     e = _unwrap(expr)
     if e is None:
         return ("dynamic", None)
+    if e.type == "string" and any(c.type == "interpolation" for c in e.children):
+        parts: list[str] = []
+        for child in e.children:
+            if child.type == "string_content":
+                parts.append(_read_text(child, source))
+            elif child.type == "interpolation":
+                parts.append("<arg>")
+        return ("static", "".join(parts))
     if e.type in ("string", "string_literal"):
         content = _static_string_content(e, source)
         return ("static", content if content is not None else "")
+    if e.type == "encapsed_string":
+        parts: list[str] = []
+        dynamic = False
+        for child in e.children:
+            if child.type == "string_content":
+                parts.append(_read_text(child, source))
+            elif child.is_named:
+                parts.append("<arg>")
+                dynamic = True
+        if parts or not dynamic:
+            return ("static", "".join(parts))
     if e.type == "template_string":
         # A tagged template (`tag`x``) has a `tag` field and a computed message;
         # an untagged one is a plain static template with substitutions.

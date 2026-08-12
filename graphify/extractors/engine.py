@@ -3003,9 +3003,14 @@ def _extract_generic(
     # editing a call on another line never renumbers this anchor.
     obs_line_counters: dict[int, int] = {}
     obs_anchor_ids: set[str] = set()
-    obs_language = "java" if path.suffix.lower() == ".java" else (
+    obs_language = {
+        ".java": "java",
+        ".py": "python",
+        ".php": "php",
+        ".phtml": "php",
+    }.get(path.suffix.lower(), (
         "typescript" if path.suffix.lower() in (".ts", ".tsx", ".mts", ".cts") else "javascript"
-    )
+    ))
 
     def _emit_obs_anchor(node, caller_nid: str, caller_label: str) -> None:
         classified = classify_log_callsite(node, source)
@@ -4979,7 +4984,11 @@ def _extract_generic(
                     and ((node.type == "call_expression"
                           and config.ts_module in ("tree_sitter_javascript", "tree_sitter_typescript"))
                          or (node.type == "method_invocation"
-                             and config.ts_module == "tree_sitter_java"))):
+                             and config.ts_module == "tree_sitter_java")
+                         or (node.type == "call"
+                             and config.ts_module == "tree_sitter_python")
+                         or (node.type in ("function_call_expression", "member_call_expression", "scoped_call_expression")
+                             and config.ts_module == "tree_sitter_php"))):
                 _emit_obs_anchor(
                     node, caller_nid, nid_to_label.get(caller_nid, caller_nid)
                 )
@@ -5746,6 +5755,24 @@ def _extract_generic(
             _scan_java_class_scope(
                 scope_node, owner_nid, nid_to_label.get(owner_nid, owner_nid)
             )
+
+    # Python/PHP module-scope logging calls are attributed to the file node.
+    # Function/method bodies are skipped because walk_calls already attributed
+    # those callsites to their exact enclosing symbol.
+    if emit_observability_anchors and config.ts_module in ("tree_sitter_python", "tree_sitter_php"):
+        module_call_types = ({"call"} if config.ts_module == "tree_sitter_python" else {
+            "function_call_expression", "member_call_expression", "scoped_call_expression",
+        })
+
+        def _scan_module_observability(n) -> None:
+            if n.type in config.function_boundary_types or n.type in config.class_types:
+                return
+            if n.type in module_call_types:
+                _emit_obs_anchor(n, file_nid, path.name)
+            for c in n.children:
+                _scan_module_observability(c)
+
+        _scan_module_observability(root)
 
     # ── Clean edges ───────────────────────────────────────────────────────────
     valid_ids = seen_ids

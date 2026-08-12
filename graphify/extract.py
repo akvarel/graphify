@@ -1244,7 +1244,7 @@ def _extract_python_rationale(path: Path, result: dict) -> None:
 
 def extract_python(path: Path) -> dict:
     """Extract classes, functions, and imports from a .py file via tree-sitter AST."""
-    result = _extract_generic(path, _PYTHON_CONFIG)
+    result = _extract_generic(path, _PYTHON_CONFIG, emit_observability_anchors=True)
     if "error" not in result:
         _extract_python_rationale(path, result)
     return result
@@ -1992,7 +1992,7 @@ def extract_scala(path: Path) -> dict:
 
 def extract_php(path: Path) -> dict:
     """Extract classes, functions, methods, namespace uses, and calls from a .php file."""
-    return _extract_generic(path, _PHP_CONFIG)
+    return _extract_generic(path, _PHP_CONFIG, emit_observability_anchors=True)
 
 
 # One level of balanced parens (e.g. `Foo #(Bar #(int))`) — bounded so malformed
