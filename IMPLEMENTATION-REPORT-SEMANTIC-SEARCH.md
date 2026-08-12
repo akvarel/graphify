@@ -10,13 +10,14 @@ Artifacts are written under the graph output directory next to `graph.json`:
 
 - `semantic-index.json` metadata
 - `semantic-node-ids.json` stable node id order
+- `semantic-node-hashes.json` deterministic projected-text hashes aligned to the IDs
 - `semantic-vectors.npy` normalized float16 vectors
 
-Writes are atomic. Loads use NumPy mmap and validate metadata before ranking.
+Builds are incremental by default. When the previous artifacts have the same index version, model name, and vector dimension, Graphify reuses unchanged float16 vectors by matching each node ID and projected-text hash. Only new or changed projected texts are embedded, and deleted or newly excluded nodes are removed from the stable sorted ID list. `--full` forces a complete rebuild. Artifacts are staged before replacement and prior artifacts are restored if embedding or artifact writing fails.
 
 ## Staleness and validation
 
-Metadata includes index format version, model name, vector dimension, graph node count, indexed node count, graph path, dtype, and a deterministic fingerprint over indexed node IDs plus projected text. Loading rejects missing, stale, model-mismatched, dimension-mismatched, or shape-mismatched indexes with actionable errors.
+Metadata includes index format version, model name, model cache path when provided, vector dimension, graph node count, indexed node count, graph path, dtype, mode, counts for reused/embedded/removed nodes, and a deterministic fingerprint over indexed node IDs plus projected text. Loading rejects missing, stale, model-mismatched, dimension-mismatched, or shape-mismatched indexes with actionable errors.
 
 ## Commands
 
@@ -32,6 +33,12 @@ Build the index:
 
 ```bash
 graphify semantic build --graph graphify-out/graph.json
+```
+
+Force a complete rebuild instead of incremental reuse:
+
+```bash
+graphify semantic build --graph graphify-out/graph.json --full
 ```
 
 Query semantic-only ranking:
@@ -76,11 +83,14 @@ graphify semantic build --model sentence-transformers/all-MiniLM-L6-v2
 ## Limitations
 
 - Brute-force NumPy dot product is intended for local CPU search at the tested 60k-node scale. Larger graphs should use an ANN backend.
-- Semantic index builds currently recompute all indexed nodes. Incremental embedding reuse is not implemented yet, so large frequently changing graphs should rebuild during CI or scheduled maintenance.
 - The semantic extra may download the FastEmbed model on first real non-offline use. Use `--model-cache` to prewarm and `--offline --model-cache` to require bundled resources.
 - FastEmbed depends on ONNX Runtime, so this path is not a no-native-binaries implementation. The embedder protocol is kept narrow for a future lat/WASM backend.
 - The projection intentionally excludes raw content and unknown fields to reduce secret exposure risk. This trades recall for privacy.
 - Hybrid ranking currently prints ranked nodes. It does not alter `graphify query` scoped subgraph rendering.
+
+## Update integration
+
+`graphify update` remains a deterministic AST-only graph refresh. If a semantic index already exists beside `graph.json`, update attempts a safe offline semantic refresh using the recorded model and cache path. It never auto-downloads a model. If the optional dependency or cache is unavailable, the command prints a warning and keeps the normal graph update successful.
 
 ## Benchmark procedure
 

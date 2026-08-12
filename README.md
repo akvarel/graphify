@@ -276,6 +276,8 @@ Codex users also need `multi_agent = true` under `[features]` in `~/.codex/confi
 
 </details>
 
+Semantic index builds are incremental by default. `graphify semantic build --graph graphify-out/graph.json` persists stable node IDs, per-node projected-text hashes, and float16 vectors. Re-running with the same index version, model, and dimension reuses unchanged vectors, embeds only new or changed nodes, and removes deleted or excluded nodes. Use `--full` to force a complete rebuild. After `graphify update`, Graphify refreshes semantic artifacts only when a semantic index already exists, using the recorded model/cache in offline mode. Missing semantic dependencies or cache produce a warning without failing the normal code graph update.
+
 ---
 
 ## Make your assistant always use the graph

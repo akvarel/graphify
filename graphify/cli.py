@@ -1077,7 +1077,7 @@ def dispatch_command(cmd: str) -> None:
 
         subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
         if subcmd not in {"build", "query"}:
-            print("Usage: graphify semantic [build|query] [--graph path] [--model name] [--model-cache dir] [--offline] [--top-k N] [--hybrid] [--expand-context]", file=sys.stderr)
+            print("Usage: graphify semantic [build|query] [--graph path] [--model name] [--model-cache dir] [--offline] [--full] [--top-k N] [--hybrid] [--expand-context]", file=sys.stderr)
             sys.exit(1)
         args = sys.argv[3:]
         question = ""
@@ -1091,6 +1091,7 @@ def dispatch_command(cmd: str) -> None:
         model_name = DEFAULT_MODEL
         model_cache = None
         offline = False
+        full = "--full" in args
         top_k = 10
         use_hybrid = "--hybrid" in args
         expand_context = "--expand-context" in args
@@ -1141,8 +1142,13 @@ def dispatch_command(cmd: str) -> None:
         try:
             if subcmd == "build":
                 embedder = FastEmbedder(model_name, cache_dir=model_cache, offline=offline)
-                idx = build_semantic_index(G, graph_path=gp, out_dir=gp.parent, model_name=model_name, model_cache=model_cache, offline=offline, embedder=embedder)
-                print(f"semantic index built: {idx.metadata['indexed_count']} nodes, dim {idx.dimension}, model {idx.metadata['model']}")
+                idx = build_semantic_index(G, graph_path=gp, out_dir=gp.parent, model_name=model_name, model_cache=model_cache, offline=offline, embedder=embedder, full=full)
+                print(
+                    f"semantic index built: {idx.metadata['indexed_count']} nodes, dim {idx.dimension}, "
+                    f"model {idx.metadata['model']}, mode {idx.metadata['mode']}, "
+                    f"reused {idx.metadata['reused_count']}, embedded {idx.metadata['embedded_count']}, "
+                    f"removed {idx.metadata['removed_count']}"
+                )
             else:
                 idx = load_semantic_index(G, graph_path=gp, out_dir=gp.parent, model_name=model_name)
                 embedder = FastEmbedder(model_name, cache_dir=model_cache, offline=offline)
@@ -2216,6 +2222,37 @@ def dispatch_command(cmd: str) -> None:
         ok = _rebuild_code(watch_path, force=force, no_cluster=no_cluster, block_on_lock=True)
         if ok:
             print("Code graph updated. For doc/paper/image changes run /graphify --update in your AI assistant.")
+            semantic_meta = Path(_GRAPHIFY_OUT) / "semantic-index.json"
+            graph_json = Path(_GRAPHIFY_OUT) / "graph.json"
+            if semantic_meta.exists() and graph_json.exists():
+                try:
+                    from graphify.semantic_search import FastEmbedder, SemanticDependencyMissing, build_semantic_index
+                    from graphify.paths import load_node_link_graph
+
+                    meta = json.loads(semantic_meta.read_text(encoding="utf-8"))
+                    model = str(meta.get("model") or "")
+                    model_cache = meta.get("model_cache")
+                    if not model:
+                        raise SemanticDependencyMissing("existing semantic index has no recorded model")
+                    raw = json.loads(graph_json.read_text(encoding="utf-8"))
+                    graph = load_node_link_graph(raw)
+                    embedder = FastEmbedder(model, cache_dir=model_cache, offline=True)
+                    idx = build_semantic_index(
+                        graph,
+                        graph_path=graph_json,
+                        out_dir=graph_json.parent,
+                        model_name=model,
+                        model_cache=model_cache,
+                        offline=True,
+                        embedder=embedder,
+                        expected_dimension=int(meta.get("dimension") or 0) or None,
+                    )
+                    print(
+                        f"Semantic index refreshed: mode {idx.metadata['mode']}, reused {idx.metadata['reused_count']}, "
+                        f"embedded {idx.metadata['embedded_count']}, removed {idx.metadata['removed_count']}."
+                    )
+                except Exception as exc:
+                    print(f"Warning: semantic index not refreshed offline: {exc}", file=sys.stderr)
             if not (
                 os.environ.get("GEMINI_API_KEY")
                 or os.environ.get("GOOGLE_API_KEY")
