@@ -1141,8 +1141,7 @@ def dispatch_command(cmd: str) -> None:
             sys.exit(1)
         try:
             if subcmd == "build":
-                embedder = FastEmbedder(model_name, cache_dir=model_cache, offline=offline)
-                idx = build_semantic_index(G, graph_path=gp, out_dir=gp.parent, model_name=model_name, model_cache=model_cache, offline=offline, embedder=embedder, full=full)
+                idx = build_semantic_index(G, graph_path=gp, out_dir=gp.parent, model_name=model_name, model_cache=model_cache, offline=offline, full=full)
                 print(
                     f"semantic index built: {idx.metadata['indexed_count']} nodes, dim {idx.dimension}, "
                     f"model {idx.metadata['model']}, mode {idx.metadata['mode']}, "
@@ -2236,7 +2235,6 @@ def dispatch_command(cmd: str) -> None:
                         raise SemanticDependencyMissing("existing semantic index has no recorded model")
                     raw = json.loads(graph_json.read_text(encoding="utf-8"))
                     graph = load_node_link_graph(raw)
-                    embedder = FastEmbedder(model, cache_dir=model_cache, offline=True)
                     idx = build_semantic_index(
                         graph,
                         graph_path=graph_json,
@@ -2244,7 +2242,6 @@ def dispatch_command(cmd: str) -> None:
                         model_name=model,
                         model_cache=model_cache,
                         offline=True,
-                        embedder=embedder,
                         expected_dimension=int(meta.get("dimension") or 0) or None,
                     )
                     print(

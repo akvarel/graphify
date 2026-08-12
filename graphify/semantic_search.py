@@ -190,13 +190,15 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
 
 def _load_reusable_index(out: Path, model_name: str, expected_dimension: int | None) -> tuple[dict, list[str], dict[str, str], np.ndarray, str | None]:
     meta_path, vec_path, ids_path, hashes_path = _index_paths(out)
-    if not (meta_path.exists() and vec_path.exists() and ids_path.exists() and hashes_path.exists()):
+    if not (meta_path.exists() and vec_path.exists() and ids_path.exists()):
         return {}, [], {}, np.zeros((0, 0), dtype=np.float16), "missing"
     try:
         metadata = json.loads(meta_path.read_text(encoding="utf-8"))
         ids = list(map(str, json.loads(ids_path.read_text(encoding="utf-8"))))
-        hashes_raw = json.loads(hashes_path.read_text(encoding="utf-8"))
-        hashes = {str(k): str(v) for k, v in hashes_raw.items()}
+        hashes = {}
+        if hashes_path.exists():
+            hashes_raw = json.loads(hashes_path.read_text(encoding="utf-8"))
+            hashes = {str(k): str(v) for k, v in hashes_raw.items()}
         vectors = np.asarray(np.load(vec_path, allow_pickle=False), dtype=np.float16)
     except Exception:
         return {}, [], {}, np.zeros((0, 0), dtype=np.float16), "unreadable"
@@ -261,7 +263,6 @@ def build_semantic_index(
 ) -> SemanticIndex:
     graph_path = Path(graph_path)
     out = Path(out_dir) if out_dir is not None else graph_path.parent
-    emb = embedder or FastEmbedder(model_name, cache_dir=model_cache, offline=offline)
     ids: list[str] = []
     texts_by_id: dict[str, str] = {}
     hashes: dict[str, str] = {}
@@ -272,8 +273,17 @@ def build_semantic_index(
             text = project_node_text(sid, data)
             texts_by_id[sid] = text
             hashes[sid] = node_text_hash(text)
-    model = getattr(emb, "model_name", model_name)
+    model = getattr(embedder, "model_name", model_name)
     old_meta, old_ids, old_hashes, old_vectors, reason = _load_reusable_index(out, model, expected_dimension)
+    # Indexes written before per-node hashes were introduced can be migrated
+    # without an expensive model pass when they exactly describe this graph.
+    if (
+        reason is None
+        and not old_hashes
+        and old_ids == ids
+        and old_meta.get("graph_fingerprint") == graph_fingerprint(G)
+    ):
+        old_hashes = dict(hashes)
     mode = "full" if full or reason not in (None, "missing") else "incremental"
     if full:
         reason = "forced"
@@ -293,6 +303,7 @@ def build_semantic_index(
             embed_texts.append(texts_by_id[sid])
     embedded16 = np.zeros((0, expected_dimension or 0), dtype=np.float16)
     if embed_texts:
+        emb = embedder or FastEmbedder(model_name, cache_dir=model_cache, offline=offline)
         embedded = _normalize_rows(np.asarray(emb.embed(embed_texts), dtype=np.float32))
         embedded16 = embedded.astype(np.float16)
     if embed_texts and expected_dimension is not None and embedded16.shape[1] != int(expected_dimension):
