@@ -10,6 +10,7 @@ from networkx.readwrite import json_graph
 
 from graphify.semantic_search import (
     DEFAULT_MODEL,
+    HASHES_NAME,
     SemanticIndexStale,
     build_semantic_index,
     hybrid_rank,
@@ -33,6 +34,22 @@ class FakeEmbedder:
                 rows.append([0.0, 1.0, 0.0])
             else:
                 rows.append([0.0, 0.0, 1.0])
+        return np.asarray(rows, dtype=np.float32)
+
+
+class CountingEmbedder(FakeEmbedder):
+    def __init__(self, model_name="fake/all-MiniLM-L6-v2", width=3):
+        self.model_name = model_name
+        self.width = width
+        self.calls = []
+
+    def embed(self, texts):
+        texts = list(texts)
+        self.calls.append(texts)
+        rows = []
+        for text in texts:
+            digest = sum(text.encode("utf-8")) or 1
+            rows.append([float((digest + i) % 17 + 1) for i in range(self.width)])
         return np.asarray(rows, dtype=np.float32)
 
 
@@ -90,6 +107,9 @@ def test_index_serialization_validation_staleness_and_float16(tmp_path):
     index = build_semantic_index(g, graph_path=graph_path, out_dir=out, embedder=FakeEmbedder())
     assert index.vectors.dtype == np.float16
     assert index.ids == ["n-auth", "n-pay"]
+    hashes = json.loads((out / HASHES_NAME).read_text())
+    assert list(hashes) == index.ids
+    assert all(isinstance(value, str) and len(value) == 64 for value in hashes.values())
     loaded = load_semantic_index(g, graph_path=graph_path, out_dir=out, model_name=FakeEmbedder.model_name)
     assert loaded.dimension == 3
     g.add_node("new", label="new")
@@ -130,6 +150,95 @@ def test_build_semantic_index_records_requested_model_with_fake_embedder(tmp_pat
         embedder=FakeEmbedder(),
     )
     assert idx.metadata["model"] == FakeEmbedder.model_name
+
+
+def test_incremental_no_change_reuses_vectors_and_embeds_zero_nodes(tmp_path):
+    g = make_graph()
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps(json_graph.node_link_data(g, edges="links")))
+    first_embedder = CountingEmbedder()
+    first = build_semantic_index(g, graph_path=graph_path, out_dir=tmp_path, embedder=first_embedder)
+    second_embedder = CountingEmbedder()
+
+    second = build_semantic_index(g, graph_path=graph_path, out_dir=tmp_path, embedder=second_embedder)
+
+    assert second.ids == first.ids
+    assert second_embedder.calls == []
+    assert np.array_equal(second.vectors, first.vectors)
+    assert second.metadata["mode"] == "incremental"
+    assert second.metadata["reused_count"] == 2
+    assert second.metadata["embedded_count"] == 0
+    assert second.metadata["removed_count"] == 0
+
+
+def test_incremental_changed_new_and_deleted_nodes_only_embeds_changed_set(tmp_path):
+    g = make_graph()
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps(json_graph.node_link_data(g, edges="links")))
+    build_semantic_index(g, graph_path=graph_path, out_dir=tmp_path, embedder=CountingEmbedder())
+    g.nodes["n-auth"]["canonical_template"] = "handles login and sessions changed"
+    g.remove_node("n-pay")
+    g.add_node("n-cache", label="CacheWriter", node_type="function", canonical_template="cache storage")
+    embedder = CountingEmbedder()
+
+    idx = build_semantic_index(g, graph_path=graph_path, out_dir=tmp_path, embedder=embedder)
+
+    assert idx.ids == ["n-auth", "n-cache"]
+    assert len(embedder.calls) == 1
+    assert len(embedder.calls[0]) == 2
+    assert idx.metadata["reused_count"] == 0
+    assert idx.metadata["embedded_count"] == 2
+    assert idx.metadata["removed_count"] == 1
+
+
+def test_full_forces_reembed_even_when_unchanged(tmp_path):
+    g = make_graph()
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps(json_graph.node_link_data(g, edges="links")))
+    build_semantic_index(g, graph_path=graph_path, out_dir=tmp_path, embedder=CountingEmbedder())
+    embedder = CountingEmbedder()
+
+    idx = build_semantic_index(g, graph_path=graph_path, out_dir=tmp_path, embedder=embedder, full=True)
+
+    assert len(embedder.calls) == 1
+    assert len(embedder.calls[0]) == 2
+    assert idx.metadata["mode"] == "full"
+    assert idx.metadata["reused_count"] == 0
+    assert idx.metadata["embedded_count"] == 2
+
+
+def test_model_or_dimension_mismatch_full_rebuilds_without_reuse(tmp_path):
+    g = make_graph()
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps(json_graph.node_link_data(g, edges="links")))
+    build_semantic_index(g, graph_path=graph_path, out_dir=tmp_path, embedder=CountingEmbedder(model_name="fake/one", width=3))
+    model_mismatch = CountingEmbedder(model_name="fake/two", width=3)
+    idx_model = build_semantic_index(g, graph_path=graph_path, out_dir=tmp_path, embedder=model_mismatch)
+    assert len(model_mismatch.calls[0]) == 2
+    assert idx_model.metadata["mode"] == "full"
+    assert idx_model.metadata["rebuild_reason"] == "model_mismatch"
+    dim_mismatch = CountingEmbedder(model_name="fake/two", width=4)
+    idx_dim = build_semantic_index(g, graph_path=graph_path, out_dir=tmp_path, embedder=dim_mismatch, expected_dimension=4)
+    assert len(dim_mismatch.calls[0]) == 2
+    assert idx_dim.metadata["dimension"] == 4
+
+
+def test_embedding_failure_preserves_prior_index_artifacts(tmp_path):
+    g = make_graph()
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps(json_graph.node_link_data(g, edges="links")))
+    build_semantic_index(g, graph_path=graph_path, out_dir=tmp_path, embedder=CountingEmbedder())
+    before = {p.name: p.read_bytes() for p in tmp_path.glob("semantic-*")}
+    g.add_node("n-new", label="new", node_type="function")
+
+    class FailingEmbedder(CountingEmbedder):
+        def embed(self, texts):
+            raise RuntimeError("embedding exploded")
+
+    with pytest.raises(RuntimeError):
+        build_semantic_index(g, graph_path=graph_path, out_dir=tmp_path, embedder=FailingEmbedder())
+    after = {p.name: p.read_bytes() for p in tmp_path.glob("semantic-*")}
+    assert after == before
 
 
 def test_offline_fastembed_overrides_false_env_and_uses_cache(tmp_path, monkeypatch):
