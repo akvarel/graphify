@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import re
 from graphify.extractors.base import _LANGUAGE_BUILTIN_GLOBALS, _file_stem, _make_id, _read_text
 from graphify.extractors.models import LanguageConfig
 from graphify.extractors.observability import (
@@ -3003,6 +3004,8 @@ def _extract_generic(
     # editing a call on another line never renumbers this anchor.
     obs_line_counters: dict[int, int] = {}
     obs_anchor_ids: set[str] = set()
+    text_template_line_counters: dict[int, int] = {}
+    text_template_seen_spans: set[tuple[int, int]] = set()
     obs_language = {
         ".java": "java",
         ".py": "python",
@@ -3074,6 +3077,176 @@ def _extract_generic(
             "weight": 1.0,
             "metadata": sanitize_metadata({"framework": framework, "method": method}),
         })
+
+    def _text_template_language() -> str:
+        if config.ts_module == "tree_sitter_python":
+            return "python"
+        if config.ts_module == "tree_sitter_java":
+            return "java"
+        if config.ts_module == "tree_sitter_php":
+            return "php"
+        return "typescript" if path.suffix.lower() in (".ts", ".tsx", ".mts", ".cts") else "javascript"
+
+    def _node_text(n) -> str:
+        return source[n.start_byte:n.end_byte].decode("utf-8", errors="replace")
+
+    def _strip_string(raw: str) -> str:
+        s = raw.strip()
+        prefixes = "rRuUbBfF"
+        while s and s[0] in prefixes:
+            s = s[1:]
+        if len(s) >= 6 and s[:3] in ('"""', "'''") and s[-3:] == s[:3]:
+            return s[3:-3]
+        if len(s) >= 2 and s[0] in ('\"', "'", '`') and s[-1] == s[0]:
+            return s[1:-1]
+        return s
+
+    def _canonical_text(n) -> tuple[str, str] | None:
+        raw = _node_text(n)
+        has_interpolation_child = any(c.type == "interpolation" for c in n.children)
+        if n.type in ("template_string", "template_literal") or has_interpolation_child or "interpolation" in raw or "${" in raw or re.search(r"[$#]\{?\w", raw):
+            body = _strip_string(raw)
+            body = re.sub(r"\$\{[^}]*\}", "<arg>", body)
+            body = re.sub(r"\{[^{}]+\}", "<arg>", body) if re.match(r"\s*[rRuUbB]*[fF]", raw) or has_interpolation_child else body
+            body = re.sub(r"\$[A-Za-z_][A-Za-z0-9_]*", "<arg>", body)
+            body = re.sub(r"#\{[^}]*\}", "<arg>", body)
+            return (canonicalize_log_message("static", body), "TEMPLATE")
+        if n.type in ("binary_expression", "concatenation") and ("+" in raw or "." in raw):
+            parts: list[str] = []
+            for c in n.children:
+                ct = _canonical_text(c)
+                if ct is not None:
+                    parts.append(ct[0])
+                elif c.is_named:
+                    parts.append("<arg>")
+            if parts and any(p == "<arg>" for p in parts):
+                return (canonicalize_log_message("static", "".join(parts)), "TEMPLATE")
+            return None
+        if "string" in n.type:
+            return (canonicalize_log_message("static", _strip_string(raw)), "CONSTANT")
+        return None
+
+    def _is_text_template_candidate(n) -> bool:
+        if config.ts_module not in ("tree_sitter_javascript", "tree_sitter_typescript", "tree_sitter_python", "tree_sitter_java", "tree_sitter_php"):
+            return False
+        if n.type in ("binary_expression", "concatenation"):
+            return True
+        if n.type in ("template_string", "template_literal", "string", "string_fragment", "string_literal", "encapsed_string"):
+            return True
+        return "string" in n.type and n.type not in ("string_content",)
+
+    def _ancestor_types(n) -> list[str]:
+        out = []
+        p = getattr(n, "parent", None)
+        while p is not None:
+            out.append(p.type)
+            p = getattr(p, "parent", None)
+        return out
+
+    def _skip_text_template(n) -> bool:
+        ancestors = _ancestor_types(n)
+        if any(t in config.import_types for t in ancestors):
+            return True
+        if config.ts_module == "tree_sitter_python" and "expression_statement" in ancestors:
+            p = n.parent
+            if p is not None and p.type == "expression_statement" and p.parent is not None and p.parent.children and p.parent.children[0] == p:
+                return True
+        call_types = {"call_expression", "call", "method_invocation", "function_call_expression", "member_call_expression", "scoped_call_expression"}
+        p = n.parent
+        while p is not None:
+            if p.type in call_types and classify_log_callsite(p, source) is not None:
+                return True
+            p = getattr(p, "parent", None)
+        return False
+
+    def _bound_name(n) -> str | None:
+        p = n.parent
+        while p is not None:
+            if p.type in ("variable_declarator", "assignment"):
+                left = p.child_by_field_name("name") or p.child_by_field_name("left")
+                return _read_text(left, source) if left is not None else None
+            if p.type in ("local_variable_declaration", "field_declaration"):
+                for c in p.children:
+                    if c.type in ("variable_declarator", "variable_declarator_id"):
+                        name = c.child_by_field_name("name") or c
+                        return _read_text(name, source)
+            if p.type == "const_declaration":
+                for c in p.children:
+                    if c.type in ("name", "identifier"):
+                        return _read_text(c, source)
+            if p.type == "const_element":
+                for c in p.children:
+                    if c.type in ("name", "identifier"):
+                        return _read_text(c, source)
+            if p.type in ("const_declaration", "expression_statement", "lexical_declaration"):
+                pass
+            if p.type in config.function_boundary_types or p.type in config.class_types:
+                return None
+            p = getattr(p, "parent", None)
+        return None
+
+    def _text_owner(n) -> tuple[str, str]:
+        best: tuple[int, str] | None = None
+        for owner_nid, body in function_bodies:
+            if body.start_byte <= n.start_byte and n.end_byte <= body.end_byte:
+                span = body.end_byte - body.start_byte
+                if best is None or span < best[0]:
+                    best = (span, owner_nid)
+        if best is not None:
+            return best[1], nid_to_label.get(best[1], best[1])
+        return file_nid, path.name
+
+    def _looks_sensitive(text: str, bound: str | None) -> bool:
+        hay = f"{bound or ''} {text}".lower()
+        if any(k in hay for k in ("secret", "password", "passwd", "token", "apikey", "api_key", "credential", "private_key")):
+            return True
+        if re.search(r"(sk|pk)_(live|test)_[a-z0-9]{10,}", text, re.I):
+            return True
+        if re.search(r"[A-Za-z0-9+/]{32,}={0,2}", text):
+            return True
+        return False
+
+    def _emit_text_templates() -> None:
+        language = _text_template_language()
+        def rec(n) -> None:
+            if _is_text_template_candidate(n) and not _skip_text_template(n):
+                got = _canonical_text(n)
+                if got is not None:
+                    canonical, kind = got
+                    bound = _bound_name(n)
+                    if (n.start_byte, n.end_byte) not in text_template_seen_spans and _keep_text(canonical, bound):
+                        text_template_seen_spans.add((n.start_byte, n.end_byte))
+                        line = n.start_point[0] + 1
+                        digest = hashlib.sha256(f"{CANONICALIZATION_VERSION}\n{canonical}".encode("utf-8")).hexdigest()
+                        counter = text_template_line_counters.get(line, 0) + 1
+                        text_template_line_counters[line] = counter
+                        nid = _make_id(stem, "text_template", digest[:12], str(line), str(counter))
+                        owner_nid, owner_label = _text_owner(n)
+                        md = {"language": language, "enclosing_symbol": owner_nid, "enclosing_symbol_label": owner_label}
+                        if bound:
+                            md["bound_name"] = bound.lstrip("$")
+                        nodes.append({
+                            "id": nid, "label": f"text_template {shorten_anchor_label(canonical)}", "file_type": "code",
+                            "type": "text_template", "template_kind": "CONSTANT" if bound and kind == "CONSTANT" else kind,
+                            "canonicalization_version": CANONICALIZATION_VERSION, "canonical_template": canonical, "sha256": digest,
+                            "source_file": str_path, "source_location": f"L{line}", "metadata": sanitize_metadata(md),
+                        })
+                        seen_ids.add(nid)
+                        add_edge(owner_nid, nid, "contains_text_template", line)
+                        if bound:
+                            add_edge(owner_nid, nid, "defines_text", line, metadata={"bound_name": bound.lstrip("$")})
+                    return
+            for c in n.children:
+                rec(c)
+        def _keep_text(canonical: str, bound: str | None) -> bool:
+            if not canonical or canonical.isspace():
+                return False
+            if len(canonical) < 3:
+                return False
+            if re.fullmatch(r"[\W_]+", canonical):
+                return False
+            return not _looks_sensitive(canonical, bound)
+        rec(root)
 
     def walk(node, parent_class_nid: str | None = None) -> None:
         t = node.type
@@ -5773,6 +5946,8 @@ def _extract_generic(
                 _scan_module_observability(c)
 
         _scan_module_observability(root)
+
+    _emit_text_templates()
 
     # ── Clean edges ───────────────────────────────────────────────────────────
     valid_ids = seen_ids
