@@ -108,6 +108,7 @@ What you get out of the box:
 | **God nodes** | The most-connected concepts, so you see what everything flows through |
 | **Communities** | The graph split into subsystems (Leiden), with LLM-free labels |
 | **Cross-file links** | `calls` / `imports` / `inherits` / `mixes_in` resolved across ~40 languages via tree-sitter AST |
+| **Text templates** | Useful JS/TS, Python, Java, and PHP string constants/templates become first-class `type=text_template` nodes with canonical text, versioned SHA-256 fingerprints, source locations, enclosing owners, and `contains_text_template` / `defines_text` edges |
 | **Query, path, explain** | Ask a question, trace the path between two things, or explain one concept, all against `graph.json` |
 | **Rationale + doc refs** | `# NOTE:` / `# WHY:` comments and ADR/RFC citations become first-class nodes linked to the code |
 | **Beyond code** | Docs, PDFs, images, and video/audio all map into the same graph |
