@@ -6737,7 +6737,7 @@ def extract(
         if _sf and "\\" in str(_sf):
             _item["source_file"] = PurePath(_sf).as_posix()
 
-    # Reconcile observability-anchor enclosing_symbol metadata with the
+    # Reconcile derived-node enclosing_symbol metadata with the
     # canonical ids: the id-remap passes above rewrite node ids and edge
     # endpoints (absolute-path-derived ids become repo-relative), but a
     # metadata value stamped at emit time would otherwise keep the stale
@@ -6747,7 +6747,8 @@ def extract(
         n.get("id", ""): n.get("label", "") for n in all_nodes if isinstance(n, dict)
     }
     for n in all_nodes:
-        if n.get("type") != "observability_anchor":
+        node_type = n.get("type")
+        if node_type not in ("observability_anchor", "text_template"):
             continue
         md = n.get("metadata")
         if not isinstance(md, dict):
@@ -6755,7 +6756,12 @@ def extract(
         for e in all_edges:
             if e.get("target") != n.get("id"):
                 continue
-            if e.get("relation") not in ("emits_log_template", "has_dynamic_log_callsite"):
+            valid_relations = (
+                ("emits_log_template", "has_dynamic_log_callsite")
+                if node_type == "observability_anchor"
+                else ("defines_text", "contains_text_template")
+            )
+            if e.get("relation") not in valid_relations:
                 continue
             src = e.get("source")
             if isinstance(src, str):

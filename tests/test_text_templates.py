@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
+from pathlib import Path
 
-from graphify.extract import extract_java, extract_js, extract_php, extract_python
+from graphify.extract import extract, extract_java, extract_js, extract_php, extract_python
 from graphify.extractors.observability import CANONICALIZATION_VERSION
 
 
@@ -208,4 +210,30 @@ def test_concatenated_templates_preserve_all_literal_fragments(tmp_path):
 
     php = tmp_path / "concat.php"
     php.write_text("<?php $msg = \"A \" . $id . \" B\";\n", encoding="utf-8")
-    assert [t["canonical_template"] for t in _templates(extract_php(php))] == ["A <arg> B"]
+    php_templates = _templates(extract_php(php))
+    assert [t["canonical_template"] for t in php_templates] == ["A <arg> B"]
+    assert php_templates[0]["metadata"]["bound_name"] == "msg"
+
+
+def test_full_extract_reconciles_template_owner_metadata_after_id_remap(tmp_path):
+    source = tmp_path / "app.py"
+    source.write_text(
+        "def render(user):\n"
+        "    message = f'Welcome {user}'\n",
+        encoding="utf-8",
+    )
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        result = extract([Path("app.py")], cache_root=tmp_path)
+    finally:
+        os.chdir(old_cwd)
+
+    template = _templates(result)[0]
+    edge = next(
+        e for e in result["edges"]
+        if e["target"] == template["id"] and e["relation"] == "defines_text"
+    )
+    assert template["metadata"]["enclosing_symbol"] == edge["source"]
+    owner = next(n for n in result["nodes"] if n["id"] == edge["source"])
+    assert template["metadata"]["enclosing_symbol_label"] == owner["label"]
