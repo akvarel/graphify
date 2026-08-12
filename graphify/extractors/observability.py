@@ -14,7 +14,7 @@ Supported frameworks (deliberately conservative, no guessing):
 - ``logger``: member calls ``<recv>.debug/info/warn/error(...)`` where the
   receiver's final identifier segment is ``logger`` or ``log`` (any case), e.g.
   pino/winston-style ``logger.info(...)``, NestJS ``this.logger.warn(...)``.
-- ``bugzero_loki``: BugZero's ``LokiClient`` — ``<loki>.log({...})`` and
+- ``loki_client``: Loki-compatible clients — ``<loki>.log({...})`` and
   ``<loki>.push([{...}])`` where the receiver's final identifier segment starts
   with ``loki`` (``loki``, ``lokiClient``, ``LokiClient``, ``loki_client``) and
   the payload is an object/array literal carrying a ``message`` property.
@@ -94,7 +94,7 @@ _CONSOLE_RECEIVER = "console"
 # or `logger`).
 _LOGGER_RECEIVER_RE = re.compile(r"^(?:logger|log)$", re.IGNORECASE)
 
-# BugZero LokiClient instances: `loki`, `lokiClient`, `LokiClient`,
+# Loki-compatible client instances: `loki`, `lokiClient`, `LokiClient`,
 # `loki_client`, `LOKI_CLIENT`, ...
 _LOKI_RECEIVER_RE = re.compile(r"^loki(?:[_-]?client)?$", re.IGNORECASE)
 _LOKI_METHODS = frozenset({"log", "push"})
@@ -181,7 +181,7 @@ def classify_log_callsite(node, source: bytes) -> tuple[str, str] | None:
         if recv is not None and _LOGGER_RECEIVER_RE.match(recv) and method in _LOG_LEVEL_METHODS:
             return ("logger", method)
         if recv is not None and _LOKI_RECEIVER_RE.match(recv) and method in _LOKI_METHODS:
-            return ("bugzero_loki", method)
+            return ("loki_client", method)
         return None
     if node.type == "method_invocation":
         method = _read_text(node.child_by_field_name("name"), source)
@@ -337,7 +337,7 @@ def extract_log_message(
     named = [c for c in args.children if c.is_named]
     if not named:
         return None
-    if framework == "bugzero_loki":
+    if framework == "loki_client":
         kind, template = _extract_loki_message(named[0], source)
     else:
         kind, template = _classify_message_expr(named[0], source)

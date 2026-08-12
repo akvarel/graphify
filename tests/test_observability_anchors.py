@@ -99,9 +99,9 @@ class TestClassifyLogCallsite:
     def test_loki_receivers(self):
         for recv in ("loki", "lokiClient", "LokiClient", "loki_client", "LOKI"):
             node, source = _first_call(f"{recv}.log({{ message: 'x' }});")
-            assert classify_log_callsite(node, source) == ("bugzero_loki", "log")
+            assert classify_log_callsite(node, source) == ("loki_client", "log")
             node, source = _first_call(f"{recv}.push([{{ message: 'x' }}]);")
-            assert classify_log_callsite(node, source) == ("bugzero_loki", "push")
+            assert classify_log_callsite(node, source) == ("loki_client", "push")
 
     def test_plain_function_call_not_logging(self):
         node, source = _first_call("doSomething('x');")
@@ -137,25 +137,25 @@ class TestMessageRecovery:
         node, source = _first_call(
             "loki.log({ level: 'info', message: 'pushed', labels: {} });"
         )
-        assert extract_log_message(node, source, "bugzero_loki") == ("static", "pushed")
+        assert extract_log_message(node, source, "loki_client") == ("static", "pushed")
 
     def test_loki_push_array_joins_static_messages(self):
         node, source = _first_call(
             "loki.push([{ level: 'info', message: 'a' }, { level: 'warn', message: 'b' }]);"
         )
-        assert extract_log_message(node, source, "bugzero_loki") == ("static", "a | b")
+        assert extract_log_message(node, source, "loki_client") == ("static", "a | b")
 
     def test_loki_computed_message_is_dynamic(self):
         node, source = _first_call("loki.log(entry('info', msg));")
-        assert extract_log_message(node, source, "bugzero_loki") == ("dynamic", None)
+        assert extract_log_message(node, source, "loki_client") == ("dynamic", None)
 
     def test_loki_missing_message_key_is_dynamic(self):
         node, source = _first_call("loki.log({ level: 'info' });")
-        assert extract_log_message(node, source, "bugzero_loki") == ("dynamic", None)
+        assert extract_log_message(node, source, "loki_client") == ("dynamic", None)
 
     def test_loki_message_interpolation(self):
         node, source = _first_call("loki.log({ message: `run ${id} done` });")
-        assert extract_log_message(node, source, "bugzero_loki") == ("static", "run <arg> done")
+        assert extract_log_message(node, source, "loki_client") == ("static", "run <arg> done")
 
 
 # ── whitespace convergence (frozen invariant) ────────────────────────────────
@@ -169,8 +169,8 @@ class TestWhitespaceConvergence:
         node, source = _first_call('console.info(" job   started ");')
         assert extract_log_message(node, source, "console") == ("static", "job started")
 
-    def test_bugzero_style_template_collapses_and_substitutes(self):
-        # Real BugZero-style callsite: ` ⚠️  Graphify evidence index: ${index}`.
+    def test_padded_template_collapses_and_substitutes(self):
+        # Representative padded callsite: ` ⚠️  Graphify evidence index: ${index}`.
         node, source = _first_call("console.warn(`  ⚠️  Graphify evidence index: ${index}`);")
         assert extract_log_message(node, source, "console") == (
             "static",
@@ -193,10 +193,10 @@ class TestWhitespaceConvergence:
         # fingerprint_template for the same canonical template.
         assert sha256_hex(" job started ") == sha256_hex("job started")
 
-    def test_bugzero_style_anchor_matches_frozen_cross_repo_fingerprint(self, tmp_path):
-        """End-to-end: the anchor emitted for the real BugZero-style callsite
+    def test_anchor_matches_frozen_cross_component_fingerprint(self, tmp_path):
+        """End-to-end: the anchor emitted for a representative padded callsite
         carries the collapsed canonical template and the frozen contract digest
-        that Incident Context asserts for the same template."""
+        used by a runtime correlation consumer for the same template."""
         f = _write_js(
             tmp_path,
             "app.ts",
@@ -299,9 +299,9 @@ def test_extract_logger_and_loki_callsites(tmp_path):
     by_fw = {}
     for a in anchors:
         by_fw.setdefault(a["metadata"]["framework"], []).append(a)
-    assert sorted(by_fw) == ["bugzero_loki", "logger"]
+    assert sorted(by_fw) == ["logger", "loki_client"]
     assert [a["canonical_template"] for a in by_fw["logger"]] == ["booted", "nested"]
-    loki_templates = sorted(a["canonical_template"] for a in by_fw["bugzero_loki"])
+    loki_templates = sorted(a["canonical_template"] for a in by_fw["loki_client"])
     assert loki_templates == ["a | b", "pushed"]
 
 
