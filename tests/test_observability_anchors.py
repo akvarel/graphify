@@ -391,7 +391,7 @@ def test_extract_dynamic_calls_in_method_connect_to_method(tmp_path):
     assert a["metadata"]["enclosing_symbol_label"] == ".fail()"
 
 
-def test_extract_out_of_scope_patterns_not_anchored(tmp_path):
+def test_extract_log_methods_anchored_but_invalid_patterns_excluded(tmp_path):
     f = _write_js(
         tmp_path, "scope.js",
         'function go() {\n'
@@ -402,7 +402,11 @@ def test_extract_out_of_scope_patterns_not_anchored(tmp_path):
         'client.info("not a logger");\n',
     )
     result = extract_js(f)
-    assert _anchors(result) == []
+    anchors = _anchors(result)
+    assert {a["canonical_template"] for a in anchors} == {
+        "plain log", "plain logger log",
+    }
+    assert {a["metadata"]["framework"] for a in anchors} == {"console", "logger"}
 
 
 def test_extract_ids_deterministic_across_runs(tmp_path):
