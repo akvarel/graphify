@@ -9,9 +9,8 @@ when one exists.
 
 Supported frameworks (deliberately conservative, no guessing):
 
-- ``console``: ``console.debug/info/warn/error(...)`` (the method set the first
-  slice targets; ``console.log`` is intentionally not anchored yet).
-- ``logger``: member calls ``<recv>.debug/info/warn/error(...)`` where the
+- ``console``: ``console.debug/info/warn/error/log(...)``.
+- ``logger``: member calls ``<recv>.debug/info/warn/error/log(...)`` where the
   receiver's final identifier segment is ``logger`` or ``log`` (any case), e.g.
   pino/winston-style ``logger.info(...)``, NestJS ``this.logger.warn(...)``.
 - ``loki_client``: Loki-compatible clients — ``<loki>.log({...})`` and
@@ -90,9 +89,8 @@ CANONICALIZATION_VERSION = "runtime-code-canonicalization/v1"
 ANCHOR_KIND_LOG_TEMPLATE = "LOG_TEMPLATE"
 ANCHOR_KIND_DYNAMIC_CALLSITE = "DYNAMIC_LOG_CALLSITE"
 
-# The level methods anchored for console/loggers (slice 1; console.log /
-# logger.log are intentionally out of scope for now).
-_LOG_LEVEL_METHODS = frozenset({"debug", "info", "warn", "error"})
+# The level methods anchored for console/loggers.
+_LOG_LEVEL_METHODS = frozenset({"debug", "info", "warn", "error", "log"})
 _PYTHON_LOG_LEVEL_METHODS = frozenset({
     "debug", "info", "warning", "warn", "error", "exception", "critical", "fatal",
 })
