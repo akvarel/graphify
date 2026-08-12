@@ -75,8 +75,9 @@ graphify semantic build --model sentence-transformers/all-MiniLM-L6-v2
 
 ## Limitations
 
-- Brute-force NumPy dot product is intended for local CPU search up to roughly 60k nodes.
-- The semantic extra may download the FastEmbed model on first real non-offline use. Use `--model-cache` to prewarm and `--offline --model-cache` to require bundled resources. This implementation and its tests do not benchmark Avion and do not download the real model.
+- Brute-force NumPy dot product is intended for local CPU search at the tested 60k-node scale. Larger graphs should use an ANN backend.
+- Semantic index builds currently recompute all indexed nodes. Incremental embedding reuse is not implemented yet, so large frequently changing graphs should rebuild during CI or scheduled maintenance.
+- The semantic extra may download the FastEmbed model on first real non-offline use. Use `--model-cache` to prewarm and `--offline --model-cache` to require bundled resources.
 - FastEmbed depends on ONNX Runtime, so this path is not a no-native-binaries implementation. The embedder protocol is kept narrow for a future lat/WASM backend.
 - The projection intentionally excludes raw content and unknown fields to reduce secret exposure risk. This trades recall for privacy.
 - Hybrid ranking currently prints ranked nodes. It does not alter `graphify query` scoped subgraph rendering.
@@ -89,3 +90,22 @@ graphify semantic build --model sentence-transformers/all-MiniLM-L6-v2
 4. Run representative queries with `--top-k 10`, `--top-k 100`, and `--hybrid --expand-context`.
 5. Compare top results against `graphify query` and existing lexical expectations.
 6. Record CPU, RAM, Python version, NumPy version, FastEmbed version, and model name.
+
+## Full Avion benchmark
+
+Measured on 2026-08-12 using the aggregate graph of all Avion services:
+
+- Graph: 60,590 nodes and 118,408 edges.
+- Model: `sentence-transformers/all-MiniLM-L6-v2`, 384 dimensions, CPU-only, prewarmed offline cache.
+- Full semantic build: 10 minutes 16.98 seconds wall time.
+- Throughput: approximately 98.2 indexed nodes/second.
+- CPU utilization: 793%, approximately eight saturated CPU cores.
+- Peak RSS: 2,461,108 KiB, approximately 2.35 GiB.
+- Model cache: 182,206,126 bytes, approximately 173.8 MiB.
+- Float16 vectors: 46,533,248 bytes, approximately 44.4 MiB.
+- Node ID map: 5,813,158 bytes, approximately 5.54 MiB.
+- Total persisted semantic index excluding model cache: approximately 49.9 MiB.
+
+Cold CLI queries, including graph JSON load and model startup, took 7.6 to 8.1 seconds with roughly 655 MiB RSS. In one warm process, 20 hybrid queries had a median of 149 ms and p95 of 360 ms. The Float16 and Float32 indexes produced identical top-10 results for both tested English Avion queries.
+
+The default English MiniLM model retrieved relevant booking and Redis error anchors for English queries. It did not provide acceptable Russian-to-English retrieval. Use `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` when cross-language Russian queries are required. A 2,000-node sample measured that multilingual model at about 90.7 nodes/second, with approximately 481 MiB model cache and 1.18 GiB sample-run RSS, so it trades more disk and slower indexing for multilingual recall.
