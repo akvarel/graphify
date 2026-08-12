@@ -84,7 +84,7 @@ class Worker {
     assert set(static) == {"job started", "job <arg> failed"}
     assert static["job started"]["metadata"]["framework"] == "psr3"
     assert static["job <arg> failed"]["metadata"]["framework"] == "laravel_log"
-    assert all(a["metadata"]["enclosing_symbol_label"] == "run()" for a in anchors)
+    assert all(a["metadata"]["enclosing_symbol_label"] == ".run()" for a in anchors)
     dynamic = [a for a in anchors if a["anchor_kind"] == "DYNAMIC_LOG_CALLSITE"]
     assert len(dynamic) == 1
     assert dynamic[0]["metadata"]["framework"] == "php_error_log"
