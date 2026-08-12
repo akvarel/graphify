@@ -171,6 +171,49 @@ def test_incremental_no_change_reuses_vectors_and_embeds_zero_nodes(tmp_path):
     assert second.metadata["removed_count"] == 0
 
 
+def test_incremental_no_change_does_not_construct_real_embedder(tmp_path, monkeypatch):
+    g = make_graph()
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps(json_graph.node_link_data(g, edges="links")))
+    build_semantic_index(g, graph_path=graph_path, out_dir=tmp_path, embedder=CountingEmbedder())
+
+    def fail_constructor(*args, **kwargs):
+        raise AssertionError("unchanged incremental build must not load the model")
+
+    monkeypatch.setattr("graphify.semantic_search.FastEmbedder", fail_constructor)
+    idx = build_semantic_index(
+        g,
+        graph_path=graph_path,
+        out_dir=tmp_path,
+        model_name=CountingEmbedder.model_name,
+    )
+    assert idx.metadata["embedded_count"] == 0
+    assert idx.metadata["reused_count"] == 2
+
+
+def test_pre_hash_index_migrates_without_reembedding(tmp_path, monkeypatch):
+    g = make_graph()
+    graph_path = tmp_path / "graph.json"
+    graph_path.write_text(json.dumps(json_graph.node_link_data(g, edges="links")))
+    first = build_semantic_index(g, graph_path=graph_path, out_dir=tmp_path, embedder=CountingEmbedder())
+    (tmp_path / HASHES_NAME).unlink()
+
+    def fail_constructor(*args, **kwargs):
+        raise AssertionError("compatible legacy index must migrate without loading the model")
+
+    monkeypatch.setattr("graphify.semantic_search.FastEmbedder", fail_constructor)
+    migrated = build_semantic_index(
+        g,
+        graph_path=graph_path,
+        out_dir=tmp_path,
+        model_name=CountingEmbedder.model_name,
+    )
+    assert np.array_equal(migrated.vectors, first.vectors)
+    assert migrated.metadata["reused_count"] == 2
+    assert migrated.metadata["embedded_count"] == 0
+    assert (tmp_path / HASHES_NAME).exists()
+
+
 def test_incremental_changed_new_and_deleted_nodes_only_embeds_changed_set(tmp_path):
     g = make_graph()
     graph_path = tmp_path / "graph.json"

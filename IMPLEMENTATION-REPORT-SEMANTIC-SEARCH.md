@@ -29,6 +29,16 @@ pip install "graphifyy[semantic]"
 uv tool install "graphifyy[semantic]"
 ```
 
+The default build is incremental. It reuses vectors whose node ID and projected-text hash are unchanged:
+
+```bash
+graphify semantic build --graph graphify-out/graph.json
+# Force all nodes through the model again:
+graphify semantic build --graph graphify-out/graph.json --full
+```
+
+After `graphify update`, an existing semantic index is refreshed automatically in strict offline mode. Normal graph updates still succeed with a warning if the optional semantic dependencies or recorded model cache are unavailable. An index created before per-node hashes existed is migrated without re-embedding when its graph fingerprint and stable node order still match.
+
 Build the index:
 
 ```bash
@@ -119,3 +129,13 @@ Measured on 2026-08-12 using the aggregate graph of all Avion services:
 Cold CLI queries, including graph JSON load and model startup, took 7.6 to 8.1 seconds with roughly 655 MiB RSS. In one warm process, 20 hybrid queries had a median of 149 ms and p95 of 360 ms. The Float16 and Float32 indexes produced identical top-10 results for both tested English Avion queries.
 
 The default English MiniLM model retrieved relevant booking and Redis error anchors for English queries. It did not provide acceptable Russian-to-English retrieval. Use `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` when cross-language Russian queries are required. A 2,000-node sample measured that multilingual model at about 90.7 nodes/second, with approximately 481 MiB model cache and 1.18 GiB sample-run RSS, so it trades more disk and slower indexing for multilingual recall.
+
+### Incremental Avion benchmark
+
+Using the same 60,590-node graph and persisted full index:
+
+- No code/text changes: 60,590 vectors reused, 0 embedded, 0 removed; 7.82 seconds wall time; 601 MiB peak RSS.
+- One projected node changed: 60,589 reused, 1 embedded, 0 removed; 7.06 seconds wall time; 853 MiB peak RSS.
+- The remaining approximately seven seconds is dominated by loading and parsing the 103.9 MiB graph JSON, fingerprinting projected node text, loading the ID/hash maps, and atomically rewriting the roughly 50 MiB index. Model inference is no longer proportional to the whole graph.
+
+Further optimization should avoid rewriting unchanged vector storage and replace full graph JSON parsing with a compact manifest or database-backed index. That would reduce no-change updates below the current seven-second floor.
