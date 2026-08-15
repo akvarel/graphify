@@ -8,6 +8,7 @@ working and tests can inject deterministic fake embedders.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -102,7 +103,7 @@ class FastEmbedder:
         if self.cache_dir is not None:
             os.environ["FASTEMBED_CACHE_PATH"] = str(self.cache_dir)
         try:
-            from fastembed import TextEmbedding
+            TextEmbedding = importlib.import_module("fastembed").TextEmbedding
         except ImportError as exc:
             raise SemanticDependencyMissing(
                 "semantic search requires optional dependencies. Install with `pip install graphifyy[semantic]`."
