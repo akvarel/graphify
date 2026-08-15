@@ -1749,8 +1749,10 @@ def extract_vue(path: Path) -> dict:
 
 
 def extract_java(path: Path) -> dict:
-    """Extract classes, interfaces, methods, constructors, and imports from a .java file."""
-    return _extract_generic(path, _JAVA_CONFIG, emit_observability_anchors=True)
+    """Extract classes, interfaces, methods, constructors, imports, and static data-flow from a .java file."""
+    result = _extract_generic(path, _JAVA_CONFIG, emit_observability_anchors=True)
+    from graphify.extractors.java_data_flow import augment_java_data_flow
+    return augment_java_data_flow(path, result)
 
 
 def _is_spock_file(path: Path, ts_result: dict) -> bool:

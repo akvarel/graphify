@@ -771,11 +771,19 @@ def _doc_twin_remap(nodes: list) -> dict[str, str]:
     return remap
 
 
-def build_from_json(extraction: dict, *, directed: bool = False, root: str | Path | None = None) -> nx.Graph:
+def build_from_json(
+    extraction: dict,
+    *,
+    directed: bool = False,
+    root: str | Path | None = None,
+    multigraph: bool = False,
+) -> nx.Graph:
     """Build a NetworkX graph from an extraction dict.
 
     directed=True produces a DiGraph that preserves edge direction (source→target).
     directed=False (default) produces an undirected Graph for backward compatibility.
+    multigraph=True preserves distinct relations between the same endpoint pair.
+    Data-flow consumers should combine it with directed=True.
     root: if given, absolute source_file paths from semantic subagents are made
         relative to root so all nodes share a consistent path key (#932).
     """
@@ -928,7 +936,10 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
                     _doc_remap.get(n, n) if _hashable(n) else n for n in he["nodes"]
                 ]
 
-    G: nx.Graph = nx.DiGraph() if directed else nx.Graph()
+    if multigraph:
+        G: nx.Graph = nx.MultiDiGraph() if directed else nx.MultiGraph()
+    else:
+        G = nx.DiGraph() if directed else nx.Graph()
     for node in extraction.get("nodes", []):
         # Skip dict nodes with a missing or non-hashable id (e.g. a list emitted
         # by a buggy LLM extraction) so NetworkX add_node never raises
