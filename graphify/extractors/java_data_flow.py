@@ -55,7 +55,10 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         source = path.read_bytes()
         root = parser.parse(source).root_node
     except Exception as exc:
-        status["java"] = {"status": "failed", "reason": type(exc).__name__}
+        if isinstance(exc, ModuleNotFoundError) and getattr(exc, "name", "") == "tree_sitter_java":
+            status["java"] = {"status": "unsupported", "reason": "tree_sitter_java_unavailable"}
+        else:
+            status["java"] = {"status": "failed", "reason": type(exc).__name__}
         append_status_node(status["java"], path.stem)
         return result
     status["java"] = {"status": "incomplete" if root.has_error else "succeeded"}
@@ -127,6 +130,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
     methods_by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
     pending_bodies: list[tuple[object, dict[str, Any], str]] = []
     pending_transformations: list[tuple[str | None, dict[str, Any], int, object]] = []
+    pending_field_initializers: list[tuple[object, str, str]] = []
 
     def named_child(n, *fields):
         for f in fields:
@@ -157,29 +161,35 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                     name = _read_text(name_node, source) if name_node is not None else ""
                     vid = add_value(f"{cls}.{name}", "field", name, name_node or c, typ)
                     classes[cls]["fields"][name] = {"id": vid, "type": typ}
-                    val = named_child(c, "value")
-                    if val is not None:
-                        src = expr_value(val, None, cls, [{}])
-                        add_edge(src, vid, "WRITTEN_TO", c)
+                    if named_child(c, "value") is not None:
+                        pending_field_initializers.append((c, cls, name))
         if n.type in {"method_declaration", "constructor_declaration"} and cls and cls in classes:
             name_node = named_child(n, "name")
             name = _read_text(name_node, source) if name_node is not None else cls
+            parameter_specs = []
+            params = named_child(n, "parameters")
+            if params:
+                for p in params.children:
+                    if p.type in {"formal_parameter", "spread_parameter"}:
+                        pn = named_child(p, "name")
+                        parameter_specs.append({
+                            "node": p,
+                            "name_node": pn,
+                            "name": _read_text(pn, source) if pn is not None else "",
+                            "type": first_type_text(p),
+                        })
+            signature = f"{cls}.{name}({','.join(spec['type'] for spec in parameter_specs)})"
             label = f".{name}()"
-            mid = next((x.get("id") for x in nodes if x.get("label") == label and cls.lower() in x.get("id", "")), None)
+            exact_loc = loc(n)
+            structural_matches = [
+                x.get("id")
+                for x in nodes
+                if x.get("label") == label
+                and cls.lower() in x.get("id", "")
+                and str(x.get("source_location", "")).startswith(exact_loc)
+            ]
+            mid = structural_matches[0] if len(structural_matches) == 1 else _make_id(stem, signature)
             if mid:
-                parameter_specs = []
-                params = named_child(n, "parameters")
-                if params:
-                    for p in params.children:
-                        if p.type in {"formal_parameter", "spread_parameter"}:
-                            pn = named_child(p, "name")
-                            parameter_specs.append({
-                                "node": p,
-                                "name_node": pn,
-                                "name": _read_text(pn, source) if pn is not None else "",
-                                "type": first_type_text(p),
-                            })
-                signature = f"{cls}.{name}({','.join(spec['type'] for spec in parameter_specs)})"
                 info = {
                     "id": mid,
                     "symbol": signature,
@@ -267,7 +277,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             nm = name_of(n)
             local = lookup_local(locals_map, nm)
             if local:
-                return local["id"]
+                return local["current"] if "current" in local else local["id"]
             if method:
                 for p in method["params"]:
                     if p["name"] == nm:
@@ -403,10 +413,13 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         elif n.type in {"assignment_expression", "assignment"}:
             left = named_child(n, "left")
             right = named_child(n, "right")
-            target = expr_value(left, method, cls, locals_map)
+            local_target = lookup_local(locals_map, name_of(left)) if left is not None and left.type == "identifier" else None
+            target = local_target["id"] if local_target else expr_value(left, method, cls, locals_map)
             source_id = expr_value(right, method, cls, locals_map)
             writes_field = is_field_value(target)
             add_edge(source_id, target, "WRITTEN_TO" if writes_field else "FLOWS_TO", n)
+            if local_target and not writes_field:
+                local_target["current"] = source_id
         elif n.type == "return_statement":
             val = next((c for c in n.children if c.is_named), None)
             source_id = expr_value(val, method, cls, locals_map)
@@ -418,10 +431,22 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             resolve_call(n, method, cls, locals_map)
         elif n.type == "object_creation_expression":
             object_value(n, method, cls, locals_map)
+        elif n.type == "for_statement":
+            locals_map.append({})
+            try:
+                for c in n.children:
+                    scan_body(c, method, cls)
+            finally:
+                locals_map.pop()
+            return
         for c in n.children:
             scan_body(c, method, cls)
 
     walk(root)
+    for declarator, cls, field_name in pending_field_initializers:
+        field = classes.get(cls, {}).get("fields", {}).get(field_name)
+        src = expr_value(named_child(declarator, "value"), None, cls, [{}])
+        add_edge(src, (field or {}).get("id"), "WRITTEN_TO", declarator)
     for body, method, cls in pending_bodies:
         method["body"] = body
         scan_body(body, method, cls)

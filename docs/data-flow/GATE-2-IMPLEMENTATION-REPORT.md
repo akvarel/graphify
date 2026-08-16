@@ -111,24 +111,33 @@ No cross-file value flow, name-only callee matching, Gate 2B, or Gate 3 traversa
 
 Branch: `feature/java-local-data-flow-v8`
 
-Final commit SHA: `FINAL_SHA_PLACEHOLDER`
+Final delivery SHA: supplied externally after commit creation. This report does not embed a self-referential final commit hash.
 
-Remote comparison evidence before final validation:
+Remote comparison evidence before remediation:
 
-- `fork/v8`: `513138436856bfb0cbb5d805675485f7589f6eab`
-- `fork/feature/java-local-data-flow`: `2b6c07c3660ccb31251bcd1c45385343652b147a`
-- merge-base with `fork/v8`: `4fca621532a23f84f69c31e397b75f8105cb5390`
+- `upstream/v8`: `4fca621532a23f84f69c31e397b75f8105cb5390`
+- Full-suite baseline evidence before these fixes: 4568 passed, 47 skipped.
 
-Validation commands executed in the project virtual environment:
+Post-7cbbdf7 remediation added regression coverage for:
+
+- assignment kill/order so stale local initializer dependencies do not create false `TRANSFORMED_BY` edges;
+- for-loop lexical scope so initializer locals expire after the loop and do not shadow fields;
+- exact same-file callee identity for overloads, with portable signature metadata for different arities and fail-closed same-arity ambiguity;
+- deferred field initializer processing so forward field references emit `WRITTEN_TO` after all fields are indexed;
+- documented unsupported status for unavailable `tree_sitter_java` rather than reporting a failed extractor.
+
+Validation commands executed in the project virtual environment after remediation:
 
 | Check | Result |
 |---|---|
-| `.venv/bin/python -m pytest tests/test_java_data_flow.py -q` | PASS, 20 passed, 1 warning |
-| `.venv/bin/python -m pytest tests/test_java_data_flow.py tests/test_java_type_resolution.py tests/test_java_member_calls.py tests/test_observability_anchors_java.py tests/test_build.py -q` | PASS, 160 passed, 1 warning |
+| `.venv/bin/python -m pytest tests/test_java_data_flow.py -q` | PASS, 25 passed, 1 warning |
+| `.venv/bin/python -m pytest tests/test_java_data_flow.py tests/test_java_type_resolution.py tests/test_java_member_calls.py tests/test_observability_anchors_java.py tests/test_build.py -q` | PASS, 165 passed, 1 warning |
 | `.venv/bin/python -m ruff check graphify/extractors/java_data_flow.py tests/test_java_data_flow.py` | PASS |
-| `.venv/bin/python -m pyright graphify/extractors/java_data_flow.py` | PASS, 0 errors |
-| `.venv/bin/graphify update .` | PASS; graph regenerated with dependency warnings for optional SQL/DM parsers and a known fixture syntax warning |
+| `.venv/bin/pyright graphify/extractors/java_data_flow.py` | PASS, 0 errors |
+| `.venv/bin/graphify update .` | PASS; graph regenerated with existing optional SQL/DM parser warnings and a known fixture syntax warning |
 | `git diff --check` | PASS |
+
+Do not treat the pre-remediation full-suite baseline as evidence for these fixes.
 
 Known limitations: Gate 2 remains same-file local/basic interprocedural extraction only. Cross-file Java value flow, traversal APIs, framework/runtime/deployment modeling, and Gate 2B/3 behavior were intentionally not implemented.
 
