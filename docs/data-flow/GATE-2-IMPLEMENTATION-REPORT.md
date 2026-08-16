@@ -8,7 +8,7 @@ This gate adds extraction only. It does not add traversal, framework-specific en
 
 ## Frozen v1 representation
 
-All facts are source-derived and use `metadata.provenance = STATIC_AST`, `confidence = EXTRACTED`, and `confidence_score = 1.0`.
+All complete facts are source-derived and use `metadata.provenance = STATIC_AST`, `confidence = EXTRACTED`, and `confidence_score = 1.0`. If tree-sitter reports parse recovery, Java data-flow extraction is machine-marked incomplete and recovered data-flow facts are downgraded instead of being presented as fully complete certainty.
 
 ### Value nodes
 
@@ -21,7 +21,7 @@ Graphify emits `type = data_value` nodes for:
 | `LOCAL` | Declared local variable or directly constructed local object |
 | `FIELD` | Declared field |
 
-Each value records its portable Java owner symbol, Java name, source location, and declared Java type when available. Value IDs derive from the file stem and owner signature rather than the checkout's absolute path.
+Each value records its portable Java owner symbol, Java name, source location, and declared Java type when available. Local, parameter, field, and synthetic object value IDs include deterministic source-span discriminators so same-named declarations and same-line object creations do not collapse. File identity uses a portable file stem and disambiguates same-named sibling Java files without using the checkout root.
 
 ### Static edges
 
@@ -31,8 +31,8 @@ Each value records its portable Java owner symbol, Java name, source location, a
 | `PASSED_AS_ARGUMENT` | Argument value is passed to the matching parameter of an exactly resolved direct call or constructor; `argumentIndex` records its zero-based position |
 | `RETURNED_AS` | Source value is returned as the current method's return value |
 | `READ_FROM` | A field value is read into a local, return, or resolved call parameter |
-| `WRITTEN_TO` | Source value is assigned to a field |
-| `TRANSFORMED_BY` | An argument supports the return of an exactly resolved non-void method, with `transformationSymbol` identifying the method |
+| `WRITTEN_TO` | Source value is assigned to or initializes a field |
+| `TRANSFORMED_BY` | A caller argument supports the return of an exactly resolved non-void method only when bounded intra-method evidence proves the corresponding callee parameter contributes to that return |
 
 Every emitted edge has existing source and target nodes. Runtime or deployment evidence cannot create these edges. Consumers that need distinct data-flow relations between the same endpoints must call `build_from_json(..., directed=True, multigraph=True)`; the legacy Graph/DiGraph modes intentionally collapse parallel edges.
 
@@ -40,13 +40,15 @@ Every emitted edge has existing source and target nodes. Runtime or deployment e
 
 - parameter, local, field, and non-void return identities
 - local initialization and assignment
-- field reads and writes
+- field reads and writes, including field declaration initializers through `WRITTEN_TO`
 - return statements
 - direct same-file method calls with a resolved receiver and exact arity
 - unqualified calls, `this` calls, same-file static class receivers, and receivers whose declared local, parameter, or field type resolves to a same-file class
 - direct same-file constructor argument mapping
 - declaration-order independence for methods and fields
 - conservative overload handling by class, name, and exact arity
+- exact callee identity in argument and transformation metadata via portable method signatures such as `Flow.convert(int)`
+- machine-visible Java data-flow status via extraction diagnostic nodes
 
 ## Deliberate omissions
 
@@ -63,37 +65,72 @@ Graphify emits no data-flow fact when resolution would require guessing. Gate 2 
 
 These omissions are incomplete coverage, not negative proof that no flow exists.
 
-## Acceptance evidence
+## Supervising Review Remediation
 
-Golden extraction tests exercise Graphify's public `extract()` interface and graph construction boundary. They verify:
+| Issue | Defect and root cause | Changed files | Correction | Adversarial test | Result |
+|---|---|---|---|---|---|
+| False `TRANSFORMED_BY` | Every argument to an exactly resolved non-void call was summarized as contributing to the return. | `graphify/extractors/java_data_flow.py`, `tests/test_java_data_flow.py` | Added bounded callee parameter-to-return dependency tracking from emitted local facts and fail-closed summary emission. | Constant return, one-of-two-parameters, and via-local tests in `test_java_transformations_require_proven_return_dependency`. | PASS |
+| Collapsed transformation identity | Metadata used class and method name only, collapsing overloads. | same | `calleeSymbol` and `transformationSymbol` now use exact portable signatures. | Existing overload tests and transformation metadata assertions. | PASS |
+| Value identity collisions | Local IDs used file/name/owner without source declaration position. Synthetic objects used line only. | same | Added deterministic source-span discriminators for locals, parameters, fields, and object creations. | Same-name local and same-line `new Foo()` tests. | PASS |
+| Same filename collisions | Java value IDs used only `path.stem`. | same | Added portable sibling-aware file disambiguation for same-named Java files. | `a/Flow.java` and `b/Flow.java` public extraction test. | PASS |
+| Lexical scope leak | A method-wide local map let expired locals remain visible after block scope. | same | Replaced flat local lookup with scoped stack handling for Java blocks. | Field/local shadowing expiry test. | PASS |
+| Silent failure and parse recovery | Broad import/parse failures returned unmarked results, and recovered parses were fully confident. | same | Added Java data-flow status and extraction diagnostic nodes; parse recovery sets incomplete status and downgraded confidence. | Forced failure seam and malformed Java parse test. | PASS |
+| Field initializer relation | Field declaration initializers used `FLOWS_TO`. | same | Field initializers now use `WRITTEN_TO`. | `test_java_field_initializer_uses_written_to`. | PASS |
+| Parallel relation preservation | Distinct Java flow relations can share endpoints. | `tests/test_java_data_flow.py` | Retained opt-in `build_from_json(..., directed=True, multigraph=True)` behavior. | Existing `READ_FROM`/`PASSED_AS_ARGUMENT` and `READ_FROM`/`RETURNED_AS` multigraph tests. | PASS |
 
-- scoped value nodes and frozen v1 metadata
-- local assignment, field read/write, argument, return, and transformation edges
-- direct constructor mapping
-- method and field declaration-order independence
-- explicit `this` receiver handling
-- exact-arity overload resolution
-- portable value IDs and distinct overload return positions
-- public graph-build preservation of argument relations
-- receiver-aware field reads and writes
-- void methods do not create return or transformation facts
-- symbolic expressions, lambda captures, reflective calls, and ambiguous calls produce no guessed edges
-- every v1 edge references existing nodes
-- extracted output survives `build_from_json()`
+## Data Flow Completeness / Failure Semantics
 
-Observed validation on the final tree:
+Java data-flow extraction is now externally visible as one of:
+
+- `succeeded`: parser and augmentation completed without tree-sitter recovery;
+- `unsupported`: Java parser dependency is unavailable;
+- `incomplete`: tree-sitter parsed with recovery/errors, so emitted facts are conservative and not fully confident;
+- `failed`: augmentation raised before extraction could complete, with a sanitized exception class name only.
+
+The machine-readable status is emitted on an `extraction_diagnostic` node with `metadata.capability = data_flow` and `metadata.language = java`. This avoids confusing "no Java flow exists" with "Java flow extraction failed or was incomplete" while preserving structural extraction for the file.
+
+## Cross-file Java Data Flow Readiness
+
+Existing Graphify Java structural extraction already has import and type-reference resolution entry points in `graphify.extractors.resolution`, including `_resolve_cross_file_java_imports` and `_resolve_java_type_references`. These can identify declarations and type references across files at the structural graph layer.
+
+For future cross-file Java value flow, the reusable facts are:
+
+- exact same-file method signatures already produced by Gate 2 for owner and callee identity;
+- existing Java import/type resolution edges for class identity across files;
+- structural method declaration nodes and parameter value nodes that can connect caller argument positions to target parameter positions once an exact cross-file callee is known.
+
+Still missing for safe cross-file flow:
+
+- a deterministic bridge from resolved cross-file method declarations to the Gate 2 value-node owner signatures;
+- overload resolution across files by exact receiver type and parameter types, not name-only matching;
+- handling for inheritance, interfaces, generics erasure, and ambiguous imports that must fail closed.
+
+No cross-file value flow, name-only callee matching, Gate 2B, or Gate 3 traversal was implemented in this remediation.
+
+## Final Validation
+
+Branch: `feature/java-local-data-flow-v8`
+
+Final commit SHA: `FINAL_SHA_PLACEHOLDER`
+
+Remote comparison evidence before final validation:
+
+- `fork/v8`: `513138436856bfb0cbb5d805675485f7589f6eab`
+- `fork/feature/java-local-data-flow`: `2b6c07c3660ccb31251bcd1c45385343652b147a`
+- merge-base with `fork/v8`: `4fca621532a23f84f69c31e397b75f8105cb5390`
+
+Validation commands executed in the project virtual environment:
 
 | Check | Result |
 |---|---|
-| Ruff on changed Python files | PASS |
-| Pyright on `java_data_flow.py` | PASS, 0 errors |
-| Focused Java data-flow/member/type and graph-build tests | PASS, 114 tests |
-| Broad extraction and Java regression set | PASS, 574 tests |
-| Complete Graphify suite with ambient `DEEPSEEK_API_KEY` removed for backend-isolation tests | PASS, 4,428 passed and 3 skipped |
-| `graphify update .` | PASS; graph regenerated |
+| `.venv/bin/python -m pytest tests/test_java_data_flow.py -q` | PASS, 20 passed, 1 warning |
+| `.venv/bin/python -m pytest tests/test_java_data_flow.py tests/test_java_type_resolution.py tests/test_java_member_calls.py tests/test_observability_anchors_java.py tests/test_build.py -q` | PASS, 160 passed, 1 warning |
+| `.venv/bin/python -m ruff check graphify/extractors/java_data_flow.py tests/test_java_data_flow.py` | PASS |
+| `.venv/bin/python -m pyright graphify/extractors/java_data_flow.py` | PASS, 0 errors |
+| `.venv/bin/graphify update .` | PASS; graph regenerated with dependency warnings for optional SQL/DM parsers and a known fixture syntax warning |
 | `git diff --check` | PASS |
 
-The first unisolated full-suite attempt exposed two pre-existing backend-detection test failures because the host exports `DEEPSEEK_API_KEY`. Removing that ambient credential, as those isolation tests require, produced the complete passing result above. An earlier concurrent-edit run also briefly loaded old implementation code with new assertions; it was superseded by the definitive no-edit full-suite pass. Independent re-review compiled three adversarial fixtures and confirmed parallel relation preservation, field-argument reads, nested field access, and lambda-capture omission through the public interfaces.
+Known limitations: Gate 2 remains same-file local/basic interprocedural extraction only. Cross-file Java value flow, traversal APIs, framework/runtime/deployment modeling, and Gate 2B/3 behavior were intentionally not implemented.
 
 ## Known baseline limitation
 
