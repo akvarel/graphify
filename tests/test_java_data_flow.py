@@ -81,7 +81,7 @@ def test_java_data_flow_emits_scoped_values_and_frozen_v1_edges(tmp_path: Path):
     assert any(
         e["source"] == vals[("FIELD", "total")]
         and e["target"] == normalize_return
-        and e.get("metadata", {}).get("transformationSymbol") == "Flow.normalize"
+        and e.get("metadata", {}).get("transformationSymbol") == "Flow.normalize(int)"
         for e in transformed
     )
     assert all(isinstance(e.get("metadata", {}).get("argumentIndex"), int) for e in _edges(result, "PASSED_AS_ARGUMENT"))
@@ -221,8 +221,8 @@ def test_java_value_ids_are_portable_and_overload_returns_do_not_collapse(tmp_pa
           int convert(int left, int right) { return left; }
         }
     """
-    first = _extract(tmp_path / "first", body)
-    second = _extract(tmp_path / "second", body)
+    first = _extract(tmp_path / "first" / "src", body)
+    second = _extract(tmp_path / "second" / "src", body)
     first_ids = {n["id"] for n in first["nodes"] if n.get("type") == "data_value"}
     second_ids = {n["id"] for n in second["nodes"] if n.get("type") == "data_value"}
     assert first_ids == second_ids
@@ -298,3 +298,90 @@ def test_java_field_receivers_and_ordinary_invoke_method_are_resolved_safely(tmp
     assert any(e["source"] == box_field and e["target"] == boxed for e in _edges(result, "READ_FROM"))
     assert any(e["source"] == box_field and e["target"] == nested for e in _edges(result, "READ_FROM"))
     assert any(e["source"] == input_id and e["target"] == invoke_raw for e in _edges(result, "PASSED_AS_ARGUMENT"))
+
+
+def test_java_transformations_require_proven_return_dependency(tmp_path: Path):
+    result = _extract(tmp_path, """
+        class Flow {
+          int run(int a, int b) { int first = id(a, b); int second = viaLocal(a, b); return first; }
+          int constant(int x) { return 42; }
+          int id(int left, int right) { return left; }
+          int viaLocal(int left, int right) { int copy = left; return copy; }
+        }
+    """)
+    a_id = _value(result, "PARAMETER", "a", "Flow.run(int,int)")
+    b_id = _value(result, "PARAMETER", "b", "Flow.run(int,int)")
+    id_return = _value(result, "RETURN_VALUE", "return", "Flow.id(int,int)")
+    via_return = _value(result, "RETURN_VALUE", "return", "Flow.viaLocal(int,int)")
+    transformed = _edges(result, "TRANSFORMED_BY")
+    assert any(e["source"] == a_id and e["target"] == id_return for e in transformed)
+    assert any(e["source"] == a_id and e["target"] == via_return for e in transformed)
+    assert not any(e["source"] == b_id and e["target"] in {id_return, via_return} for e in transformed)
+    assert not any(e.get("metadata", {}).get("transformationSymbol") == "Flow.constant(int)" for e in transformed)
+
+
+def test_java_same_named_locals_and_lexical_expiry_do_not_leak(tmp_path: Path):
+    result = _extract(tmp_path, """
+        class Flow {
+          int value;
+          int run(boolean flag, int a, int b) {
+            if (flag) { int value = a; consume(value); }
+            if (!flag) { int value = b; consume(value); }
+            return value;
+          }
+          void consume(int raw) {}
+        }
+    """)
+    locals_named_value = [n for n in result["nodes"] if n.get("type") == "data_value" and n.get("metadata", {}).get("kind") == "LOCAL" and n.get("metadata", {}).get("name") == "value"]
+    assert len({n["id"] for n in locals_named_value}) == 2
+    field_id = _value(result, "FIELD", "value", "Flow.value")
+    run_return = _value(result, "RETURN_VALUE", "return", "Flow.run(boolean,int,int)")
+    assert any(e["source"] == field_id and e["target"] == run_return for e in _edges(result, "RETURNED_AS"))
+    assert not any(e["source"] in {n["id"] for n in locals_named_value} and e["target"] == run_return for e in _edges(result, "RETURNED_AS"))
+
+
+def test_java_same_named_files_do_not_collide_but_checkout_ids_are_portable(tmp_path: Path):
+    for root in [tmp_path / "one", tmp_path / "two"]:
+        (root / "a").mkdir(parents=True)
+        (root / "b").mkdir(parents=True)
+        (root / "a" / "Flow.java").write_text("class Flow { int run(int x) { return x; } }", encoding="utf-8")
+        (root / "b" / "Flow.java").write_text("class Flow { int run(int x) { return x; } }", encoding="utf-8")
+    first = extract([tmp_path / "one" / "a" / "Flow.java", tmp_path / "one" / "b" / "Flow.java"], cache_root=tmp_path / "one" / "graphify-out")
+    second = extract([tmp_path / "two" / "a" / "Flow.java", tmp_path / "two" / "b" / "Flow.java"], cache_root=tmp_path / "two" / "graphify-out")
+    first_ids = {n["id"] for n in first["nodes"] if n.get("type") == "data_value"}
+    second_ids = {n["id"] for n in second["nodes"] if n.get("type") == "data_value"}
+    assert len(first_ids) == 4
+    assert any("a_flow" in node_id for node_id in first_ids)
+    assert any("b_flow" in node_id for node_id in first_ids)
+    assert first_ids == second_ids
+
+
+def test_java_same_line_synthetic_object_values_do_not_collapse(tmp_path: Path):
+    result = _extract(tmp_path, "class Foo {} class Flow { void run() { Foo a = new Foo(); Foo b = new Foo(); } }")
+    synthetic = [n for n in result["nodes"] if n.get("type") == "data_value" and str(n.get("metadata", {}).get("name", "")).startswith("new Foo@")]
+    assert len({n["id"] for n in synthetic}) == 2
+
+
+def test_java_failure_and_parse_recovery_are_machine_visible(tmp_path: Path, monkeypatch):
+    import graphify.extractors.java_data_flow as java_data_flow
+
+    result = _extract(tmp_path / "parse", "class Flow { int run(int x) { if ( return x; } }")
+    diagnostics = [n for n in result["nodes"] if n.get("type") == "extraction_diagnostic"]
+    assert any(n.get("metadata", {}).get("status") == "incomplete" for n in diagnostics)
+    assert any(n.get("confidence_score") < 1.0 for n in result["nodes"] if n.get("type") == "data_value")
+
+    def boom(_name: str):
+        raise RuntimeError("forced")
+
+    monkeypatch.setattr(java_data_flow.importlib, "import_module", boom)
+    failed = java_data_flow.augment_java_data_flow(tmp_path / "missing.java", {"nodes": [], "edges": []})
+    assert failed["data_flow"]["java"]["status"] == "failed"
+    assert failed["data_flow"]["java"]["reason"] == "RuntimeError"
+
+
+def test_java_field_initializer_uses_written_to(tmp_path: Path):
+    result = _extract(tmp_path, "class Flow { int seed; int field = seed; }")
+    seed_id = _value(result, "FIELD", "seed", "Flow.seed")
+    field_id = _value(result, "FIELD", "field", "Flow.field")
+    assert any(e["source"] == seed_id and e["target"] == field_id for e in _edges(result, "WRITTEN_TO"))
+    assert not any(e["source"] == seed_id and e["target"] == field_id for e in _edges(result, "FLOWS_TO"))
