@@ -20,8 +20,6 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
     same extraction result.  Ambiguous, reflective, dynamic, or name-only cross
     method calls are omitted.
     """
-    if result.get("error"):
-        return result
     status = result.setdefault("data_flow", {})
     status["java"] = {"status": "unsupported", "reason": "tree_sitter_java_unavailable"}
 
@@ -41,6 +39,11 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             "confidence_score": 1.0,
             "metadata": sanitize_metadata({"language": "java", "capability": "data_flow", **java_status}),
         })
+
+    if result.get("error"):
+        if result.get("error") == "tree_sitter_java not installed":
+            append_status_node(status["java"], path.stem)
+        return result
 
     try:
         mod = importlib.import_module("tree_sitter_java")
@@ -131,6 +134,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
     pending_bodies: list[tuple[object, dict[str, Any], str]] = []
     pending_transformations: list[tuple[str | None, dict[str, Any], int, object]] = []
     pending_field_initializers: list[tuple[object, str, str]] = []
+    method_name_counts: dict[tuple[str, str], int] = defaultdict(int)
 
     def named_child(n, *fields):
         for f in fields:
@@ -142,6 +146,20 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
     def first_type_text(n) -> str:
         c = named_child(n, "type")
         return _read_text(c, source).split("<", 1)[0].strip() if c is not None else ""
+
+    def collect_method_name_counts(n, cls: str | None = None) -> None:
+        if n.type in {"class_declaration", "interface_declaration", "record_declaration", "enum_declaration", "annotation_type_declaration"}:
+            name_node = named_child(n, "name")
+            name = _read_text(name_node, source) if name_node is not None else ""
+            for child in n.children:
+                collect_method_name_counts(child, name or cls)
+            return
+        if n.type in {"method_declaration", "constructor_declaration"} and cls:
+            name_node = named_child(n, "name")
+            name = _read_text(name_node, source) if name_node is not None else cls
+            method_name_counts[(cls, name)] += 1
+        for child in n.children:
+            collect_method_name_counts(child, cls)
 
     def walk(n, cls: str | None = None):
         if n.type in {"class_declaration", "interface_declaration", "record_declaration", "enum_declaration", "annotation_type_declaration"}:
@@ -181,15 +199,39 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             signature = f"{cls}.{name}({','.join(spec['type'] for spec in parameter_specs)})"
             label = f".{name}()"
             exact_loc = loc(n)
+            line_loc = f"L{line(n)}"
             structural_matches = [
                 x.get("id")
                 for x in nodes
                 if x.get("label") == label
                 and cls.lower() in x.get("id", "")
-                and str(x.get("source_location", "")).startswith(exact_loc)
+                and (
+                    str(x.get("source_location", "")).startswith(exact_loc)
+                    or str(x.get("source_location", "")).startswith(line_loc)
+                )
             ]
-            mid = structural_matches[0] if len(structural_matches) == 1 else _make_id(stem, signature)
+            overloaded = method_name_counts.get((cls, name), 0) > 1
+            mid = structural_matches[0] if len(structural_matches) == 1 and not overloaded else _make_id(stem, signature)
             if mid:
+                if mid not in seen_nodes:
+                    seen_nodes.add(mid)
+                    nodes.append({
+                        "id": mid,
+                        "label": f".{name}({','.join(spec['type'] for spec in parameter_specs)})",
+                        "file_type": "code",
+                        "type": "function",
+                        "source_file": str_path,
+                        "source_location": exact_loc,
+                        "confidence": "EXTRACTED",
+                        "confidence_score": 0.8 if root.has_error else 1.0,
+                        "metadata": sanitize_metadata({
+                            "language": "java",
+                            "kind": "method",
+                            "symbol": signature,
+                            "structural_overload_identity": True,
+                        }),
+                    })
+                    valid_ids.add(mid)
                 info = {
                     "id": mid,
                     "symbol": signature,
@@ -442,6 +484,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         for c in n.children:
             scan_body(c, method, cls)
 
+    collect_method_name_counts(root)
     walk(root)
     for declarator, cls, field_name in pending_field_initializers:
         field = classes.get(cls, {}).get("fields", {}).get(field_name)
