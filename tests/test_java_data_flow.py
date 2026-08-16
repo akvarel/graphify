@@ -385,3 +385,88 @@ def test_java_field_initializer_uses_written_to(tmp_path: Path):
     field_id = _value(result, "FIELD", "field", "Flow.field")
     assert any(e["source"] == seed_id and e["target"] == field_id for e in _edges(result, "WRITTEN_TO"))
     assert not any(e["source"] == seed_id and e["target"] == field_id for e in _edges(result, "FLOWS_TO"))
+
+
+def test_java_assignment_kill_prevents_stale_transform_dependency(tmp_path: Path):
+    result = _extract(tmp_path, """
+        class Flow {
+          int run(int initial, int replacement) { return id(initial, replacement); }
+          int id(int initial, int replacement) {
+            int chosen = initial;
+            chosen = replacement;
+            return chosen;
+          }
+        }
+    """)
+    initial_id = _value(result, "PARAMETER", "initial", "Flow.run(int,int)")
+    replacement_id = _value(result, "PARAMETER", "replacement", "Flow.run(int,int)")
+    id_return = _value(result, "RETURN_VALUE", "return", "Flow.id(int,int)")
+    transformed = _edges(result, "TRANSFORMED_BY")
+    assert any(e["source"] == replacement_id and e["target"] == id_return for e in transformed)
+    assert not any(e["source"] == initial_id and e["target"] == id_return for e in transformed)
+
+
+def test_java_for_initializer_scope_expires_and_field_is_not_shadowed(tmp_path: Path):
+    result = _extract(tmp_path, """
+        class Flow {
+          int i;
+          int run() {
+            for (int i = 0; i < 1; i++) { consume(i); }
+            return i;
+          }
+          void consume(int raw) {}
+        }
+    """)
+    field_id = _value(result, "FIELD", "i", "Flow.i")
+    run_return = _value(result, "RETURN_VALUE", "return", "Flow.run()")
+    loop_locals = [
+        n["id"] for n in result["nodes"]
+        if n.get("type") == "data_value"
+        and n.get("metadata", {}).get("kind") == "LOCAL"
+        and n.get("metadata", {}).get("name") == "i"
+    ]
+    assert loop_locals
+    assert any(e["source"] == field_id and e["target"] == run_return for e in _edges(result, "RETURNED_AS"))
+    assert not any(e["source"] in set(loop_locals) and e["target"] == run_return for e in _edges(result, "RETURNED_AS"))
+
+
+def test_java_overload_metadata_keeps_exact_callee_identity(tmp_path: Path):
+    result = _extract(tmp_path, """
+        class Flow {
+          int run(int one, int two) { return convert(one, two); }
+          int convert(int raw) { return raw; }
+          int convert(int left, int right) { return left; }
+        }
+    """)
+    left_id = _value(result, "PARAMETER", "left", "Flow.convert(int,int)")
+    edge = next(e for e in _edges(result, "PASSED_AS_ARGUMENT") if e["target"] == left_id)
+    md = edge.get("metadata", {})
+    assert md.get("calleeSymbol") == "Flow.convert(int,int)"
+    assert md.get("callee", "").endswith("flow_convert_int_int")
+    transformed = next(
+        e for e in _edges(result, "TRANSFORMED_BY")
+        if e.get("metadata", {}).get("transformationSymbol") == "Flow.convert(int,int)"
+    )
+    assert transformed.get("metadata", {}).get("callee", "").endswith("flow_convert_int_int")
+
+
+def test_java_forward_field_initializer_waits_for_all_fields(tmp_path: Path):
+    result = _extract(tmp_path, "class Flow { int snapshot = source; int source = 1; }")
+    snapshot_id = _value(result, "FIELD", "snapshot", "Flow.snapshot")
+    source_id = _value(result, "FIELD", "source", "Flow.source")
+    assert any(e["source"] == source_id and e["target"] == snapshot_id for e in _edges(result, "WRITTEN_TO"))
+
+
+def test_java_missing_tree_sitter_java_is_unsupported_not_failed(tmp_path: Path, monkeypatch):
+    import graphify.extractors.java_data_flow as java_data_flow
+
+    real_import = java_data_flow.importlib.import_module
+
+    def missing_java(name: str):
+        if name == "tree_sitter_java":
+            raise ModuleNotFoundError("No module named 'tree_sitter_java'", name="tree_sitter_java")
+        return real_import(name)
+
+    monkeypatch.setattr(java_data_flow.importlib, "import_module", missing_java)
+    result = java_data_flow.augment_java_data_flow(tmp_path / "Flow.java", {"nodes": [], "edges": []})
+    assert result["data_flow"]["java"] == {"status": "unsupported", "reason": "tree_sitter_java_unavailable"}
