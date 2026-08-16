@@ -116,28 +116,29 @@ Final delivery SHA: supplied externally after commit creation. This report does 
 Remote comparison evidence before remediation:
 
 - `upstream/v8`: `4fca621532a23f84f69c31e397b75f8105cb5390`
-- Full-suite baseline evidence before these fixes: 4568 passed, 47 skipped.
+- Definitive complete-suite evidence after all remediation fixes: 4575 passed, 47 skipped, 3 warnings.
 
-Post-7cbbdf7 remediation added regression coverage for:
+Post-24abc229 remediation added regression coverage for:
 
 - assignment kill/order so stale local initializer dependencies do not create false `TRANSFORMED_BY` edges;
 - for-loop lexical scope so initializer locals expire after the loop and do not shadow fields;
 - exact same-file callee identity for overloads, with portable signature metadata for different arities and fail-closed same-arity ambiguity;
+- metadata callee IDs for exact overload identities always referencing emitted nodes, including public extraction and multigraph build coverage for `Flow.convert(int,int)`;
 - deferred field initializer processing so forward field references emit `WRITTEN_TO` after all fields are indexed;
-- documented unsupported status for unavailable `tree_sitter_java` rather than reporting a failed extractor.
+- public extraction boundary status for genuine first-import unavailability of `tree_sitter_java`, with an unsupported Java data-flow diagnostic node rather than zero-node silent success or Gate 3 behavior.
 
 Validation commands executed in the project virtual environment after remediation:
 
 | Check | Result |
 |---|---|
-| `.venv/bin/python -m pytest tests/test_java_data_flow.py -q` | PASS, 25 passed, 1 warning |
-| `.venv/bin/python -m pytest tests/test_java_data_flow.py tests/test_java_type_resolution.py tests/test_java_member_calls.py tests/test_observability_anchors_java.py tests/test_build.py -q` | PASS, 165 passed, 1 warning |
-| `.venv/bin/python -m ruff check graphify/extractors/java_data_flow.py tests/test_java_data_flow.py` | PASS |
-| `.venv/bin/pyright graphify/extractors/java_data_flow.py` | PASS, 0 errors |
-| `.venv/bin/graphify update .` | PASS; graph regenerated with existing optional SQL/DM parser warnings and a known fixture syntax warning |
+| `.venv/bin/python -m pytest tests/test_java_data_flow.py -q` | PASS, 27 passed, 1 warning |
+| `uv run pytest -q tests/test_java_data_flow.py tests/test_java_type_resolution.py tests/test_java_member_calls.py tests/test_observability_anchors_java.py tests/test_build.py -q` | PASS, 167 passed, 1 warning |
+| `uv run ruff check graphify/extractors/java_data_flow.py tests/test_java_data_flow.py` | PASS |
+| `uv run pyright graphify/extractors/java_data_flow.py` | PASS, 0 errors |
 | `git diff --check` | PASS |
+| `uv run graphify update .` | PASS; graph regenerated with existing optional SQL/DM parser warnings, zero-node fixture warnings, and a known fixture syntax warning |
 
-Do not treat the pre-remediation full-suite baseline as evidence for these fixes.
+The definitive complete-suite result above includes the final public-boundary and same-line overload fixes.
 
 Known limitations: Gate 2 remains same-file local/basic interprocedural extraction only. Cross-file Java value flow, traversal APIs, framework/runtime/deployment modeling, and Gate 2B/3 behavior were intentionally not implemented.
 

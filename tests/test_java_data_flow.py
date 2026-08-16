@@ -448,6 +448,30 @@ def test_java_overload_metadata_keeps_exact_callee_identity(tmp_path: Path):
         if e.get("metadata", {}).get("transformationSymbol") == "Flow.convert(int,int)"
     )
     assert transformed.get("metadata", {}).get("callee", "").endswith("flow_convert_int_int")
+    node_ids = {node["id"] for node in result["nodes"]}
+    metadata_callees = {
+        edge.get("metadata", {}).get("callee")
+        for edge in result["edges"]
+        if edge.get("metadata", {}).get("callee")
+    }
+    assert metadata_callees <= node_ids
+
+
+def test_java_overload_metadata_callee_survives_public_multigraph_build(tmp_path: Path):
+    result = _extract(
+        tmp_path,
+        "class Flow { int run(int one, int two) { return convert(one, two); } int convert(int raw) { return raw; } int convert(int left, int right) { return left; } }",
+    )
+    graph = build_from_json(result, directed=True, multigraph=True)
+    node_ids = set(graph.nodes)
+    callee_ids = {
+        data.get("metadata", {}).get("callee")
+        for _, _, data in graph.edges(data=True)
+        if data.get("metadata", {}).get("callee")
+    }
+    assert callee_ids
+    assert callee_ids <= node_ids
+    assert any(callee.endswith("flow_flow_convert_int_int") for callee in callee_ids)
 
 
 def test_java_forward_field_initializer_waits_for_all_fields(tmp_path: Path):
@@ -470,3 +494,26 @@ def test_java_missing_tree_sitter_java_is_unsupported_not_failed(tmp_path: Path,
     monkeypatch.setattr(java_data_flow.importlib, "import_module", missing_java)
     result = java_data_flow.augment_java_data_flow(tmp_path / "Flow.java", {"nodes": [], "edges": []})
     assert result["data_flow"]["java"] == {"status": "unsupported", "reason": "tree_sitter_java_unavailable"}
+
+
+def test_java_public_extract_reports_first_import_unavailable(tmp_path: Path, monkeypatch):
+    import graphify.extractors.engine as engine
+
+    real_import = engine.importlib.import_module
+
+    def missing_java(name: str):
+        if name == "tree_sitter_java":
+            raise ModuleNotFoundError("No module named 'tree_sitter_java'", name="tree_sitter_java")
+        return real_import(name)
+
+    monkeypatch.setattr(engine.importlib, "import_module", missing_java)
+    result = _extract(tmp_path, "class Flow { int run(int input) { return input; } }")
+    diagnostics = [
+        node for node in result["nodes"]
+        if node.get("type") == "extraction_diagnostic"
+        and node.get("metadata", {}).get("language") == "java"
+        and node.get("metadata", {}).get("capability") == "data_flow"
+    ]
+    assert diagnostics
+    assert diagnostics[0].get("metadata", {}).get("status") == "unsupported"
+    assert diagnostics[0].get("metadata", {}).get("reason") == "tree_sitter_java_unavailable"
