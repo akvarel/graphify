@@ -83,6 +83,36 @@ Valid and important state: **relationship existence = EXACT, analysis
 coverage = PARTIAL.** An exact local fact must not be read as a claim of
 whole-program completeness.
 
+### 4.1 Attempted boundaries are machine-visible evidence (remediation P0-2)
+
+An AMBIGUOUS / UNRESOLVED / UNSUPPORTED resolution is **not** modeled as
+"no flow exists": the source layer emits one bounded
+`extraction_diagnostic` node (`metadata.kind == "cross_file_resolution"`) per
+attempted cross-file boundary. GVR must never have to infer uncertainty from
+the absence of an edge. Each diagnostic is a **node, never a positive
+relation** (no `FLOWS_TO`/`CALLS`), and creates no transitive graph fact. It
+carries:
+
+- `resolution` — `EXACT` / `AMBIGUOUS` / `UNRESOLVED` / `UNSUPPORTED`.
+- `coverage` — `COMPLETE_FOR_SUPPORTED_CONSTRUCT` / `PARTIAL` / `UNKNOWN`.
+- `callerFile`, `callerLocation`, `receiver` (sanitized type text),
+  `receiverFqn` (when resolved), `receiverConfidence` (`PROVEN`/`MAY`).
+- `importContext` — `same_package` / `explicit_import` / `qualified` /
+  `wildcard` / `default_package` / `unknown`.
+- `method`, `constructor`, `arity`.
+- `reason` — machine-readable code (e.g. `wildcard_import_ambiguous`,
+  `overload_ambiguity`, `receiver_unresolved`, `receiver_unsupported_type`).
+- `candidateCount`, and `candidates` (identities) only when deterministically
+  known and safe — never raw source values or secrets.
+- `extractor` — `graphify`.
+
+Exact boundaries emit `EXACT` diagnostics **and** the positive edges
+(PASSED_AS_ARGUMENT / TRANSFORMED_BY / FLOWS_TO). Absence of a diagnostic
+means the analyzer never attempted the boundary (e.g. no call on a class
+receiver), which is distinguishable from an attempted-but-unresolved boundary.
+These diagnostics are the machine-visible source from which the resolution
+statistics (`cross_file_resolution_stats`) are derived.
+
 ## 5. What `confidence` means
 
 `confidence_score` describes the strength of the **static evidence**, not a

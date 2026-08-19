@@ -345,7 +345,8 @@ def test_cross_file_order_independent(tmp_path: Path):
 
 def test_cross_file_checkout_root_portability(tmp_path: Path):
     # L: equivalent source trees under different absolute roots must produce
-    # equivalent cross-file relationships (endpoints valid in each graph).
+    # equivalent canonical data_value IDs and cross-file relationships, and no
+    # absolute checkout path may leak into persisted ids.
     def build(base: Path) -> tuple[list[Path], Path]:
         src = base / "proj/src/acme"
         service = src / "PS.java"
@@ -353,27 +354,38 @@ def test_cross_file_checkout_root_portability(tmp_path: Path):
         service.parent.mkdir(parents=True, exist_ok=True)
         service.write_text("package acme;\npublic class PS { public double calc(double b){ return b; } }\n")
         order.write_text("package acme;\npublic class Ord { private PS ps; public double go(){ double b=1.0; return ps.calc(b); } }\n")
-        return [service, order], base / "out"
+        return [service, order], base / "proj"
 
-    files1, out1 = build(tmp_path / "rootA")
-    files2, out2 = build(tmp_path / "rootB")
+    def extract_root(base: Path) -> tuple[list[Path], Path]:
+        files, src_root = build(base)
+        return files, src_root
 
-    def xf_edges(r: dict) -> list[tuple]:
-        out = []
+    files1, src1 = extract_root(tmp_path / "rootA")
+    files2, src2 = extract_root(tmp_path / "rootB")
+
+    def norm(r: dict) -> dict:
+        dv = {n["id"] for n in r["nodes"] if n.get("type") == "data_value"}
+        fn = {n["id"] for n in r["nodes"] if n.get("type") == "function"}
+        xf = {
+            (e["relation"], e["source"], e["target"])
+            for e in r["edges"] if (e.get("metadata") or {}).get("cross_file")
+        }
+        abs_leak = {n["id"] for n in r["nodes"] if "rootA" in n["id"] or "rootB" in n["id"]}
+        return {"dv": dv, "fn": fn, "xf": xf, "abs_leak": abs_leak, "nodes": r["nodes"], "edges": r["edges"]}
+
+    r1 = norm(extract(files1, root=src1, cache_root=tmp_path / "out1"))
+    r2 = norm(extract(files2, root=src2, cache_root=tmp_path / "out2"))
+    # Same number of cross-file edges and IDENTICAL canonical ids/endpoints.
+    assert r1["xf"] and len(r1["xf"]) == len(r2["xf"])
+    assert r1["dv"] == r2["dv"]
+    assert r1["fn"] == r2["fn"]
+    assert r1["xf"] == r2["xf"]
+    assert not r1["abs_leak"] and not r2["abs_leak"]
+    # All endpoints valid in each graph and canonical (match a node id).
+    for r in (r1, r2):
         ids = {n["id"] for n in r["nodes"]}
-        for e in r["edges"]:
-            if (e.get("metadata") or {}).get("cross_file"):
-                out.append((e["relation"], e["source"] in ids, e["target"] in ids))
-        return out
-
-    r1 = extract(files1, cache_root=out1)
-    r2 = extract(files2, cache_root=out2)
-    e1 = xf_edges(r1)
-    e2 = xf_edges(r2)
-    assert e1 and e2
-    # Same number of cross-file edges, all endpoints valid in their own graph.
-    assert len(e1) == len(e2)
-    assert all(ok for _, ok, _ in e1) and all(ok for _, ok, _ in e2)
+        for rel, s, t in r["xf"]:
+            assert s in ids and t in ids
 
 
 def test_cross_file_multi_parameter_dependency(tmp_path: Path):

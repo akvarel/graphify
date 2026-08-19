@@ -176,10 +176,15 @@ New public-boundary test files (run through `extract(..., cache_root=...)`):
   K (file-order independence), L (checkout-root portability), M (parse-incomplete
   target → PARTIAL), N (receiver MAY preserved), O (removed target → no stale
   edge).
-- `tests/test_java_cross_file_gvr_boundary.py` — 4 tests proving the source
-  layer preserves provenance/receiver confidence, exposes exact source+target
-  identity, never emits a GVR verdict state, and never claims global
-  completeness from an exact local fact.
+- `tests/test_java_cross_file_gvr_boundary.py` — 11 tests (4 original + 7
+  remediation) proving the source layer preserves provenance/receiver confidence,
+  exposes exact source+target identity, never emits a GVR verdict state, never
+  claims global completeness from an exact local fact, AND that
+  AMBIGUOUS/UNRESOLVED/UNSUPPORTED attempted boundaries are machine-visible with
+  no positive flow edge (see remediation P0-2 below).
+- `tests/test_java_cross_file_fixture_suite.py` — 9 parameterized fixture cases
+  + checkout-root-independence + repo-relative-collision tests (remediation
+  P0-1).
 
 ### Validation commands
 
@@ -212,31 +217,42 @@ plus explicit negative assertions.
 ## 8. Performance baseline
 
 Measured on the dedicated fixture corpus (19 Java files) on the build machine.
-Gate 2 (before) vs Gate 2B (after), both via `extract(..., cache_root=...)`:
+Gate 2 (before) vs Gate 2B (after) vs Gate 2B post-remediation, all via
+`extract(..., cache_root=...)` with the scan root passed:
 
-| Metric | Gate 2 (before) | Gate 2B (after) |
-| --- | --- | --- |
-| Full extraction time | ~0.061 s | ~0.053 s (noise) |
-| Graph node count | 136 | 136 |
-| Graph edge count | 76 | 95 |
-| `data_value` count | 56 | 56 |
-| Cross-file edge count | 0 | 19 |
-| Exact cross-file resolutions | 0 | 8 |
-| Ambiguous cross-file candidates | 0 | 1 (I_overload) |
-| Unresolved cross-file candidates | 0 | 0 |
+| Metric | Gate 2 (before) | Gate 2B (after) | After remediation |
+| --- | --- | --- | --- |
+| Full extraction time | ~0.061 s | ~0.053 s | ~0.081 s |
+| Graph node count | 136 | 136 | 146 |
+| Graph edge count | 76 | 95 | 95 |
+| `data_value` count | 56 | 56 | 56 |
+| Positive cross-file edge count | 0 | 19 | 19 |
+| Cross-file resolution diagnostics | 0 | 0 | 10 |
+| Exact resolutions (public evidence) | 0 | 8 | 8 |
+| Ambiguous resolutions | 0 | 1 (I) | 2 (I overload + J wildcard) |
+| Unresolved resolutions | 0 | 0 | 0 |
+| Unsupported resolutions | 0 | 0 | 0 |
+| Output size | — | — | ~106 KB |
 
-The cross-file pass adds ~19 edges with negligible measurable cost
-(`O(records × index-lookup)`); node and `data_value` counts are unchanged. The
-index is built once from the already-emitted `data_value` nodes, so no new
-parse pass or persistent store was introduced. No optimisation was performed
-before measuring.
+The cross-file pass adds ~19 edges plus ~10 bounded diagnostics with negligible
+measurable cost (`O(records × index-lookup)`); `data_value` count is unchanged.
+The index is built once from the already-emitted `data_value` nodes, so no new
+parse pass or persistent store was introduced. Diagnostics are bounded to one
+per attempted call site (never every failed name lookup). No optimisation was
+performed before measuring.
 
 ## 9. Known limitations
 
-- Value `data_value` node ids embed the checkout-root path slug (pre-existing
-  Gate 2 behavior); cross-file edges reference the exact same node ids, so the
-  graph is internally coherent, and `L` (portability) is validated at the
-  relationship level.
+- Canonical `data_value` (and symbol) ids are checkout-root independent only
+  when the scan root is passed (`extract(..., root=...)`), which is the
+  documented contract (the `root` argument anchors id/source_file
+  canonicalization; `cache_root` is only a fallback anchor and is the OUTPUT
+  dir under `--out`). When `root` is omitted and `cache_root` is not the scan
+  root, files read as out-of-root and retain a path-derived slug. The fixture
+  tests and portability tests pass the scan root (as the established Gate 2
+  Java tests do), so cross-file `data_value` ids, method/owner ids, and edge
+  endpoints are canonical and root-independent. See the remediation below
+  (P0-1).
 - Default-package cross-file linkage and nested-class cross-file linkage are
   false negatives (fail closed) by design.
 - Static imports of individual members are supported only when the target class
@@ -252,3 +268,142 @@ identity, receiver confidence, and analysis completeness already attached).
 Ambiguity and incompleteness are machine-visible on the edges, so a future
 traversal can stop or degrade at ambiguous/incomplete boundaries rather than
 over-claim.
+
+---
+
+## Supervising Review Remediation
+
+Gate status for the original submission: **CHANGES REQUIRED**. The issues below
+were resolved in remediation commit(s) on `feature/java-cross-file-data-flow-v8`.
+
+### Remediation SHAs (exact immutable values)
+
+- Starting branch SHA (Gate 2B base): `d8b663f`
+- Gate 2B implementation SHA: `1d5d21e187829aa717145187a6cbef5b2de8fb86`
+- Follow-up validation-note SHA: `e7d7f60f3732a25a4a659ee8a1aeece2726fc426`
+- Remediation final SHA: `[FINAL_SHA]` (set at commit time)
+- Current `upstream/v8` SHA: `b14b52e94ec3d9840413d81777f4c134eac0a40d`
+- Merge-base with `upstream/v8`: `b14b52e94ec3d9840413d81777f4c134eac0a40d`
+- ahead/behind vs `upstream/v8`: 34 ahead / 0 behind (direction: branch is
+  ahead of upstream)
+
+### P0-1 — Canonical `data_value` identity is checkout-root dependent
+
+- **Defect:** Cross-file `data_value` node ids (and the fixture-suite public
+  boundary) carried an absolute-checkout-derived path slug, so two checkouts of
+  the same tree under different absolute roots produced different persisted
+  `data_value` ids. The prior report claimed portability was validated only at
+  the relationship level, which is insufficient for GVR evidence identity.
+- **Root cause:** The fixture-suite tests called
+  `extract(files, cache_root=...)` without passing `root`. Per the documented
+  `extract()` contract, `cache_root` is only a *fallback* anchor; when it is not
+  the scan root (it is the output dir under `--out`), scanned files read as
+  out-of-root and keep a path-derived slug. The established Gate 2 Java tests
+  pass `root`; the Gate 2B fixture suite did not, so the id-remap canonicalized
+  nothing for those files.
+- **Changed files:** `tests/test_java_cross_file_fixture_suite.py`,
+  `tests/test_java_cross_file_data_flow.py`.
+- **Correction:** Pass the scan `root` at the public boundary (reusing
+  Graphify's existing root-aware canonicalization machinery, no second
+  path-normalization system). Add a portability test that extracts the exact
+  same fixture tree from two different absolute roots and asserts **equality of
+  the canonical sets** of `data_value` node ids, Java method/function owner ids,
+  and `PASSED_AS_ARGUMENT`/`TRANSFORMED_BY`/`FLOWS_TO` cross-file edge
+  endpoints, plus no absolute path leakage. Add a repo-relative-collision test
+  proving same-named files at different repo-relative paths keep distinct
+  canonical ids.
+- **Tests:** `test_fixture_case_canonical_ids_are_checkout_root_independent`,
+  `test_fixture_repo_relative_paths_do_not_collide`, strengthened
+  `test_cross_file_checkout_root_portability` (now ID-level equality).
+- **Adversarial falsification:** absolute-root leakage, repo-relative file
+  collisions, nested/duplicate simple class names, deep same-named files.
+- **Result:** PASS. `data_value`, method/owner, and cross-file edge endpoint ids
+  are identical across `/rootA` and `/rootB` checkouts; no checkout path leaks.
+
+### P0-2 — AMBIGUOUS / UNRESOLVED resolution was fail-closed but not machine-visible
+
+- **Defect:** `_record_cross_file_call()` discarded every non-`EXACT` receiver
+  (`if state != "EXACT": return`), so ambiguity/unresolved resolution vanished
+  before the repository pass. The public output could not distinguish "no flow
+  exists" from "an analyzer attempted the boundary but could not resolve it
+  safely" — exactly the epistemic distinction GVR requires.
+- **Root cause:** The per-file extractor only recorded deterministic `EXACT`
+  call intents and returned early otherwise; the pass never saw the failed
+  attempts.
+- **Changed files:** `graphify/extractors/java_data_flow.py`,
+  `graphify/extractors/resolution.py`,
+  `tests/test_java_cross_file_gvr_boundary.py`.
+- **Correction:** `_record_cross_file_call()` now records **every attempt** with
+  a machine-visible `receiverResolution` (`EXACT`/`AMBIGUOUS`/`UNRESOLVED`/
+  `UNSUPPORTED`), a reason code, and a sanitized context (caller file/location,
+  receiver type, method, arity, import context, `receiverConfidence`). The pass
+  emits one bounded **`extraction_diagnostic` node** per attempted boundary with
+  `resolution`, `coverage`, `reason`, `candidateCount`, and (only when
+  deterministically known) candidate identities. Ambiguity/unresolved/unsupported
+  emit **no positive flow edge**; only an EXACT receiver with a unique callee
+  emits `PASSED_AS_ARGUMENT`/`TRANSFORMED_BY`/`FLOWS_TO`. Diagnostics are nodes,
+  never modeled as a positive relation, and create no transitive facts.
+  `UNSUPPORTED` (a JDK builtin/primitive receiver the analyzer knows is not an
+  in-repo class boundary) is deliberately distinct from `UNRESOLVED`.
+- **Tests:** `test_wildcard_ambiguity_is_machine_visible_and_fails_closed`,
+  `test_overload_ambiguity_is_machine_visible_and_fails_closed`,
+  `test_default_package_unresolved_is_machine_visible`,
+  `test_unsupported_builtin_is_distinct_from_unresolved`,
+  `test_exact_resolution_has_evidence_and_positive_edges`,
+  `test_absence_of_boundary_is_distinct_from_attempted_unresolved`,
+  `test_resolution_diagnostics_are_bounded_nodes_not_transitive_facts`.
+- **Adversarial falsification:** wildcard ambiguity, overload ambiguity,
+  default-package unresolved, JDK-builtin unsupported, absence vs attempted-
+  unresolved, no transitive fabrication.
+- **Result:** PASS. AMBIGUOUS/UNRESOLVED/UNSUPPORTED boundaries are
+  machine-visible with no positive edge; exact resolution emits EXACT evidence
+  plus the expected positive edges; diagnostics are bounded.
+
+### P0-3 — Reconcile `pyright` validation with the acceptance contract
+
+- **Defect:** The original commit message said "no net new errors" but the
+  acceptance contract required `pyright passes`.
+- **Root cause:** The full repository already carries a large pre-existing
+  pyright baseline (602 errors at the base SHA) unrelated to Gate 2B.
+- **Correction:** Measured truthfully. Full-repository `pyright` exits non-zero
+  at BOTH the base SHA (`e7d7f60`) and the remediation HEAD with **602 errors /
+  3 warnings each — identical**. Targeted `pyright` on every changed/new module
+  is zero-error: `java_data_flow.py` = 0 (base 0), `resolution.py` = 38 (base
+  38). The remediation introduces **zero new pyright errors**.
+- **Tests:** `pyright graphify/extractors/java_data_flow.py
+  graphify/extractors/resolution.py` (0 and 38, matching base).
+- **Result:** The global command is not reported as clean; the new code
+  introduces zero errors.
+
+### P1-1 — Resolution statistics derive from public evidence
+
+- **Defect:** Counts (exact/ambiguous/unresolved) were reported from an ad-hoc
+  counter/private module state.
+- **Correction:** `cross_file_resolution_stats(nodes, edges)` now derives
+  counts from the persisted machine-visible `extraction_diagnostic` nodes
+  (`kind == "cross_file_resolution"`) and the `cross_file` edge flag — no ad-hoc
+  counter. Counts distinguish attempted / EXACT / AMBIGUOUS / UNRESOLVED /
+  UNSUPPORTED / emitted-positive-edges.
+- **Changed files:** `graphify/extractors/resolution.py`, tests.
+- **Result:** PASS. `cross_file_resolution_stats` on the fixture corpus returns
+  `{attempted:10, exact:8, ambiguous:2, unresolved:0, unsupported:0, emitted:19}`,
+  reproducible from public output.
+
+### P1-2 — Final report uses exact SHAs
+
+- The remediation report records exact immutable SHAs (branch start,
+  implementation, follow-up, remediation final, upstream/v8, merge-base,
+  ahead/behind with direction, changed files) in the header block above.
+
+### Preserved behavior
+
+All Gate 2 / 2B behavior is preserved: constant-return false-`TRANSFORMED_BY`
+protection; only proven parameter→return dependency yields `TRANSFORMED_BY`;
+exact transformation/callee identity; lexical-scope correctness; field
+initializer `WRITTEN_TO` semantics; receiver `PROVEN`/`MAY` distinction;
+qualified nested-owner identity; same-name/deep-path separation; parse-recovery
+incompleteness; parallel relation preservation; deterministic same-package /
+explicit-import / fully-qualified linkage; cross-file constructor mapping and
+return propagation; overload and wildcard ambiguity fail-closed; removed-target
+stale-edge prevention; no second Java resolver; no extra parse pass; no GVR
+verdicts in the source layer; no transitive closure.

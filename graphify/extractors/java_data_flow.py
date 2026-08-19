@@ -7,9 +7,14 @@ from pathlib import Path
 from typing import Any
 
 from graphify.extractors.base import _file_stem, _make_id, _read_text
+from graphify.extractors.engine import _JAVA_BUILTIN_TYPES  # noqa: E402
 from graphify.security import sanitize_metadata
 
 DATA_VALUE_TYPE = "data_value"
+
+_JAVA_PRIMITIVES = frozenset({
+    "byte", "short", "int", "long", "float", "double", "char", "boolean", "void",
+})
 
 
 def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]:
@@ -207,17 +212,26 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
 
         Returns ``(fqn, state)`` where state is ``EXACT`` when the identity is
         deterministic (explicit import, same-package, or already-qualified) and
-        ``UNRESOLVED``/``AMBIGUOUS`` otherwise. Only ``EXACT`` receivers may be
-        linked cross-file. This reuses the file's own import/package facts, so it
-        is the same resolver the resolution layer uses, not a second one."""
+        ``AMBIGUOUS``/``UNRESOLVED``/``UNSUPPORTED`` otherwise. Only ``EXACT``
+        receivers may be linked cross-file. ``UNSUPPORTED`` means the analyzer
+        KNOWS the receiver is a JDK builtin/primitive (no in-repo class to
+        link), which is deliberately distinguishable from ``UNRESOLVED`` (a
+        plausible user class that cannot be located). This reuses the file's
+        own import/package facts, so it is the same resolver the resolution
+        layer uses, not a second one."""
         cls = (target_cls or "").strip()
         if not cls:
             return None, "UNRESOLVED"
         cls = cls.split("<", 1)[0].strip()
-        if "." in cls:
-            return cls, "EXACT"
+        simple = cls.rsplit(".", 1)[-1]
         if cls in java_imports:
             return java_imports[cls], "EXACT"
+        # JDK builtin/primitive receiver: the analyzer knows this is not an
+        # in-repo cross-file class boundary -> UNSUPPORTED (not UNRESOLVED).
+        if simple in _JAVA_PRIMITIVES or simple in _JAVA_BUILTIN_TYPES:
+            return None, "UNSUPPORTED"
+        if "." in cls:
+            return cls, "EXACT"
         # A wildcard import makes a bare simple-name receiver ambiguous: it could
         # resolve to a class in any wildcard-imported package, not just the
         # current package. Fail closed (J) rather than assume same-package.
@@ -245,38 +259,63 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
 
         Emitted by the same per-file extractor that proves local flow, so no
         second analyzer is introduced. The later repository pass matches these
-        against exact callees in other files."""
+        against exact callees in other files. Every ATTEMPT is recorded with a
+        machine-visible ``receiverResolution`` (EXACT/AMBIGUOUS/UNRESOLVED/
+        UNSUPPORTED) so an attempted-but-unresolved boundary stays distinct
+        from "no flow exists"; positive flow edges are only ever asserted by
+        the pass for an EXACT receiver with a unique callee."""
         if not target_cls:
             return
         fqn, state = _receiver_fqn(target_cls)
-        if state != "EXACT":
-            return
+        t_simple = target_cls.split("<", 1)[0].strip()
+        if "." in t_simple:
+            import_ctx = "qualified"
+        elif t_simple in java_imports:
+            import_ctx = "explicit_import"
+        elif java_has_wildcard_import:
+            import_ctx = "wildcard"
+        elif java_package:
+            import_ctx = "same_package"
+        else:
+            import_ctx = "default_package"
         if obj is None or (obj is not None and name_of(obj) == "this"):
             conf = "PROVEN"
         elif obj is not None and (
-            name_of(obj) in java_imports or name_of(obj)[0:1].isupper()
+            name_of(obj) in java_imports or (name_of(obj) or "")[0:1].isupper()
         ):
             conf = "PROVEN"  # explicit static class receiver (imported or same-package)
         else:
             conf = "MAY"
-        arg_values: list[dict[str, object]] = []
-        for _i, _a in enumerate(args_of(call_node)):
-            _v = expr_value(_a, method, cls, locals_map)
-            if _v:
-                arg_values.append({"index": _i, "value": _v})
+        reason = {
+            "EXACT": "exact",
+            "AMBIGUOUS": "wildcard_import_ambiguous" if java_has_wildcard_import else "receiver_ambiguous",
+            "UNRESOLVED": "receiver_unresolved",
+            "UNSUPPORTED": "receiver_unsupported_type",
+        }.get(state, "unknown")
         rec = {
             "file": str_path,
             "package": java_package,
-            "receiver": fqn,
+            "receiver": target_cls,
+            "receiverFqn": fqn,
+            "receiverResolution": state,
             "receiverConfidence": conf,
+            "importContext": import_ctx,
+            "reason": reason,
             "method": name,
             "constructor": constructor,
             "argCount": argument_count,
-            "argValues": arg_values,
+            "argValues": [],
             "returnSink": None,
             "returnSinkKind": None,
             "location": f"{loc(call_node)}:{span(call_node)}",
         }
+        if state == "EXACT":
+            # Argument value ids (with indices) are only needed when the pass may
+            # assert PASSED_AS_ARGUMENT / TRANSFORMED_BY edges.
+            for _i, _a in enumerate(args_of(call_node)):
+                _v = expr_value(_a, method, cls, locals_map)
+                if _v:
+                    rec["argValues"].append({"index": _i, "value": _v})
         xf_by_call[call_node] = rec
         cross_file_calls.append(rec)
 

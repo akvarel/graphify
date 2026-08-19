@@ -10,6 +10,7 @@ from graphify.extractors.base import (  # noqa: F401
     _make_id,
     _read_text,
 )
+from graphify.security import sanitize_metadata
 import hashlib
 import json
 import os
@@ -3188,7 +3189,7 @@ def _resolve_cross_file_java_data_flow(
         for e in all_edges
     }
     emitted = 0
-    stats = {"records": 0, "exact": 0, "ambiguous": 0, "unresolved": 0}
+    emitted_diagnostics = 0
 
     def _push(src: str | None, tgt: str | None, rel: str, md: dict[str, Any]) -> None:
         nonlocal emitted
@@ -3215,6 +3216,70 @@ def _resolve_cross_file_java_data_flow(
         })
         emitted += 1
 
+    def _emit_diagnostic(
+        rec: dict[str, Any],
+        resolution: str,
+        coverage: str,
+        reason: str,
+        candidate_count: int | None,
+        candidates: list[str] | None = None,
+    ) -> None:
+        """Emit one bounded, machine-visible cross-file resolution diagnostic.
+
+        A diagnostic NODE (never a positive relation/edge) so an
+        attempted-but-ambiguous/unresolved/unsupported boundary stays distinct
+        from "no flow exists", without fabricating a flow edge. Candidate
+        identities are included only when deterministically known and safe
+        (never raw source values or secrets)."""
+        nonlocal emitted_diagnostics
+        sf = rec.get("file") or ""
+        loc = rec.get("location") or ""
+        stem = _file_stem(Path(sf)) if sf else "unknown"
+        loc_slug = re.sub(r"[^A-Za-z0-9]", "_", loc)[:40] if loc else ""
+        nid = _make_id(stem, "cross_file_data_flow",
+                       str(rec.get("method") or ""), str(rec.get("argCount") or 0),
+                       loc_slug)
+        score = {
+            "EXACT": 1.0, "AMBIGUOUS": 0.5, "UNRESOLVED": 0.5, "UNSUPPORTED": 0.5,
+        }.get(resolution, 0.5)
+        if coverage == "PARTIAL":
+            score = min(score, 0.8)
+        md: dict[str, Any] = {
+            "capability": "cross_file_data_flow",
+            "kind": "cross_file_resolution",
+            "resolution": resolution,
+            "coverage": coverage,
+            "callerFile": sf,
+            "callerLocation": loc,
+            "receiver": rec.get("receiver") or "",
+            "receiverFqn": rec.get("receiverFqn") or "",
+            "receiverConfidence": rec.get("receiverConfidence") or "MAY",
+            "importContext": rec.get("importContext") or "unknown",
+            "method": rec.get("method") or "",
+            "constructor": bool(rec.get("constructor")),
+            "arity": int(rec.get("argCount") or 0),
+            "reason": reason,
+            "candidateCount": candidate_count if candidate_count is not None else 0,
+            "extractor": "graphify",
+        }
+        if candidates:
+            md["candidates"] = list(candidates)
+        all_nodes.append({
+            "id": nid,
+            "label": "Java cross-file data-flow resolution",
+            "file_type": "code",
+            "type": "extraction_diagnostic",
+            "source_file": sf,
+            "source_location": loc,
+            "confidence": "EXTRACTED",
+            "confidence_score": score,
+            "metadata": sanitize_metadata(md),
+            "_origin": "cross_file_resolution",
+        })
+        emitted_diagnostics += 1
+
+    counts = {"attempted": 0, "exact": 0, "ambiguous": 0, "unresolved": 0, "unsupported": 0}
+
     for file_result in per_file:
         records = ((file_result.get("data_flow") or {}).get("java", {})
                    .get("cross_file_calls") or [])
@@ -3232,37 +3297,61 @@ def _resolve_cross_file_java_data_flow(
             if cur is None or (rec.get("returnSink") and not cur.get("returnSink")):
                 best[loc] = rec
         for rec in best.values():
-            stats["records"] += 1
-            receiver = rec.get("receiver") or ""
-            if "." in receiver:
-                package, _, owner_simple = receiver.rpartition(".")
-            else:
-                package, owner_simple = "", receiver
+            resolution = str(rec.get("receiverResolution") or "UNRESOLVED")
             m_name = str(rec.get("method") or "")
             a_raw = rec.get("argCount")
             a_cnt = int(a_raw) if isinstance(a_raw, int) else -1
-            matched = index.get((package, owner_simple, m_name, a_cnt), [])
-            if len(matched) > 1:
-                stats["ambiguous"] += 1
-                continue  # AMBIGUOUS -> fail closed
-            if len(matched) == 0:
-                stats["unresolved"] += 1
-                continue  # UNRESOLVED -> fail closed
-            stats["exact"] += 1
-            callee = matched[0]
+            callee = None
+            matched: list[dict[str, Any]] = []
+            candidate_ids: list[str] = []
+            if resolution == "EXACT":
+                receiver_fqn = rec.get("receiverFqn") or (rec.get("receiver") or "")
+                if "." in receiver_fqn:
+                    package, _, owner_simple = receiver_fqn.rpartition(".")
+                else:
+                    package, owner_simple = "", receiver_fqn
+                matched = index.get((package, owner_simple, m_name, a_cnt), [])
+                if len(matched) == 1:
+                    callee = matched[0]
+            if callee is not None:
+                final_res = "EXACT"
+                reason = "exact"
+                candidate_count = 1
+                coverage = "PARTIAL" if callee["incomplete"] else "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
+            elif resolution == "EXACT" and len(matched) > 1:
+                final_res = "AMBIGUOUS"
+                reason = "overload_ambiguity"
+                candidate_count = len(matched)
+                candidate_ids = [c["symbol"] for c in matched]
+                coverage = "PARTIAL"
+            elif resolution == "EXACT":
+                final_res = "UNRESOLVED"
+                reason = "callee_unresolved"
+                candidate_count = 0
+                coverage = "PARTIAL"
+            else:
+                # Receiver-level AMBIGUOUS / UNRESOLVED / UNSUPPORTED: fail closed.
+                final_res = resolution
+                reason = str(rec.get("reason") or resolution.lower())
+                candidate_count = None
+                coverage = "PARTIAL"
+            _emit_diagnostic(rec, final_res, coverage, reason, candidate_count, candidate_ids)
+            counts["attempted"] += 1
+            if final_res != "EXACT":
+                counts[final_res.lower()] += 1
+                continue
+            assert callee is not None  # EXACT implies a unique callee matched
+            counts["exact"] += 1
             base_md = {
                 "source_file": rec.get("file", ""),
                 "source_location": rec.get("location"),
                 "cross_file": True,
-                "receiver": receiver,
+                "receiver": rec.get("receiverFqn") or (rec.get("receiver") or ""),
                 "receiverConfidence": rec.get("receiverConfidence", "MAY"),
                 "callee": callee["node_id"],
                 "calleeSymbol": callee["symbol"],
                 "constructor": bool(rec.get("constructor")),
-                "analysisCompleteness": (
-                    "PARTIAL" if callee["incomplete"]
-                    else "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
-                ),
+                "analysisCompleteness": coverage,
             }
             param_ids = callee["param_value_ids"]
             for arg_entry in rec.get("argValues") or []:
@@ -3283,6 +3372,33 @@ def _resolve_cross_file_java_data_flow(
                     **base_md,
                     "relationKind": rec.get("returnSinkKind"),
                 })
-    stats["emitted"] = emitted
-    globals()["_LAST_CROSS_FILE_JAVA_STATS"] = stats
-    return stats
+    counts["emitted"] = emitted
+    return counts
+
+
+def cross_file_resolution_stats(nodes: list[dict], edges: list[dict]) -> dict[str, int]:
+    """Derive cross-file resolution statistics purely from the persisted graph.
+
+    Counts come from the machine-visible ``extraction_diagnostic`` nodes emitted
+    by ``_resolve_cross_file_java_data_flow`` (one per attempted boundary), so
+    they are reproducible from public evidence rather than ad-hoc private state.
+    Positive cross-file edges are counted from the ``cross_file`` metadata flag.
+    ``attempted`` is the number of attempted boundaries (== sum of the four
+    resolution buckets); ``emitted`` is the number of positive cross-file edges.
+    """
+    counts = {"attempted": 0, "exact": 0, "ambiguous": 0, "unresolved": 0,
+              "unsupported": 0, "emitted": 0}
+    for node in nodes:
+        meta = node.get("metadata") or {}
+        if node.get("type") != "extraction_diagnostic":
+            continue
+        if meta.get("kind") != "cross_file_resolution":
+            continue
+        res = (meta.get("resolution") or "").lower()
+        if res in counts:
+            counts[res] += 1
+        counts["attempted"] += 1
+    for edge in edges:
+        if (edge.get("metadata") or {}).get("cross_file"):
+            counts["emitted"] += 1
+    return counts
