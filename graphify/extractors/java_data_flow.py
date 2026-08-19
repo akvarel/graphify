@@ -83,6 +83,36 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
     append_status_node(status["java"], stem)
     seen_nodes.add(_make_id(stem, "data_flow", "java", status["java"].get("status", "unknown")))
 
+    # Gate 2B: package + simple-name -> FQN imports for deterministic cross-file
+    # receiver resolution (reuses the same import/package facts the resolution
+    # layer uses, so no parallel resolver is introduced).
+    java_package = ""
+    java_imports: dict[str, str] = {}
+    java_has_wildcard_import = False
+    for child in root.children:
+        if child.type == "package_declaration":
+            java_package = _read_text(child, source)[len("package"):].strip().rstrip(";").strip()
+        elif child.type == "import_declaration":
+            body = _read_text(child, source)[len("import"):].strip().rstrip(";").strip()
+            if body.startswith("static "):
+                body = body[len("static "):].strip()
+            if body.endswith(".*"):
+                java_has_wildcard_import = True
+                continue
+            if "." not in body:
+                continue
+            simple = body.split(".")[-1]
+            if simple and simple[0:1].isupper():
+                java_imports.setdefault(simple, body)
+
+    # Cross-file call records emitted by this file's extractor; a later
+    # repository-wide pass links them to exact callees in other files. This is
+    # how Gate 2B bridges caller arguments to cross-file callee parameters
+    # without a second analyzer: the SAME per-file extractor that proves local
+    # flow also records deterministic cross-file intent.
+    cross_file_calls: list[dict[str, Any]] = []
+    xf_by_call: dict[object, dict[str, Any]] = {}
+
     def line(n) -> int:
         return n.start_point[0] + 1
 
@@ -105,6 +135,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                 "kind": frozen_kind,
                 "owner": owner_symbol,
                 "name": name,
+                "package": java_package,
                 "provenance": "STATIC_AST",
             }
             if java_type:
@@ -155,6 +186,105 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         if name in classes:
             return name
         return simple_class.get(name)
+
+    def _resolve_receiver_type(t: str | None) -> str | None:
+        """Resolve a receiver's declared type for cross-file call recording.
+
+        Uses ``_class_qual`` (same-file owner) when deterministic; otherwise keeps
+        the raw type name when it is plausibly a class (uppercase) so the call can
+        be matched against a class declared in another file. Non-class types
+        (``int``, ``String``, primitives) still resolve to None."""
+        q = _class_qual(t or "")
+        if q:
+            return q
+        t0 = (t or "").strip().split("<", 1)[0].strip()
+        if t0 and t0[0:1].isupper():
+            return t0
+        return None
+
+    def _receiver_fqn(target_cls: str) -> tuple[str | None, str]:
+        """Map a cross-file receiver type to a package-qualified class FQN.
+
+        Returns ``(fqn, state)`` where state is ``EXACT`` when the identity is
+        deterministic (explicit import, same-package, or already-qualified) and
+        ``UNRESOLVED``/``AMBIGUOUS`` otherwise. Only ``EXACT`` receivers may be
+        linked cross-file. This reuses the file's own import/package facts, so it
+        is the same resolver the resolution layer uses, not a second one."""
+        cls = (target_cls or "").strip()
+        if not cls:
+            return None, "UNRESOLVED"
+        cls = cls.split("<", 1)[0].strip()
+        if "." in cls:
+            return cls, "EXACT"
+        if cls in java_imports:
+            return java_imports[cls], "EXACT"
+        # A wildcard import makes a bare simple-name receiver ambiguous: it could
+        # resolve to a class in any wildcard-imported package, not just the
+        # current package. Fail closed (J) rather than assume same-package.
+        if java_has_wildcard_import:
+            return None, "AMBIGUOUS"
+        if java_package:
+            return f"{java_package}.{cls}", "EXACT"
+        # Default package: the simple name is the class's own FQN, but only the
+        # defining file can prove it. Fail closed here; the cross-file pass links
+        # default-package cases only when the class is actually declared.
+        return cls, "UNRESOLVED"
+
+    def _record_cross_file_call(
+        call_node,
+        target_cls: str,
+        name: str,
+        argument_count: int,
+        method,
+        cls: str,
+        locals_map,
+        obj,
+        constructor: bool = False,
+    ) -> None:
+        """Record a deterministic cross-file call/constructor intent.
+
+        Emitted by the same per-file extractor that proves local flow, so no
+        second analyzer is introduced. The later repository pass matches these
+        against exact callees in other files."""
+        if not target_cls:
+            return
+        fqn, state = _receiver_fqn(target_cls)
+        if state != "EXACT":
+            return
+        if obj is None or (obj is not None and name_of(obj) == "this"):
+            conf = "PROVEN"
+        elif obj is not None and (
+            name_of(obj) in java_imports or name_of(obj)[0:1].isupper()
+        ):
+            conf = "PROVEN"  # explicit static class receiver (imported or same-package)
+        else:
+            conf = "MAY"
+        arg_values: list[dict[str, object]] = []
+        for _i, _a in enumerate(args_of(call_node)):
+            _v = expr_value(_a, method, cls, locals_map)
+            if _v:
+                arg_values.append({"index": _i, "value": _v})
+        rec = {
+            "file": str_path,
+            "package": java_package,
+            "receiver": fqn,
+            "receiverConfidence": conf,
+            "method": name,
+            "constructor": constructor,
+            "argCount": argument_count,
+            "argValues": arg_values,
+            "returnSink": None,
+            "returnSinkKind": None,
+            "location": f"{loc(call_node)}:{span(call_node)}",
+        }
+        xf_by_call[call_node] = rec
+        cross_file_calls.append(rec)
+
+    def _capture_xf_sink(n, sink_id, sink_kind: str) -> None:
+        """Attach a cross-file call's return sink (caller-side receiving value)."""
+        if n is not None and n in xf_by_call:
+            xf_by_call[n]["returnSink"] = sink_id
+            xf_by_call[n]["returnSinkKind"] = sink_kind
 
     def named_child(n, *fields):
         for f in fields:
@@ -242,8 +372,29 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             overloaded = method_name_counts.get((qual, name), 0) > 1
             mid = structural_matches[0] if len(structural_matches) == 1 and not overloaded else _make_id(stem, signature)
             if mid:
-                if mid not in seen_nodes:
+                method_md = sanitize_metadata({
+                    "language": "java",
+                    "kind": "method",
+                    "symbol": signature,
+                    "structural_overload_identity": True,
+                    "param_types": [spec["type"] for spec in parameter_specs],
+                    "package": java_package,
+                })
+                existing = next((x for x in nodes if x.get("id") == mid), None)
+                if existing is not None:
+                    # The generic extractor already emitted this method node
+                    # (sometimes with type=None). Enrich it in place with
+                    # data-flow identity instead of appending a duplicate, which
+                    # a later node-id dedup would drop and thereby strip the
+                    # symbol/param metadata the cross-file pass needs. Idempotent
+                    # even when the id is already registered in seen_nodes.
+                    existing["type"] = "function"
+                    existing["metadata"] = {**(existing.get("metadata") or {}), **method_md}
                     seen_nodes.add(mid)
+                    valid_ids.add(mid)
+                elif mid not in seen_nodes:
+                    seen_nodes.add(mid)
+                    valid_ids.add(mid)
                     nodes.append({
                         "id": mid,
                         "label": f".{name}({','.join(spec['type'] for spec in parameter_specs)})",
@@ -253,14 +404,8 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                         "source_location": exact_loc,
                         "confidence": "EXTRACTED",
                         "confidence_score": 0.8 if root.has_error else 1.0,
-                        "metadata": sanitize_metadata({
-                            "language": "java",
-                            "kind": "method",
-                            "symbol": signature,
-                            "structural_overload_identity": True,
-                        }),
+                        "metadata": method_md,
                     })
-                    valid_ids.add(mid)
                 info = {
                     "id": mid,
                     "symbol": signature,
@@ -279,7 +424,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                 if n.type == "method_declaration" and return_type != "void":
                     ret = add_value(signature, "return", "return", n, return_type)
                 info["returns"] = ret
-                for spec in parameter_specs:
+                for index, spec in enumerate(parameter_specs):
                     pid = add_value(
                         signature,
                         "parameter",
@@ -287,6 +432,11 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                         spec["name_node"] or spec["node"],
                         spec["type"],
                     )
+                    if pid:
+                        for pn in nodes:
+                            if pn.get("id") == pid and isinstance(pn.get("metadata"), dict):
+                                pn["metadata"]["param_index"] = index
+                                break
                     info["params"].append({"name": spec["name"], "id": pid, "type": spec["type"]})
                 body = named_child(n, "body")
                 if body:
@@ -417,6 +567,11 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         ]
         if len(constructors) == 1:
             wire_args(n, constructors[0], method, cls, locals_map)
+        elif typ and not target_qual and typ[0:1].isupper():
+            # Cross-file constructor (`new Invoice(price, currency)`): record it
+            # so the repository-wide pass can link arguments to the exact
+            # constructor in another file (Gate 2B). Fail closed otherwise.
+            _record_cross_file_call(n, typ, typ.rsplit(".", 1)[-1], len(args_of(n)), method, cls, locals_map, None, constructor=True)
         return oid
 
     def resolve_call(n, method, cls, locals_map):
@@ -432,12 +587,17 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                 target_cls = _class_qual(on)
             local = lookup_local(locals_map, on)
             if local:
-                target_cls = _class_qual(local.get("type") or "") or target_cls
+                target_cls = _resolve_receiver_type(local.get("type")) or target_cls
             for p in (method or {}).get("params", []):
                 if p["name"] == on:
-                    target_cls = _class_qual(p.get("type") or "") or target_cls
+                    target_cls = _resolve_receiver_type(p.get("type")) or target_cls
             if on in classes.get(cls, {}).get("fields", {}):
-                target_cls = _class_qual(classes[cls]["fields"][on].get("type") or "") or target_cls
+                target_cls = _resolve_receiver_type(classes[cls]["fields"][on].get("type")) or target_cls
+            if not target_cls and on and on[0:1].isupper():
+                # Static class receiver whose type is declared in another file
+                # (e.g. `PricingService.calculate(x)`). Falls through to a
+                # cross-file record when not a same-file class.
+                target_cls = on
         argument_count = len(args_of(n))
         candidates = [
             candidate
@@ -446,11 +606,17 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             and candidate["class"] == target_cls
             and len(candidate.get("params", [])) == argument_count
         ]
-        if len(candidates) != 1:
-            return None
-        target = candidates[0]
-        wire_args(n, target, method, cls, locals_map)
-        return target
+        if len(candidates) == 1:
+            target = candidates[0]
+            wire_args(n, target, method, cls, locals_map)
+            return target
+        # No exact same-file candidate. If the receiver resolves to a
+        # deterministic cross-file class type, record the call intent so the
+        # repository-wide pass can link it to the exact callee in another file
+        # (Gate 2B). Name-only / unresolved receivers record nothing.
+        if target_cls and target_cls not in classes:
+            _record_cross_file_call(n, target_cls, name, argument_count, method, cls, locals_map, obj)
+        return None
 
     def args_of(n):
         a = named_child(n, "arguments")
@@ -518,6 +684,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                     vid = add_value(method["symbol"], "local", nm, nn or c, typ)
                     source_expr = named_child(c, "value")
                     source_id = expr_value(source_expr, method, cls, locals_map)
+                    _capture_xf_sink(source_expr, vid, "local")
                     bind_local(locals_map, nm, {"id": vid, "type": typ})
                     if is_field_value(source_id):
                         add_edge(source_id, vid, "READ_FROM", c, field_edge_md(source_expr, method, cls, locals_map))
@@ -530,6 +697,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             target = local_target["id"] if local_target else expr_value(left, method, cls, locals_map)
             source_id = expr_value(right, method, cls, locals_map)
             writes_field = is_field_value(target)
+            _capture_xf_sink(right, target, "field" if writes_field else "local")
             if writes_field:
                 add_edge(source_id, target, "WRITTEN_TO", n, field_edge_md(left, method, cls, locals_map))
             else:
@@ -539,6 +707,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         elif n.type == "return_statement":
             val = next((c for c in n.children if c.is_named), None)
             source_id = expr_value(val, method, cls, locals_map)
+            _capture_xf_sink(val, method.get("returns"), "return")
             if is_field_value(source_id):
                 add_edge(source_id, method.get("returns"), "READ_FROM", n, field_edge_md(val, method, cls, locals_map))
             add_edge(source_id, method.get("returns"), "RETURNED_AS", n)
@@ -576,4 +745,30 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                 call,
                 {"transformationSymbol": target["symbol"], "argumentIndex": argument_index, "callee": target["id"]},
             )
+    # Expose each method's param->return dependency indices and param value-node
+    # ids so the cross-file pass can prove TRANSFORMED_BY without re-analysis.
+    # The method's RETURN_VALUE data-value node reliably survives extract()'s
+    # later node dedup (function nodes do not), so the stamps live there and on
+    # the method node for other consumers.
+    for klass in classes.values():
+        for method in klass.get("methods", []):
+            deps = sorted(method.get("param_return_deps", set()))
+            ret_id = method.get("returns")
+            if ret_id:
+                for node in nodes:
+                    if node.get("id") == ret_id and isinstance(node.get("metadata"), dict):
+                        node["metadata"]["param_return_deps"] = deps
+                        node["metadata"]["package"] = java_package
+                        node["metadata"]["param_value_ids"] = [p["id"] for p in method.get("params", [])]
+                        break
+            mid = method.get("id")
+            if mid:
+                for node in nodes:
+                    if node.get("id") == mid and isinstance(node.get("metadata"), dict):
+                        node["metadata"]["param_return_deps"] = deps
+                        node["metadata"]["param_value_ids"] = [p["id"] for p in method.get("params", [])]
+                        node["metadata"]["return_value_id"] = ret_id
+                        break
+    if cross_file_calls:
+        result.setdefault("data_flow", {}).setdefault("java", {}).setdefault("cross_file_calls", []).extend(cross_file_calls)
     return result

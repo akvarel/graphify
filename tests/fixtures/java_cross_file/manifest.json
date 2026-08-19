@@ -1,0 +1,124 @@
+{
+  "_comment": "Dedicated multi-file Java cross-file fixture suite (Gate 2B, Section 16). Each case's expected cross-file edge relations are asserted at the public extraction boundary by tests/test_java_cross_file_fixture_suite.py. Precision over recall: negative cases must emit nothing.",
+  "cases": [
+    {
+      "name": "A_same_package",
+      "files": [
+        "src/acme/PricingService.java",
+        "src/acme/Order.java"
+      ],
+      "expected": [
+        "PASSED_AS_ARGUMENT",
+        "TRANSFORMED_BY",
+        "FLOWS_TO"
+      ],
+      "forbidden": []
+    },
+    {
+      "name": "B_explicit_import",
+      "files": [
+        "src/com/a/Widget.java",
+        "src/com/b/Widget.java",
+        "src/com/x/User.java"
+      ],
+      "expected": [
+        "PASSED_AS_ARGUMENT",
+        "TRANSFORMED_BY",
+        "FLOWS_TO"
+      ],
+      "forbidden": []
+    },
+    {
+      "name": "C_cross_file_return",
+      "files": [
+        "src/acme/Converter.java",
+        "src/acme/App.java"
+      ],
+      "expected": [
+        "PASSED_AS_ARGUMENT",
+        "FLOWS_TO"
+      ],
+      "forbidden": [
+        "TRANSFORMED_BY"
+      ]
+    },
+    {
+      "name": "D_constant_return",
+      "files": [
+        "src/acme/Const.java",
+        "src/acme/Use.java"
+      ],
+      "expected": [
+        "PASSED_AS_ARGUMENT",
+        "FLOWS_TO"
+      ],
+      "forbidden": [
+        "TRANSFORMED_BY"
+      ]
+    },
+    {
+      "name": "E_multi_param",
+      "files": [
+        "src/acme/Calc.java",
+        "src/acme/User.java"
+      ],
+      "expected": [
+        "PASSED_AS_ARGUMENT",
+        "TRANSFORMED_BY",
+        "FLOWS_TO"
+      ],
+      "forbidden": []
+    },
+    {
+      "name": "F_constructor",
+      "files": [
+        "src/acme/Invoice.java",
+        "src/acme/Shop.java"
+      ],
+      "expected": [
+        "PASSED_AS_ARGUMENT",
+        "FLOWS_TO"
+      ],
+      "forbidden": []
+    },
+    {
+      "name": "I_overload",
+      "files": [
+        "src/acme/Ambig.java",
+        "src/acme/AmbigUser.java"
+      ],
+      "expected": [],
+      "forbidden": [
+        "PASSED_AS_ARGUMENT",
+        "TRANSFORMED_BY",
+        "FLOWS_TO"
+      ]
+    },
+    {
+      "name": "J_wildcard",
+      "files": [
+        "src/com/a/W.java",
+        "src/com/x/WUser.java"
+      ],
+      "expected": [],
+      "forbidden": [
+        "PASSED_AS_ARGUMENT",
+        "TRANSFORMED_BY",
+        "FLOWS_TO"
+      ]
+    },
+    {
+      "name": "N_receiver_may",
+      "files": [
+        "src/acme/PS.java",
+        "src/acme/Ord.java"
+      ],
+      "expected": [
+        "PASSED_AS_ARGUMENT",
+        "TRANSFORMED_BY",
+        "FLOWS_TO"
+      ],
+      "forbidden": []
+    }
+  ]
+}

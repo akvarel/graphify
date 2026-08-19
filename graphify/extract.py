@@ -118,6 +118,7 @@ from graphify.extractors.resolution import (  # noqa: E402,F401
     _resolve_c_include_path,
     _resolve_cross_file_imports,
     _resolve_cross_file_java_imports,
+    _resolve_cross_file_java_data_flow,
     _resolve_export_target,
     _resolve_go_type_references,
     _resolve_java_type_references,
@@ -5689,6 +5690,21 @@ def extract(
     # them (foo_h vs foo_cpp), so the collapse must happen first. Collapsing here
     # also means disambiguation sees one source_file per id and won't split them.
     _merge_decl_def_classes(all_nodes, all_edges)
+
+    # Gate 2B: cross-file Java data-flow linkage (caller args -> callee params,
+    # callee returns -> caller receiving values). Runs BEFORE the id-remap below
+    # so the pre-remap value-node ids carried by the per-file cross_file_calls
+    # records still match all_nodes; the remap then rewrites these edges'
+    # endpoints together with the nodes. Fail-closed (exact receiver FQN +
+    # method + arity; ambiguity/unresolved emits nothing).
+    if any(p.suffix == ".java" for p in paths):
+        try:
+            _resolve_cross_file_java_data_flow(per_file, paths, all_nodes, all_edges)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Java cross-file data-flow resolution failed, skipping: %s", exc
+            )
 
     # Remap file node IDs from absolute-path-derived to the canonical
     # {parent_dir}_{stem} spec form so (a) graph.json edge endpoints are stable

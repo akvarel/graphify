@@ -3102,3 +3102,187 @@ def _pascal_resolve_class(from_path: Path, class_name: str) -> str | None:
     if file_stem:
         return _make_id(file_stem, class_name)
     return None
+
+
+def _resolve_cross_file_java_data_flow(
+    per_file: list[dict],
+    paths: list[Path],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> dict[str, int]:
+    """Gate 2B cross-file Java data-flow linkage.
+
+    Links the per-file extractor's recorded cross-file call/constructor intents
+    (``result["data_flow"]["java"]["cross_file_calls"]``) to EXACT callee methods
+    in other files, bridging caller arguments to callee parameters and callee
+    returns to caller receiving values. No new resolver is introduced: receiver
+    types and call intents come from the SAME per-file extractor, and the global
+    method index is built purely from emitted method nodes (metadata carries the
+    package, param types, param->return dependency indices and value-node ids).
+    Matching is exact (receiver FQN + method name + arity); ambiguity or an
+    unresolved receiver yields no edge (fail closed). Transitive flow is never
+    computed, and no GVR verdicts are produced here.
+
+    Must run BEFORE extract()'s id-remap passes so the pre-remap value-node ids
+    carried by the records still match the node ids in ``all_nodes``; the remap
+    then rewrites these edges' endpoints together with the nodes.
+
+    Returns a stats dict ``{"records", "exact", "ambiguous", "unresolved",
+    "emitted"}`` for diagnostics; the edges are appended to ``all_edges``.
+    """
+    # Global method/constructor index keyed by (package, owner simple name,
+    # method name, arity). Built from PARAMETER and RETURN_VALUE data-value
+    # nodes, which reliably survive extract()'s later node dedup (method function
+    # nodes do not): the extractor stamps package on every data-value node,
+    # param index on parameters, and param->return deps on the return node. This
+    # keeps the linkage deterministic and independent of name-only matching, and
+    # covers constructors (parameters, no return node).
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for node in all_nodes:
+        meta = node.get("metadata") or {}
+        if node.get("type") != "data_value":
+            continue
+        symbol = meta.get("owner") or ""
+        package = meta.get("package") or ""
+        if not symbol or "(" not in symbol:
+            continue
+        owner, _, rest = symbol.rpartition(".")
+        name = rest.split("(", 1)[0]
+        if not owner or not name:
+            continue
+        kind = meta.get("kind")
+        group = groups.setdefault((package, symbol), {
+            "params": {}, "param_return_deps": set(), "return_id": None,
+            "incomplete": False,
+        })
+        # Parse incompleteness propagates: a target whose extraction was degraded
+        # (source parse errors) must not present an apparently complete flow.
+        if node.get("confidence_score", 1.0) < 1.0:
+            group["incomplete"] = True
+        if kind == "PARAMETER":
+            idx = meta.get("param_index")
+            if idx is not None:
+                group["params"][idx] = node.get("id")
+        elif kind == "RETURN_VALUE":
+            group["return_id"] = node.get("id")
+            group["param_return_deps"] = set(meta.get("param_return_deps") or [])
+
+    index: dict[tuple[str, str, str, int], list[dict[str, Any]]] = {}
+    for (package, symbol), group in groups.items():
+        owner, _, rest = symbol.rpartition(".")
+        name = rest.split("(", 1)[0]
+        param_ids = [group["params"].get(i) for i in range(len(group["params"]))]
+        arity = len(param_ids)
+        index.setdefault((package, owner, name, arity), []).append({
+            "node_id": group["return_id"] or (param_ids[0] if param_ids else None),
+            "return_id": group["return_id"],
+            "param_value_ids": param_ids,
+            "param_return_deps": group["param_return_deps"],
+            "symbol": symbol,
+            "incomplete": group["incomplete"],
+        })
+
+    owned = {n.get("id") for n in all_nodes}
+    seen_edges = {
+        (e.get("source"), e.get("target"), e.get("relation"), e.get("source_location"))
+        for e in all_edges
+    }
+    emitted = 0
+    stats = {"records": 0, "exact": 0, "ambiguous": 0, "unresolved": 0}
+
+    def _push(src: str | None, tgt: str | None, rel: str, md: dict[str, Any]) -> None:
+        nonlocal emitted
+        if not src or not tgt or src not in owned or tgt not in owned:
+            return
+        key = (src, tgt, rel, md.get("source_location"))
+        if key in seen_edges:
+            return
+        seen_edges.add(key)
+        conf = md.get("receiverConfidence", "PROVEN")
+        score = 1.0 if conf == "PROVEN" else 0.5
+        if md.get("analysisCompleteness") == "PARTIAL":
+            score = min(score, 0.8)  # parse-incomplete target: never full trust
+        all_edges.append({
+            "source": src,
+            "target": tgt,
+            "relation": rel,
+            "confidence": "EXTRACTED",
+            "confidence_score": score,
+            "source_file": md.get("source_file", ""),
+            "source_location": md.get("source_location"),
+            "weight": 1.0,
+            "metadata": {"provenance": "CROSS_FILE"} | md,
+        })
+        emitted += 1
+
+    for file_result in per_file:
+        records = ((file_result.get("data_flow") or {}).get("java", {})
+                   .get("cross_file_calls") or [])
+        if not records:
+            continue
+        # Dedupe by call site, preferring the record that captured a return sink
+        # (the extractor records an expression-position call twice: once as a
+        # value, once as a statement).
+        best: dict[str, dict[str, Any]] = {}
+        for rec in records:
+            loc = rec.get("location")
+            if not loc:
+                continue
+            cur = best.get(loc)
+            if cur is None or (rec.get("returnSink") and not cur.get("returnSink")):
+                best[loc] = rec
+        for rec in best.values():
+            stats["records"] += 1
+            receiver = rec.get("receiver") or ""
+            if "." in receiver:
+                package, _, owner_simple = receiver.rpartition(".")
+            else:
+                package, owner_simple = "", receiver
+            m_name = str(rec.get("method") or "")
+            a_raw = rec.get("argCount")
+            a_cnt = int(a_raw) if isinstance(a_raw, int) else -1
+            matched = index.get((package, owner_simple, m_name, a_cnt), [])
+            if len(matched) > 1:
+                stats["ambiguous"] += 1
+                continue  # AMBIGUOUS -> fail closed
+            if len(matched) == 0:
+                stats["unresolved"] += 1
+                continue  # UNRESOLVED -> fail closed
+            stats["exact"] += 1
+            callee = matched[0]
+            base_md = {
+                "source_file": rec.get("file", ""),
+                "source_location": rec.get("location"),
+                "cross_file": True,
+                "receiver": receiver,
+                "receiverConfidence": rec.get("receiverConfidence", "MAY"),
+                "callee": callee["node_id"],
+                "calleeSymbol": callee["symbol"],
+                "constructor": bool(rec.get("constructor")),
+                "analysisCompleteness": (
+                    "PARTIAL" if callee["incomplete"]
+                    else "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
+                ),
+            }
+            param_ids = callee["param_value_ids"]
+            for arg_entry in rec.get("argValues") or []:
+                i = arg_entry.get("index")
+                arg_value_id = arg_entry.get("value")
+                if i is None or i < 0 or i >= len(param_ids) or not param_ids[i]:
+                    continue
+                amd = {**base_md, "argumentIndex": i}
+                _push(arg_value_id, param_ids[i], "PASSED_AS_ARGUMENT", amd)
+                if i in callee["param_return_deps"] and callee["return_id"]:
+                    _push(arg_value_id, callee["return_id"], "TRANSFORMED_BY", {
+                        **amd,
+                        "transformationSymbol": callee["symbol"],
+                        "argumentIndex": i,
+                    })
+            if rec.get("returnSink") and callee["return_id"]:
+                _push(callee["return_id"], rec["returnSink"], "FLOWS_TO", {
+                    **base_md,
+                    "relationKind": rec.get("returnSinkKind"),
+                })
+    stats["emitted"] = emitted
+    globals()["_LAST_CROSS_FILE_JAVA_STATS"] = stats
+    return stats
