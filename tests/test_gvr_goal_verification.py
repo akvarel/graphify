@@ -81,6 +81,53 @@ def test_car_wash_passes_when_the_car_is_moved_and_washed():
     assert verify(context, proposal).verdict == VerificationVerdict.PASS
 
 
+def test_failed_precondition_does_not_magically_apply_effect():
+    context = VerificationContext.from_nested_state(
+        {"car": {"location": "home", "washed": False}},
+        goals=(Goal("washed", (Predicate("car", "washed", "EQ", True),)),),
+    )
+    proposal = Proposal(
+        actions=(
+            Action(
+                "wash_car",
+                preconditions=(Predicate("car", "location", "EQ", "car_wash"),),
+                effects=(Predicate("car", "washed", "SET", True),),
+            ),
+        ),
+    )
+
+    report = verify(context, proposal)
+
+    assert report.verdict == VerificationVerdict.FAIL
+    assert report.final_state[("car", "washed")] is False
+    assert any(issue.code == "PRECONDITION_FAILED" for issue in report.failures)
+    assert any(issue.code == "GOAL_UNSATISFIED" for issue in report.failures)
+
+
+def test_insufficient_resource_does_not_magically_apply_effect():
+    context = VerificationContext.from_nested_state(
+        {"car": {"location": "home"}},
+        goals=(Goal("arrive", (Predicate("car", "location", "EQ", "destination"),)),),
+        resources={("car", "fuel_liters"): 5.0},
+    )
+    proposal = Proposal(
+        actions=(
+            Action(
+                "drive",
+                consumes=(Predicate("car", "fuel_liters", "GE", 8.0),),
+                effects=(Predicate("car", "location", "SET", "destination"),),
+            ),
+        ),
+    )
+
+    report = verify(context, proposal)
+
+    assert report.verdict == VerificationVerdict.FAIL
+    assert report.final_state[("car", "location")] == "home"
+    assert any(issue.code == "RESOURCE_INSUFFICIENT" for issue in report.failures)
+    assert any(issue.code == "GOAL_UNSATISFIED" for issue in report.failures)
+
+
 def test_missing_email_precondition_is_unknown_not_fabricated():
     context = VerificationContext.from_nested_state({"ivan": {"name": "Ivan"}})
     proposal = Proposal(
