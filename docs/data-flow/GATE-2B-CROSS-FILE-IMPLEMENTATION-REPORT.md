@@ -281,7 +281,7 @@ were resolved in remediation commit(s) on `feature/java-cross-file-data-flow-v8`
 - Starting branch SHA (Gate 2B base): `d8b663f`
 - Gate 2B implementation SHA: `1d5d21e187829aa717145187a6cbef5b2de8fb86`
 - Follow-up validation-note SHA: `e7d7f60f3732a25a4a659ee8a1aeece2726fc426`
-- Remediation final SHA: `[FINAL_SHA]` (set at commit time)
+- Remediation final SHA: `53afba492040bbe61b45632eb3617e98bd4b2c7e`
 - Current `upstream/v8` SHA: `b14b52e94ec3d9840413d81777f4c134eac0a40d`
 - Merge-base with `upstream/v8`: `b14b52e94ec3d9840413d81777f4c134eac0a40d`
 - ahead/behind vs `upstream/v8`: 34 ahead / 0 behind (direction: branch is
