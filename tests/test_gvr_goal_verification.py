@@ -1,11 +1,13 @@
 from graphify.gvr import (
     Action,
     Goal,
+    IndeterminateValue,
     Predicate,
     Proposal,
     VerificationContext,
     VerificationVerdict,
     VerifierRegistry,
+    counterexamples,
     default_registry,
     verify,
 )
@@ -43,6 +45,14 @@ def test_car_wash_rejects_walking_because_car_never_reaches_wash():
         ("car", "location"),
         ("car", "washed"),
     }
+    witnesses = counterexamples(report)
+    assert any(
+        item.subject == "car"
+        and item.attribute == "location"
+        and item.actual_value == "home"
+        and item.expected_value == "car_wash"
+        for item in witnesses
+    )
 
 
 def test_car_wash_passes_when_the_car_is_moved_and_washed():
@@ -120,7 +130,7 @@ def test_resources_are_consumed_across_multiple_actions():
     assert any(issue.action == "step-2" and issue.code == "RESOURCE_INSUFFICIENT" for issue in report.failures)
 
 
-def test_unsupported_effect_makes_result_unknown():
+def test_unsupported_effect_taints_poststate_and_goal_is_unknown_not_false():
     context = VerificationContext.from_nested_state(
         {"document": {"approved": False}},
         goals=(Goal("approved", (Predicate("document", "approved", "EQ", True),)),),
@@ -132,7 +142,40 @@ def test_unsupported_effect_makes_result_unknown():
     report = verify(context, proposal)
 
     assert report.verdict == VerificationVerdict.UNKNOWN
+    assert report.final_state[("document", "approved")] == IndeterminateValue.UNKNOWN
     assert any(issue.code == "EFFECT_UNSUPPORTED" for issue in report.unknowns)
+    assert any(issue.code == "GOAL_UNKNOWN" for issue in report.unknowns)
+    assert not report.failures
+
+
+def test_unsupported_effect_makes_later_precondition_unknown():
+    context = VerificationContext.from_nested_state({"document": {"approved": False}})
+    proposal = Proposal(
+        actions=(
+            Action("external_approval", effects=(Predicate("document", "approved", "CALL_TOOL", "approve"),)),
+            Action("publish", preconditions=(Predicate("document", "approved", "EQ", True),)),
+        ),
+    )
+
+    report = verify(context, proposal)
+
+    assert report.verdict == VerificationVerdict.UNKNOWN
+    assert any(
+        issue.code == "PRECONDITION_UNKNOWN" and issue.action == "publish"
+        for issue in report.unknowns
+    )
+
+
+def test_known_unsatisfied_goal_still_fails_without_indeterminate_effect():
+    context = VerificationContext.from_nested_state(
+        {"document": {"approved": False}},
+        goals=(Goal("approved", (Predicate("document", "approved", "EQ", True),)),),
+    )
+
+    report = verify(context, Proposal(actions=()))
+
+    assert report.verdict == VerificationVerdict.FAIL
+    assert any(issue.code == "GOAL_UNSATISFIED" for issue in report.failures)
 
 
 def test_invariant_violation_fails_even_if_goal_passes():
@@ -194,9 +237,10 @@ def test_duplicate_verifier_registration_is_rejected():
         raise AssertionError("duplicate verifier registration must fail")
 
 
-def test_empty_registry_passes_without_claiming_unchecked_goals():
-    # A deliberately empty registry is a caller choice. It proves only that no
-    # selected verifier failed; production policy must decide which verifiers are mandatory.
+def test_empty_registry_passes_only_selected_verifier_set():
+    # A deliberately empty registry means "no selected verifier failed". It does
+    # NOT establish that the proposal is safe. Closed policy decides which
+    # verifier set is mandatory for a given operation.
     registry = VerifierRegistry()
     context = VerificationContext(goals=(Goal("g", (Predicate("x", "y", "EQ", 1),)),))
 
