@@ -18,6 +18,12 @@ class VerificationVerdict(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
+class IndeterminateValue(str, Enum):
+    """A state slot whose postcondition cannot be derived deterministically."""
+
+    UNKNOWN = "INDETERMINATE"
+
+
 _MISSING = object()
 
 
@@ -125,6 +131,8 @@ class Verifier(Protocol):
 def _compare(actual: Any, predicate: Predicate) -> VerificationVerdict:
     op = predicate.operator.upper()
     expected = predicate.value
+    if actual == IndeterminateValue.UNKNOWN:
+        return VerificationVerdict.UNKNOWN
     if actual is _MISSING:
         if op == "NOT_EXISTS":
             return VerificationVerdict.PASS
@@ -160,9 +168,12 @@ def evaluate(predicate: Predicate, state: dict[tuple[str, str], Any]) -> Verific
 
 
 def _apply_effect(state: dict[tuple[str, str], Any], effect: Predicate) -> bool:
-    """Apply only deterministic assignment/resource effects.
+    """Apply deterministic effects and taint unsupported post-state as unknown.
 
-    Returns False when the effect operator is not simulatable by the generic core.
+    Returning False means the generic runtime could not derive the effect. The
+    affected state slot is still overwritten with ``INDETERMINATE`` so later
+    precondition/goal/invariant checks cannot accidentally reason from stale
+    pre-action state.
     """
     op = effect.operator.upper()
     key = effect.key()
@@ -174,22 +185,27 @@ def _apply_effect(state: dict[tuple[str, str], Any], effect: Predicate) -> bool:
         return True
     if op in {"ADD", "INCREMENT"}:
         current = state.get(key, _MISSING)
-        if current is _MISSING:
+        if current is _MISSING or current == IndeterminateValue.UNKNOWN:
+            state[key] = IndeterminateValue.UNKNOWN
             return False
         try:
             state[key] = current + effect.value
+            return True
         except (TypeError, ValueError):
+            state[key] = IndeterminateValue.UNKNOWN
             return False
-        return True
     if op in {"SUBTRACT", "DECREMENT"}:
         current = state.get(key, _MISSING)
-        if current is _MISSING:
+        if current is _MISSING or current == IndeterminateValue.UNKNOWN:
+            state[key] = IndeterminateValue.UNKNOWN
             return False
         try:
             state[key] = current - effect.value
+            return True
         except (TypeError, ValueError):
+            state[key] = IndeterminateValue.UNKNOWN
             return False
-        return True
+    state[key] = IndeterminateValue.UNKNOWN
     return False
 
 
