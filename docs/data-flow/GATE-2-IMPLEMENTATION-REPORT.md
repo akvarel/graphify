@@ -162,20 +162,20 @@ Status: **GREEN** at `3951406daf8cf9bf0c19cdbf4baedfbf03918553`
 - The round-1 Drive report's `18 ahead / 59 behind` was direction-swapped; the
   branch is in fact **ahead** of `fork/v8` (the ahead count grew from 59 to 87
   after integrating current `upstream/v8` and adding round-2 work). The updated
-  branch has been pushed to `origin/feature/java-local-data-flow-v8`.
+  branch has been pushed to `fork/feature/java-local-data-flow-v8`.
 
 ### Exact steps to reproduce
 
 ```bash
 cd /sharedssd/git/graphify
-git fetch fork upstream origin
+git fetch fork upstream
 git switch feature/java-local-data-flow-v8
 git merge upstream/v8                      # integrate current v8
 pytest -q tests/test_java_data_flow.py     # 32 passed
 pytest -q                                  # full suite: 4847 passed, 51 skipped
 ruff check graphify tests
 pyright
-git push origin feature/java-local-data-flow-v8
+git push fork feature/java-local-data-flow-v8
 ```
 
 No Gate 3 work was attempted in this round; receiver/instance semantics are
