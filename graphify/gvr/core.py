@@ -3,7 +3,7 @@
 The core consumes structured state and proposals. Semantic extraction from
 natural language is intentionally outside this module: an LLM may propose
 Goals/Actions/Predicates, but only deterministic verifiers decide whether the
-structured proposal satisfies the supplied constraints.
+structured proposal satisfies supplied constraints.
 """
 from __future__ import annotations
 
@@ -18,8 +18,8 @@ class VerificationVerdict(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
-class IndeterminateValue(str, Enum):
-    """A state slot whose postcondition cannot be derived deterministically."""
+class IndeterminateValue(Enum):
+    """Marker for a post-state slot that cannot be derived deterministically."""
 
     UNKNOWN = "INDETERMINATE"
 
@@ -29,7 +29,7 @@ _MISSING = object()
 
 @dataclass(frozen=True)
 class Predicate:
-    """A small deterministic proposition over world state."""
+    """A deterministic proposition over one world-state slot."""
 
     subject: str
     attribute: str
@@ -128,10 +128,19 @@ class Verifier(Protocol):
     ) -> list[VerificationIssue]: ...
 
 
+def _combine(verdicts: Iterable[VerificationVerdict]) -> VerificationVerdict:
+    values = set(verdicts)
+    if VerificationVerdict.FAIL in values:
+        return VerificationVerdict.FAIL
+    if VerificationVerdict.UNKNOWN in values:
+        return VerificationVerdict.UNKNOWN
+    return VerificationVerdict.PASS
+
+
 def _compare(actual: Any, predicate: Predicate) -> VerificationVerdict:
     op = predicate.operator.upper()
     expected = predicate.value
-    if actual == IndeterminateValue.UNKNOWN:
+    if actual is IndeterminateValue.UNKNOWN:
         return VerificationVerdict.UNKNOWN
     if actual is _MISSING:
         if op == "NOT_EXISTS":
@@ -167,14 +176,28 @@ def evaluate(predicate: Predicate, state: dict[tuple[str, str], Any]) -> Verific
     return _compare(state.get(predicate.key(), _MISSING), predicate)
 
 
-def _apply_effect(state: dict[tuple[str, str], Any], effect: Predicate) -> bool:
-    """Apply deterministic effects and taint unsupported post-state as unknown.
+def _requirement_amount(requirement: Predicate) -> float | None:
+    try:
+        return float(requirement.value)
+    except (TypeError, ValueError):
+        return None
 
-    Returning False means the generic runtime could not derive the effect. The
-    affected state slot is still overwritten with ``INDETERMINATE`` so later
-    precondition/goal/invariant checks cannot accidentally reason from stale
-    pre-action state.
-    """
+
+def _resource_verdict(
+    requirement: Predicate,
+    resources: dict[tuple[str, str], float],
+) -> VerificationVerdict:
+    amount = _requirement_amount(requirement)
+    if amount is None:
+        return VerificationVerdict.UNKNOWN
+    available = resources.get(requirement.key())
+    if available is None:
+        return VerificationVerdict.UNKNOWN
+    return VerificationVerdict.PASS if available >= amount else VerificationVerdict.FAIL
+
+
+def _apply_effect(state: dict[tuple[str, str], Any], effect: Predicate) -> bool:
+    """Apply a deterministic effect; otherwise taint its post-state as unknown."""
     op = effect.operator.upper()
     key = effect.key()
     if op in {"SET", "EQ", "=="}:
@@ -185,7 +208,7 @@ def _apply_effect(state: dict[tuple[str, str], Any], effect: Predicate) -> bool:
         return True
     if op in {"ADD", "INCREMENT"}:
         current = state.get(key, _MISSING)
-        if current is _MISSING or current == IndeterminateValue.UNKNOWN:
+        if current is _MISSING or current is IndeterminateValue.UNKNOWN:
             state[key] = IndeterminateValue.UNKNOWN
             return False
         try:
@@ -196,7 +219,7 @@ def _apply_effect(state: dict[tuple[str, str], Any], effect: Predicate) -> bool:
             return False
     if op in {"SUBTRACT", "DECREMENT"}:
         current = state.get(key, _MISSING)
-        if current is _MISSING or current == IndeterminateValue.UNKNOWN:
+        if current is _MISSING or current is IndeterminateValue.UNKNOWN:
             state[key] = IndeterminateValue.UNKNOWN
             return False
         try:
@@ -209,11 +232,53 @@ def _apply_effect(state: dict[tuple[str, str], Any], effect: Predicate) -> bool:
     return False
 
 
+def _transition_action(
+    state: dict[tuple[str, str], Any],
+    resources: dict[tuple[str, str], float],
+    action: Action,
+) -> VerificationVerdict:
+    """Advance one action without fabricating postconditions.
+
+    - definite failed prerequisite/resource => action cannot execute; no effect;
+    - unknown prerequisite/resource => action may or may not execute; affected
+      post-state becomes indeterminate;
+    - all gates pass => consume resources and apply deterministic effects;
+      unsupported effects taint only their affected slots.
+    """
+    precondition_status = _combine(evaluate(item, state) for item in action.preconditions)
+    resource_status = _combine(_resource_verdict(item, resources) for item in action.consumes)
+    gate_status = _combine((precondition_status, resource_status))
+
+    if gate_status == VerificationVerdict.FAIL:
+        return gate_status
+    if gate_status == VerificationVerdict.UNKNOWN:
+        for effect in action.effects:
+            state[effect.key()] = IndeterminateValue.UNKNOWN
+        return gate_status
+
+    for requirement in action.consumes:
+        amount = _requirement_amount(requirement)
+        if amount is not None:
+            resources[requirement.key()] -= amount
+
+    effects_status = VerificationVerdict.PASS
+    for effect in action.effects:
+        if not _apply_effect(state, effect):
+            effects_status = VerificationVerdict.UNKNOWN
+    return effects_status
+
+
 class PreconditionVerifier:
     name = "preconditions"
 
-    def verify(self, context: VerificationContext, proposal: Proposal, final_state: dict[tuple[str, str], Any]) -> list[VerificationIssue]:
+    def verify(
+        self,
+        context: VerificationContext,
+        proposal: Proposal,
+        final_state: dict[tuple[str, str], Any],
+    ) -> list[VerificationIssue]:
         state = dict(context.state)
+        resources = dict(context.resources)
         issues: list[VerificationIssue] = []
         for action in proposal.actions:
             for predicate in action.preconditions:
@@ -221,21 +286,29 @@ class PreconditionVerifier:
                 if verdict != VerificationVerdict.PASS:
                     issues.append(VerificationIssue(
                         verifier=self.name,
-                        code="PRECONDITION_FAILED" if verdict == VerificationVerdict.FAIL else "PRECONDITION_UNKNOWN",
+                        code=(
+                            "PRECONDITION_FAILED"
+                            if verdict == VerificationVerdict.FAIL
+                            else "PRECONDITION_UNKNOWN"
+                        ),
                         verdict=verdict,
                         message=f"Action {action.name!r} precondition is not established",
                         predicate=predicate,
                         action=action.name,
                     ))
-            for effect in action.effects:
-                _apply_effect(state, effect)
+            _transition_action(state, resources, action)
         return issues
 
 
 class GoalSatisfactionVerifier:
     name = "goal_satisfaction"
 
-    def verify(self, context: VerificationContext, proposal: Proposal, final_state: dict[tuple[str, str], Any]) -> list[VerificationIssue]:
+    def verify(
+        self,
+        context: VerificationContext,
+        proposal: Proposal,
+        final_state: dict[tuple[str, str], Any],
+    ) -> list[VerificationIssue]:
         issues: list[VerificationIssue] = []
         for goal in context.goals:
             for predicate in goal.conditions:
@@ -243,7 +316,11 @@ class GoalSatisfactionVerifier:
                 if verdict != VerificationVerdict.PASS:
                     issues.append(VerificationIssue(
                         verifier=self.name,
-                        code="GOAL_UNSATISFIED" if verdict == VerificationVerdict.FAIL else "GOAL_UNKNOWN",
+                        code=(
+                            "GOAL_UNSATISFIED"
+                            if verdict == VerificationVerdict.FAIL
+                            else "GOAL_UNKNOWN"
+                        ),
                         verdict=verdict,
                         message=f"Goal {goal.id!r} is not established after proposal",
                         predicate=predicate,
@@ -254,14 +331,23 @@ class GoalSatisfactionVerifier:
 class InvariantVerifier:
     name = "invariants"
 
-    def verify(self, context: VerificationContext, proposal: Proposal, final_state: dict[tuple[str, str], Any]) -> list[VerificationIssue]:
+    def verify(
+        self,
+        context: VerificationContext,
+        proposal: Proposal,
+        final_state: dict[tuple[str, str], Any],
+    ) -> list[VerificationIssue]:
         issues: list[VerificationIssue] = []
         for predicate in context.invariants:
             verdict = evaluate(predicate, final_state)
             if verdict != VerificationVerdict.PASS:
                 issues.append(VerificationIssue(
                     verifier=self.name,
-                    code="INVARIANT_VIOLATED" if verdict == VerificationVerdict.FAIL else "INVARIANT_UNKNOWN",
+                    code=(
+                        "INVARIANT_VIOLATED"
+                        if verdict == VerificationVerdict.FAIL
+                        else "INVARIANT_UNKNOWN"
+                    ),
                     verdict=verdict,
                     message="Required invariant is not established after proposal",
                     predicate=predicate,
@@ -272,53 +358,50 @@ class InvariantVerifier:
 class ResourceVerifier:
     name = "resources"
 
-    def verify(self, context: VerificationContext, proposal: Proposal, final_state: dict[tuple[str, str], Any]) -> list[VerificationIssue]:
+    def verify(
+        self,
+        context: VerificationContext,
+        proposal: Proposal,
+        final_state: dict[tuple[str, str], Any],
+    ) -> list[VerificationIssue]:
+        state = dict(context.state)
         remaining = dict(context.resources)
         issues: list[VerificationIssue] = []
         for action in proposal.actions:
             for requirement in action.consumes:
-                key = requirement.key()
-                available = remaining.get(key)
-                if available is None:
-                    issues.append(VerificationIssue(
-                        verifier=self.name,
-                        code="RESOURCE_UNKNOWN",
-                        verdict=VerificationVerdict.UNKNOWN,
-                        message=f"Resource required by action {action.name!r} is unknown",
-                        predicate=requirement,
-                        action=action.name,
-                    ))
+                verdict = _resource_verdict(requirement, remaining)
+                if verdict == VerificationVerdict.PASS:
                     continue
-                try:
-                    needed = float(requirement.value)
-                except (TypeError, ValueError):
-                    issues.append(VerificationIssue(
-                        verifier=self.name,
-                        code="RESOURCE_REQUIREMENT_UNKNOWN",
-                        verdict=VerificationVerdict.UNKNOWN,
-                        message=f"Resource requirement for action {action.name!r} is not numeric",
-                        predicate=requirement,
-                        action=action.name,
-                    ))
-                    continue
-                if available < needed:
-                    issues.append(VerificationIssue(
-                        verifier=self.name,
-                        code="RESOURCE_INSUFFICIENT",
-                        verdict=VerificationVerdict.FAIL,
-                        message=f"Action {action.name!r} requires {needed}, available {available}",
-                        predicate=requirement,
-                        action=action.name,
-                    ))
+                if _requirement_amount(requirement) is None:
+                    code = "RESOURCE_REQUIREMENT_UNKNOWN"
+                    message = f"Resource requirement for action {action.name!r} is not numeric"
+                elif requirement.key() not in remaining:
+                    code = "RESOURCE_UNKNOWN"
+                    message = f"Resource required by action {action.name!r} is unknown"
                 else:
-                    remaining[key] = available - needed
+                    code = "RESOURCE_INSUFFICIENT"
+                    message = f"Action {action.name!r} does not have enough resource"
+                issues.append(VerificationIssue(
+                    verifier=self.name,
+                    code=code,
+                    verdict=verdict,
+                    message=message,
+                    predicate=requirement,
+                    action=action.name,
+                ))
+            _transition_action(state, remaining, action)
         return issues
 
 
 class ClaimConsistencyVerifier:
     name = "claim_consistency"
 
-    def verify(self, context: VerificationContext, proposal: Proposal, final_state: dict[tuple[str, str], Any]) -> list[VerificationIssue]:
+    def verify(
+        self,
+        context: VerificationContext,
+        proposal: Proposal,
+        final_state: dict[tuple[str, str], Any],
+    ) -> list[VerificationIssue]:
         issues: list[VerificationIssue] = []
         seen: dict[tuple[str, str], Any] = {}
         for claim in proposal.claims:
@@ -338,24 +421,44 @@ class ClaimConsistencyVerifier:
 
 
 class EffectCoverageVerifier:
-    """Make unsupported simulated effects explicit instead of silently trusting them."""
+    """Expose effects the generic runtime cannot deterministically simulate."""
 
     name = "effect_coverage"
 
-    def verify(self, context: VerificationContext, proposal: Proposal, final_state: dict[tuple[str, str], Any]) -> list[VerificationIssue]:
+    def verify(
+        self,
+        context: VerificationContext,
+        proposal: Proposal,
+        final_state: dict[tuple[str, str], Any],
+    ) -> list[VerificationIssue]:
         issues: list[VerificationIssue] = []
-        shadow = dict(context.state)
+        state = dict(context.state)
+        resources = dict(context.resources)
         for action in proposal.actions:
-            for effect in action.effects:
-                if not _apply_effect(shadow, effect):
-                    issues.append(VerificationIssue(
-                        verifier=self.name,
-                        code="EFFECT_UNSUPPORTED",
-                        verdict=VerificationVerdict.UNKNOWN,
-                        message=f"Generic runtime cannot deterministically simulate effect for action {action.name!r}",
-                        predicate=effect,
-                        action=action.name,
-                    ))
+            gate = _combine(
+                [evaluate(item, state) for item in action.preconditions]
+                + [_resource_verdict(item, resources) for item in action.consumes]
+            )
+            if gate == VerificationVerdict.PASS:
+                for effect in action.effects:
+                    if not _apply_effect(state, effect):
+                        issues.append(VerificationIssue(
+                            verifier=self.name,
+                            code="EFFECT_UNSUPPORTED",
+                            verdict=VerificationVerdict.UNKNOWN,
+                            message=(
+                                f"Generic runtime cannot deterministically simulate "
+                                f"effect for action {action.name!r}"
+                            ),
+                            predicate=effect,
+                            action=action.name,
+                        ))
+                for requirement in action.consumes:
+                    amount = _requirement_amount(requirement)
+                    if amount is not None:
+                        resources[requirement.key()] -= amount
+            else:
+                _transition_action(state, resources, action)
         return issues
 
 
@@ -389,19 +492,14 @@ def default_registry() -> VerifierRegistry:
 
 def simulate(context: VerificationContext, proposal: Proposal) -> dict[tuple[str, str], Any]:
     state = dict(context.state)
+    resources = dict(context.resources)
     for action in proposal.actions:
-        for effect in action.effects:
-            _apply_effect(state, effect)
+        _transition_action(state, resources, action)
     return state
 
 
 def _aggregate(issues: Iterable[VerificationIssue]) -> VerificationVerdict:
-    verdicts = {issue.verdict for issue in issues}
-    if VerificationVerdict.FAIL in verdicts:
-        return VerificationVerdict.FAIL
-    if VerificationVerdict.UNKNOWN in verdicts:
-        return VerificationVerdict.UNKNOWN
-    return VerificationVerdict.PASS
+    return _combine(issue.verdict for issue in issues)
 
 
 def verify(
