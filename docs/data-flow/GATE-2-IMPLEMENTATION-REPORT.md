@@ -78,6 +78,35 @@ These omissions are incomplete coverage, not negative proof that no flow exists.
 | Field initializer relation | Field declaration initializers used `FLOWS_TO`. | same | Field initializers now use `WRITTEN_TO`. | `test_java_field_initializer_uses_written_to`. | PASS |
 | Parallel relation preservation | Distinct Java flow relations can share endpoints. | `tests/test_java_data_flow.py` | Retained opt-in `build_from_json(..., directed=True, multigraph=True)` behavior. | Existing `READ_FROM`/`PASSED_AS_ARGUMENT` and `READ_FROM`/`RETURNED_AS` multigraph tests. | PASS |
 
+## Supervising Review Remediation — Round 2
+
+Supervising review of the round-1 report and the actual branch/code found three
+remaining correctness/integration gaps that this round closes (P0-1..P0-3), plus
+evidence and v8-integration work (P0-4, P0-5).
+
+| Issue | Defect and root cause | Changed files | Correction | Adversarial test | Result |
+|---|---|---|---|---|---|
+| P0-1 Receiver / instance ambiguity on FIELD flow | Declaration-level FIELD nodes mapped `this.value`, `other.value`, and other instances of the same declared field to the SAME FIELD value node while writes also targeted that node, producing a dangerous `input -> WRITTEN_TO Flow.value -> READ_FROM foreign` shape where the write is `this.value` and the read is `other.value`. | `graphify/extractors/java_data_flow.py`, `tests/test_java_data_flow.py` | Field `READ_FROM`/`WRITTEN_TO` edges now carry deterministic receiver/access-site identity plus `receiverConfidence`. `this`, unqualified, and deterministic `this.<chain>` receivers are `PROVEN` (score 1.0); named receivers of a declared class type are explicit `MAY` alias flow (score 0.5). No alias equivalence is invented; unprovable receivers stay `MAY` or fail closed. | `this.field` vs `other.field`, two locals of the same class, nested receiver chains (`this.box.value` vs `box.value`). | PASS |
+| P0-2 General same-filename identity, not sibling-only | Value IDs used a sibling-aware `path.parent.parent.glob(...)` heuristic and otherwise `path.stem`, so same-named files at non-sibling depths collided. | same | Replaced the sibling heuristic with Graphify's canonical `_file_stem` full-path stem; `extract()`'s id-remap relativizes it to the scan root, so IDs are distinct per repo-relative file and portable across checkout roots at any depth. Edges are rewired by the same remap. | Deep non-sibling paths (`service-a/.../Flow.java`, `service-b/.../Flow.java`, `src/.../Flow.java`). | PASS |
+| P0-3 Qualified owner identity for nested classes | `classes` was keyed by simple class name, so `A.Helper` and `B.Helper` collapsed and `Helper.f(int)` could fabricate cross-owner flow. | same | Classes are keyed by deterministic qualified owner path (`A.Helper`, `B.Helper`); method, parameter, field, return and synthetic value identities inherit the qualified owner. A simple name is honoured only when unique; ambiguous simple names fail closed. | Two enclosing classes each containing `Helper` with the same method names/arity. | PASS |
+| P0-4 Correct ahead/behind evidence | Round-1 Drive report stated `18 ahead / 59 behind`; supervising review showed the direction was swapped. | report | Re-run with correct semantics: commits only in `v8` = behind, commits only in the feature branch = ahead. | n/a (evidence) | recorded below |
+| P0-5 Integrate current `v8` | Branch was still behind current `v8`. | report | Fetched and merged current `upstream/v8` into `feature/java-local-data-flow-v8`, resolved conflicts, and pushed the updated branch. | n/a (integration) | done |
+
+### Gate 3 semantics for receiver/instance flow (P0-1 contract)
+
+Downstream traversal MUST distinguish proven same-receiver field flow from
+MAY/unknown alias flow:
+
+- A `READ_FROM`/`WRITTEN_TO` edge whose `metadata.receiverConfidence == "PROVEN"`
+  (receiver `this`, unqualified, or a deterministic `this.<chain>`) may be treated
+  as definite same-instance field flow.
+- An edge whose `metadata.receiverConfidence == "MAY"` was produced through a named
+  receiver of a declared class type (or an unknown receiver) and must NOT be
+  presented as proven same-receiver flow. `metadata.receiver` carries the
+  deterministic access-site identity (e.g. `Flow@other`, `Box@param`) so
+  write→read correlation is possible without fabricating instance equivalence.
+- These MAY edges carry `confidence_score = 0.5`; PROVEN field edges carry 1.0.
+
 ## Data Flow Completeness / Failure Semantics
 
 Java data-flow extraction is now externally visible as one of:
@@ -109,36 +138,48 @@ No cross-file value flow, name-only callee matching, Gate 2B, or Gate 3 traversa
 
 ## Final Validation
 
-Branch: `feature/java-local-data-flow-v8`
+Status: **GREEN** at `3951406daf8cf9bf0c19cdbf4baedfbf03918553`
+(`feature/java-local-data-flow-v8`, round 2 complete).
 
-Final delivery SHA: supplied externally after commit creation. This report does not embed a self-referential final commit hash.
+- `tests/test_java_data_flow.py`: **32 passed** (round-1 set + 5 new round-2
+  adversarial tests; 2 portability tests updated to pass `root`).
+- Full suite: **4847 passed, 51 skipped** — green (includes Java, build,
+  and type-resolution suites).
+- `ruff`, `pyright`, and `git diff --check`: clean.
+- Cross-file and code-flow (`build_from_json`) behavior unchanged; the only
+  regression gate touched is the Java data-flow extractor and its tests.
 
-Remote comparison evidence before remediation:
+### v8 integration and ahead/behind (P0-4, P0-5)
 
-- `upstream/v8`: `4fca621532a23f84f69c31e397b75f8105cb5390`
-- Definitive complete-suite evidence after all remediation fixes: 4575 passed, 47 skipped, 3 warnings.
+- Feature branch: `feature/java-local-data-flow-v8` @ `3951406`.
+- Current `fork/v8` ref: `5131384`; current `upstream/v8` ref (integrated):
+  `b14b52e` (v0.9.47).
+- merge-base(`HEAD`, `fork/v8`): `4fca621`.
+- Correct semantics, commits only in `fork/v8` = behind, commits only in the
+  feature branch = ahead (`git rev-list --count --left-right fork/v8...HEAD`):
+  - ahead (branch-only commits): **87**
+  - behind (v8-only commits): **18**
+- The round-1 Drive report's `18 ahead / 59 behind` was direction-swapped; the
+  branch is in fact **ahead** of `fork/v8` (the ahead count grew from 59 to 87
+  after integrating current `upstream/v8` and adding round-2 work). The updated
+  branch has been pushed to `origin/feature/java-local-data-flow-v8`.
 
-Post-24abc229 remediation added regression coverage for:
+### Exact steps to reproduce
 
-- assignment kill/order so stale local initializer dependencies do not create false `TRANSFORMED_BY` edges;
-- for-loop lexical scope so initializer locals expire after the loop and do not shadow fields;
-- exact same-file callee identity for overloads, with portable signature metadata for different arities and fail-closed same-arity ambiguity;
-- metadata callee IDs for exact overload identities always referencing emitted nodes, including public extraction and multigraph build coverage for `Flow.convert(int,int)`;
-- deferred field initializer processing so forward field references emit `WRITTEN_TO` after all fields are indexed;
-- public extraction boundary status for genuine first-import unavailability of `tree_sitter_java`, with an unsupported Java data-flow diagnostic node rather than zero-node silent success or Gate 3 behavior.
+```bash
+cd /sharedssd/git/graphify
+git fetch fork upstream origin
+git switch feature/java-local-data-flow-v8
+git merge upstream/v8                      # integrate current v8
+pytest -q tests/test_java_data_flow.py     # 32 passed
+pytest -q                                  # full suite: 4847 passed, 51 skipped
+ruff check graphify tests
+pyright
+git push origin feature/java-local-data-flow-v8
+```
 
-Validation commands executed in the project virtual environment after remediation:
-
-| Check | Result |
-|---|---|
-| `.venv/bin/python -m pytest tests/test_java_data_flow.py -q` | PASS, 27 passed, 1 warning |
-| `uv run pytest -q tests/test_java_data_flow.py tests/test_java_type_resolution.py tests/test_java_member_calls.py tests/test_observability_anchors_java.py tests/test_build.py -q` | PASS, 167 passed, 1 warning |
-| `uv run ruff check graphify/extractors/java_data_flow.py tests/test_java_data_flow.py` | PASS |
-| `uv run pyright graphify/extractors/java_data_flow.py` | PASS, 0 errors |
-| `git diff --check` | PASS |
-| `uv run graphify update .` | PASS; graph regenerated with existing optional SQL/DM parser warnings, zero-node fixture warnings, and a known fixture syntax warning |
-
-The definitive complete-suite result above includes the final public-boundary and same-line overload fixes.
+No Gate 3 work was attempted in this round; receiver/instance semantics are
+documented above as the contract for the next gate.
 
 Known limitations: Gate 2 remains same-file local/basic interprocedural extraction only. Cross-file Java value flow, traversal APIs, framework/runtime/deployment modeling, and Gate 2B/3 behavior were intentionally not implemented.
 
