@@ -199,9 +199,13 @@ An adversarial review was performed over cases beyond the primary fixtures:
 duplicate package/class names, nested classes, wildcard imports, same-arity
 overloads, unrelated same-named methods, parse-incomplete targets, and removed
 targets. See the adversarial fixtures in `tests/test_java_cross_file_data_flow.py`
-(J, H, I, M, O). `javac` was not available in the build environment; that
-limitation is reported (the verification relies on manually-defined expected
-exact targets at the public extraction boundary, plus negative assertions).
+(J, H, I, M, O). In addition, all nine fixture cases were compiled with
+`javac 25.0.3` (`A`, `B`, `C`, `D`, `E`, `F`, `I`, `J`, `N` all `OK`), proving
+the fixtures are valid Java and that the resolver's fail-closed decisions
+(overload ambiguity in `I`, wildcard ambiguity in `J`) reflect genuine Java
+semantics rather than malformed input. The verification also relies on
+manually-defined expected exact targets at the public extraction boundary,
+plus explicit negative assertions.
 
 ---
 
