@@ -19,9 +19,11 @@ from .core import (
     default_registry,
     verify,
 )
+from .counterexamples import Counterexample, counterexamples
 
 __all__ = [
     "Action",
+    "Counterexample",
     "Evidence",
     "Goal",
     "Predicate",
@@ -31,6 +33,7 @@ __all__ = [
     "VerificationReport",
     "VerificationVerdict",
     "VerifierRegistry",
+    "counterexamples",
     "default_registry",
     "verify",
 ]
