@@ -17,11 +17,11 @@ V1_RELATIONS = {
 V1_KINDS = {"PARAMETER", "RETURN_VALUE", "LOCAL", "FIELD"}
 
 
-def _extract(tmp_path: Path, body: str) -> dict:
+def _extract(tmp_path: Path, body: str, *, root: Path | None = None) -> dict:
     tmp_path.mkdir(parents=True, exist_ok=True)
     p = tmp_path / "Flow.java"
     p.write_text(body, encoding="utf-8")
-    return extract([p], cache_root=tmp_path / "graphify-out")
+    return extract([p], root=root, cache_root=tmp_path / "graphify-out")
 
 
 def _values(result: dict) -> dict[tuple[str, str], str]:
@@ -221,8 +221,12 @@ def test_java_value_ids_are_portable_and_overload_returns_do_not_collapse(tmp_pa
           int convert(int left, int right) { return left; }
         }
     """
-    first = _extract(tmp_path / "first" / "src", body)
-    second = _extract(tmp_path / "second" / "src", body)
+    # Pass the checkout root explicitly so extract()'s id-remap relativizes the
+    # full-path file stem to the canonical repo-relative form (P0-2): the same
+    # repo-relative source tree in two different absolute roots must yield
+    # identical data-value IDs.
+    first = _extract(tmp_path / "first" / "src", body, root=tmp_path / "first" / "src")
+    second = _extract(tmp_path / "second" / "src", body, root=tmp_path / "second" / "src")
     first_ids = {n["id"] for n in first["nodes"] if n.get("type") == "data_value"}
     second_ids = {n["id"] for n in second["nodes"] if n.get("type") == "data_value"}
     assert first_ids == second_ids
@@ -346,8 +350,11 @@ def test_java_same_named_files_do_not_collide_but_checkout_ids_are_portable(tmp_
         (root / "b").mkdir(parents=True)
         (root / "a" / "Flow.java").write_text("class Flow { int run(int x) { return x; } }", encoding="utf-8")
         (root / "b" / "Flow.java").write_text("class Flow { int run(int x) { return x; } }", encoding="utf-8")
-    first = extract([tmp_path / "one" / "a" / "Flow.java", tmp_path / "one" / "b" / "Flow.java"], cache_root=tmp_path / "one" / "graphify-out")
-    second = extract([tmp_path / "two" / "a" / "Flow.java", tmp_path / "two" / "b" / "Flow.java"], cache_root=tmp_path / "two" / "graphify-out")
+    # Pass each checkout root so extract()'s id-remap relativizes the canonical
+    # full-path file stem (P0-2): IDs must be distinct per repo-relative file
+    # and identical across the two absolute checkout roots.
+    first = extract([tmp_path / "one" / "a" / "Flow.java", tmp_path / "one" / "b" / "Flow.java"], root=tmp_path / "one", cache_root=tmp_path / "one" / "graphify-out")
+    second = extract([tmp_path / "two" / "a" / "Flow.java", tmp_path / "two" / "b" / "Flow.java"], root=tmp_path / "two", cache_root=tmp_path / "two" / "graphify-out")
     first_ids = {n["id"] for n in first["nodes"] if n.get("type") == "data_value"}
     second_ids = {n["id"] for n in second["nodes"] if n.get("type") == "data_value"}
     assert len(first_ids) == 4
@@ -517,3 +524,145 @@ def test_java_public_extract_reports_first_import_unavailable(tmp_path: Path, mo
     assert diagnostics
     assert diagnostics[0].get("metadata", {}).get("status") == "unsupported"
     assert diagnostics[0].get("metadata", {}).get("reason") == "tree_sitter_java_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Round 2 — Gate 2 Supervising Review Remediation
+# ---------------------------------------------------------------------------
+
+
+def test_java_field_receiver_flow_is_marked_proven_or_may(tmp_path: Path):
+    """P0-1: `this.field` reads/writes are proven same-receiver; a read through
+    a named receiver of a declared class type is explicit MAY/alias flow, never
+    presented as unqualified definite truth."""
+    result = _extract(tmp_path, """
+        class Flow {
+          int value;
+          int run(Flow other, int input) {
+            this.value = input;
+            int own = this.value;
+            int foreign = other.value;
+            return own + foreign;
+          }
+        }
+    """)
+    flow_field = _value(result, "FIELD", "value", "Flow.value")
+    own = _value(result, "LOCAL", "own", "Flow.run(Flow,int)")
+    foreign = _value(result, "LOCAL", "foreign", "Flow.run(Flow,int)")
+
+    own_read = [e for e in _edges(result, "READ_FROM") if e["source"] == flow_field and e["target"] == own]
+    foreign_read = [e for e in _edges(result, "READ_FROM") if e["source"] == flow_field and e["target"] == foreign]
+    assert any(e.get("metadata", {}).get("receiver") == "Flow" for e in own_read)
+    assert any(e.get("metadata", {}).get("receiverConfidence") == "PROVEN" for e in own_read)
+    assert all(e.get("confidence_score", 1.0) == 1.0 for e in own_read)
+    assert any(e.get("metadata", {}).get("receiver") == "Flow@other" for e in foreign_read)
+    assert any(e.get("metadata", {}).get("receiverConfidence") == "MAY" for e in foreign_read)
+    assert all(e.get("confidence_score", 1.0) == 0.5 for e in foreign_read)
+
+
+def test_java_field_receiver_two_instances_have_distinct_may_access_sites(tmp_path: Path):
+    """P0-1: two locals of the same class get deterministic, distinct receiver
+    access-site identities, each explicitly MAY (not proven same-instance)."""
+    result = _extract(tmp_path, """
+        class Flow {
+          int value;
+          int run(Flow f1, Flow f2, int input) {
+            f1.value = input;
+            int a = f1.value;
+            int b = f2.value;
+            return a + b;
+          }
+        }
+    """)
+    flow_field = _value(result, "FIELD", "value", "Flow.value")
+    writes = [e for e in _edges(result, "WRITTEN_TO") if e["target"] == flow_field]
+    reads = [e for e in _edges(result, "READ_FROM") if e["source"] == flow_field]
+    assert any(e.get("metadata", {}).get("receiver") == "Flow@f1" for e in writes)
+    assert any(e.get("metadata", {}).get("receiver") == "Flow@f1" for e in reads)
+    assert any(e.get("metadata", {}).get("receiver") == "Flow@f2" for e in reads)
+    assert all(e.get("metadata", {}).get("receiverConfidence") == "MAY" for e in writes + reads)
+    assert all(e.get("confidence_score", 1.0) == 0.5 for e in writes + reads)
+
+
+def test_java_field_receiver_nested_chain_proven_on_this_only(tmp_path: Path):
+    """P0-1: a nested `this.box.value` chain is a deterministic receiver (PROVEN),
+    while `box.value` through a named receiver stays MAY."""
+    result = _extract(tmp_path, """
+        class Box { int value; }
+        class Flow {
+          Box box;
+          int run(Box param, int input) {
+            this.box.value = input;
+            int viaThis = this.box.value;
+            int viaParam = param.value;
+            return viaThis + viaParam;
+          }
+        }
+    """)
+    box_field = _value(result, "FIELD", "value", "Box.value")
+    via_this = [e.get("metadata", {}) for e in _edges(result, "READ_FROM") if e["source"] == box_field]
+    write_md = [e.get("metadata", {}) for e in _edges(result, "WRITTEN_TO") if e["target"] == box_field]
+    assert any(e.get("receiver") == "Flow.box" and e.get("receiverConfidence") == "PROVEN" for e in via_this)
+    assert any(e.get("receiver") == "Flow.box" and e.get("receiverConfidence") == "PROVEN" for e in write_md)
+    assert any(e.get("receiver") == "Box@param" and e.get("receiverConfidence") == "MAY" for e in via_this)
+
+
+def test_java_deep_same_named_files_are_distinct_and_portable(tmp_path: Path):
+    """P0-2: same-named Java files at arbitrary (non-sibling) repository-relative
+    depths get distinct, checkout-root-portable data-value IDs."""
+    body = "class Flow { int value; int run(int x) { int y = x; return y; } }"
+    rels = [
+        "service-a/src/main/java/com/acme/Flow.java",
+        "service-b/src/main/java/com/acme/Flow.java",
+        "src/main/java/com/acme/Flow.java",
+    ]
+    for root in [tmp_path / "one", tmp_path / "two"]:
+        for rel in rels:
+            p = root / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body, encoding="utf-8")
+    first = extract([tmp_path / "one" / r for r in rels], root=tmp_path / "one", cache_root=tmp_path / "one" / ".g")
+    second = extract([tmp_path / "two" / r for r in rels], root=tmp_path / "two", cache_root=tmp_path / "two" / ".g")
+    first_ids = {n["id"] for n in first["nodes"] if n.get("type") == "data_value"}
+    second_ids = {n["id"] for n in second["nodes"] if n.get("type") == "data_value"}
+    # Portable across the two absolute checkout roots.
+    assert first_ids == second_ids
+    # 3 files x 4 value nodes (field, return, parameter, local).
+    assert len(first_ids) == 12
+    # Distinct per repo-relative file at arbitrary depth.
+    stems = {n["id"].split("_data_value_", 1)[0] for n in first["nodes"] if n.get("type") == "data_value"}
+    assert stems == {
+        "service_a_src_main_java_com_acme_flow",
+        "service_b_src_main_java_com_acme_flow",
+        "src_main_java_com_acme_flow",
+    }
+
+
+def test_java_nested_classes_with_same_simple_name_keep_distinct_owners(tmp_path: Path):
+    """P0-3: two enclosing classes each containing a nested `Helper` with the same
+    method names/arity keep independent qualified owner identities; exact callee
+    resolution never crosses the two Helpers."""
+    result = _extract(tmp_path, """
+        class A {
+          static class Helper { int f(int x) { return x; } int use(int x) { return f(x); } }
+        }
+        class B {
+          static class Helper { int f(int x) { return x; } int use(int x) { return f(x); } }
+        }
+    """)
+    a_f_x = _value(result, "PARAMETER", "x", "A.Helper.f(int)")
+    b_f_x = _value(result, "PARAMETER", "x", "B.Helper.f(int)")
+    assert a_f_x != b_f_x
+    a_use_x = _value(result, "PARAMETER", "x", "A.Helper.use(int)")
+    b_use_x = _value(result, "PARAMETER", "x", "B.Helper.use(int)")
+    passed = _edges(result, "PASSED_AS_ARGUMENT")
+    assert any(e["source"] == a_use_x and e["target"] == a_f_x for e in passed)
+    assert any(e["source"] == b_use_x and e["target"] == b_f_x for e in passed)
+    # The two same-simple-name Helpers never cross.
+    assert not any(e["source"] == a_use_x and e["target"] == b_f_x for e in passed)
+    assert not any(e["source"] == b_use_x and e["target"] == a_f_x for e in passed)
+    owners = {n.get("metadata", {}).get("owner") for n in result["nodes"] if n.get("type") == "data_value"}
+    assert "A.Helper.f(int)" in owners
+    assert "B.Helper.f(int)" in owners
+    assert "A.Helper.use(int)" in owners
+    assert "B.Helper.use(int)" in owners

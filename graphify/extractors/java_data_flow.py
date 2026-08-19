@@ -6,7 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from graphify.extractors.base import _make_id, _read_text
+from graphify.extractors.base import _file_stem, _make_id, _read_text
 from graphify.security import sanitize_metadata
 
 DATA_VALUE_TYPE = "data_value"
@@ -71,12 +71,13 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
     valid_ids = {n.get("id") for n in nodes}
     seen_nodes = set(valid_ids)
     seen_edges = {(e.get("source"), e.get("target"), e.get("relation"), e.get("source_location")) for e in edges}
-    sibling_same_name = False
-    try:
-        sibling_same_name = sum(1 for candidate in path.parent.parent.glob(f"*/{path.name}")) > 1
-    except OSError:
-        sibling_same_name = False
-    stem = Path(path.parent.name, path.stem).as_posix() if sibling_same_name else path.stem
+    # Canonical repo-relative file identity: reuse Graphify's `_file_stem`
+    # (full path, extension dropped) so same-named Java files at ANY
+    # repository-relative depth get distinct, portable value identities.
+    # `extract()`'s id-remap post-pass relativizes this to the scan root, so
+    # the absolute checkout root can never leak into persisted IDs. This
+    # replaces the prior sibling-only heuristic (P0-2).
+    stem = _file_stem(path)
     str_path = str(path)
 
     append_status_node(status["java"], stem)
@@ -124,17 +125,36 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         if key in seen_edges:
             return
         seen_edges.add(key)
-        edge = {"source": src, "target": tgt, "relation": rel, "confidence": "EXTRACTED", "confidence_score": 0.8 if root.has_error else 1.0,
+        score = 0.8 if root.has_error else 1.0
+        # Receiver-ambiguous field flow (P0-1): a read/write through a named
+        # receiver of a declared class type is not proven same-instance, so it is
+        # explicitly downgraded (MAY) rather than presented as definite truth.
+        if (md or {}).get("receiverConfidence") == "MAY":
+            score = min(score, 0.5)
+        edge = {"source": src, "target": tgt, "relation": rel, "confidence": "EXTRACTED", "confidence_score": score,
                 "source_file": str_path, "source_location": loc(n), "weight": 1.0,
                 "metadata": sanitize_metadata({"provenance": "STATIC_AST"} | (md or {}))}
         edges.append(edge)
 
     classes: dict[str, dict[str, Any]] = {}
+    # simple class name -> qualified owner path (only when unique, so nested
+    # classes with the same simple name stay independent and never collapse).
+    simple_class: dict[str, str] = {}
     methods_by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
     pending_bodies: list[tuple[object, dict[str, Any], str]] = []
     pending_transformations: list[tuple[str | None, dict[str, Any], int, object]] = []
     pending_field_initializers: list[tuple[object, str, str]] = []
     method_name_counts: dict[tuple[str, str], int] = defaultdict(int)
+
+    def _class_qual(name: str) -> str | None:
+        """Resolve a class reference to its deterministic qualified owner path.
+
+        Qualified names are returned as-is; a simple name is honoured only when it
+        maps to exactly one class in this file (P0-3), otherwise the reference is
+        ambiguous and resolves to None (fail closed)."""
+        if name in classes:
+            return name
+        return simple_class.get(name)
 
     def named_child(n, *fields):
         for f in fields:
@@ -147,43 +167,52 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         c = named_child(n, "type")
         return _read_text(c, source).split("<", 1)[0].strip() if c is not None else ""
 
-    def collect_method_name_counts(n, cls: str | None = None) -> None:
+    def collect_method_name_counts(n, qual: str | None = None) -> None:
         if n.type in {"class_declaration", "interface_declaration", "record_declaration", "enum_declaration", "annotation_type_declaration"}:
             name_node = named_child(n, "name")
             name = _read_text(name_node, source) if name_node is not None else ""
+            child_qual = f"{qual}.{name}" if qual and name else (name or qual)
             for child in n.children:
-                collect_method_name_counts(child, name or cls)
+                collect_method_name_counts(child, child_qual)
             return
-        if n.type in {"method_declaration", "constructor_declaration"} and cls:
+        if n.type in {"method_declaration", "constructor_declaration"} and qual:
             name_node = named_child(n, "name")
-            name = _read_text(name_node, source) if name_node is not None else cls
-            method_name_counts[(cls, name)] += 1
+            name = _read_text(name_node, source) if name_node is not None else qual.rsplit(".", 1)[-1]
+            method_name_counts[(qual, name)] += 1
         for child in n.children:
-            collect_method_name_counts(child, cls)
+            collect_method_name_counts(child, qual)
 
-    def walk(n, cls: str | None = None):
+    def walk(n, qual: str | None = None):
         if n.type in {"class_declaration", "interface_declaration", "record_declaration", "enum_declaration", "annotation_type_declaration"}:
             name_node = named_child(n, "name")
             name = _read_text(name_node, source) if name_node is not None else ""
             if name:
+                child_qual = f"{qual}.{name}" if qual else name
                 cid = next((x.get("id") for x in nodes if x.get("label") == name and name.lower() in x.get("id", "")), _make_id(stem, name))
-                classes[name] = {"id": cid, "fields": {}, "methods": []}
+                classes[child_qual] = {"id": cid, "fields": {}, "methods": []}
+                # Register the simple-name alias only when unique; a second class
+                # with the same simple name makes the alias ambiguous and is dropped
+                # so resolution fails closed instead of fabricating flow (P0-3).
+                if name in simple_class and simple_class[name] != child_qual:
+                    del simple_class[name]
+                else:
+                    simple_class[name] = child_qual
                 for c in n.children:
-                    walk(c, name)
+                    walk(c, child_qual)
                 return
-        if n.type == "field_declaration" and cls and cls in classes:
+        if n.type == "field_declaration" and qual and qual in classes:
             typ = first_type_text(n)
             for c in n.children:
                 if c.type == "variable_declarator":
                     name_node = named_child(c, "name")
                     name = _read_text(name_node, source) if name_node is not None else ""
-                    vid = add_value(f"{cls}.{name}", "field", name, name_node or c, typ)
-                    classes[cls]["fields"][name] = {"id": vid, "type": typ}
+                    vid = add_value(f"{qual}.{name}", "field", name, name_node or c, typ)
+                    classes[qual]["fields"][name] = {"id": vid, "type": typ}
                     if named_child(c, "value") is not None:
-                        pending_field_initializers.append((c, cls, name))
-        if n.type in {"method_declaration", "constructor_declaration"} and cls and cls in classes:
+                        pending_field_initializers.append((c, qual, name))
+        if n.type in {"method_declaration", "constructor_declaration"} and qual and qual in classes:
             name_node = named_child(n, "name")
-            name = _read_text(name_node, source) if name_node is not None else cls
+            name = _read_text(name_node, source) if name_node is not None else qual.rsplit(".", 1)[-1]
             parameter_specs = []
             params = named_child(n, "parameters")
             if params:
@@ -196,7 +225,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                             "name": _read_text(pn, source) if pn is not None else "",
                             "type": first_type_text(p),
                         })
-            signature = f"{cls}.{name}({','.join(spec['type'] for spec in parameter_specs)})"
+            signature = f"{qual}.{name}({','.join(spec['type'] for spec in parameter_specs)})"
             label = f".{name}()"
             exact_loc = loc(n)
             line_loc = f"L{line(n)}"
@@ -204,13 +233,13 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                 x.get("id")
                 for x in nodes
                 if x.get("label") == label
-                and cls.lower() in x.get("id", "")
+                and qual.lower() in x.get("id", "")
                 and (
                     str(x.get("source_location", "")).startswith(exact_loc)
                     or str(x.get("source_location", "")).startswith(line_loc)
                 )
             ]
-            overloaded = method_name_counts.get((cls, name), 0) > 1
+            overloaded = method_name_counts.get((qual, name), 0) > 1
             mid = structural_matches[0] if len(structural_matches) == 1 and not overloaded else _make_id(stem, signature)
             if mid:
                 if mid not in seen_nodes:
@@ -236,14 +265,14 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                     "id": mid,
                     "symbol": signature,
                     "name": name,
-                    "class": cls,
+                    "class": qual,
                     "params": [],
                     "locals": [{}],
                     "param_return_deps": set(),
                     "returns": None,
                     "node": n,
                 }
-                classes[cls]["methods"].append(info)
+                classes[qual]["methods"].append(info)
                 methods_by_name[name].append(info)
                 return_type = first_type_text(n)
                 ret = None
@@ -261,10 +290,10 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                     info["params"].append({"name": spec["name"], "id": pid, "type": spec["type"]})
                 body = named_child(n, "body")
                 if body:
-                    pending_bodies.append((body, info, cls))
+                    pending_bodies.append((body, info, qual))
                 return
         for c in n.children:
-            walk(c, cls)
+            walk(c, qual)
 
     def name_of(n) -> str:
         return _read_text(n, source).strip()
@@ -289,15 +318,16 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             receiver = name_of(n)
             if receiver == "this":
                 return cls
-            if receiver in classes:
-                return receiver
+            qual = _class_qual(receiver)
+            if qual:
+                return qual
             local = lookup_local(locals_map, receiver)
             if local:
-                return local.get("type")
+                return _class_qual(local.get("type") or "") or local.get("type")
             for param in (method or {}).get("params", []):
                 if param["name"] == receiver:
-                    return param.get("type")
-            return classes.get(cls, {}).get("fields", {}).get(receiver, {}).get("type")
+                    return _class_qual(param.get("type") or "") or param.get("type")
+            return _class_qual(classes.get(cls, {}).get("fields", {}).get(receiver, {}).get("type") or "") or classes.get(cls, {}).get("fields", {}).get(receiver, {}).get("type")
         if n.type == "field_access":
             return (field_info(n, method, cls, locals_map) or {}).get("type")
         return None
@@ -311,6 +341,42 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
 
     def field_value(n, method, cls: str, locals_map) -> str | None:
         return (field_info(n, method, cls, locals_map) or {}).get("id")
+
+    def receiver_identity(obj, method, cls: str, locals_map) -> tuple[str, str]:
+        """Return ``(receiver_path, confidence)`` for a field-access object expression.
+
+        ``confidence`` is ``"PROVEN"`` when the receiver is deterministically the
+        same instance (`this`/unqualified or a deterministic `this.<chain>` path)
+        and ``"MAY"`` when it is a named receiver of a declared class type whose
+        instance identity cannot be proven (P0-1). Unknown receivers stay ``MAY``
+        with a deterministic access-site path so downstream traversal can
+        distinguish proven same-receiver flow from unknown/alias flow.
+        """
+        if obj is None:
+            return cls, "PROVEN"
+        on = name_of(obj)
+        if obj.type == "this":
+            return cls, "PROVEN"
+        if obj.type == "identifier":
+            if _class_qual(on):
+                return on, "PROVEN"  # static class receiver
+            typ = receiver_type(obj, method, cls, locals_map)
+            if typ in classes:
+                return f"{typ}@{on}", "MAY"
+            return f"@{on}", "MAY"
+        if obj.type == "field_access":
+            inner_obj = named_child(obj, "object")
+            fld = named_child(obj, "field")
+            inner_path, inner_conf = receiver_identity(inner_obj, method, cls, locals_map)
+            fname = name_of(fld) if fld is not None else "?"
+            return f"{inner_path}.{fname}", inner_conf
+        return name_of(obj) or "?", "MAY"
+
+    def field_edge_md(field_expr, method, cls: str, locals_map) -> dict[str, Any]:
+        """Receiver/access-site metadata for a field-access expression (P0-1)."""
+        obj = named_child(field_expr, "object") if field_expr is not None and field_expr.type == "field_access" else None
+        path, conf = receiver_identity(obj, method, cls, locals_map)
+        return {"receiver": path, "receiverConfidence": conf}
 
     def expr_value(n, method, cls: str, locals_map) -> str | None:
         if n is None:
@@ -343,10 +409,11 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         if not method or not typ:
             return None
         oid = add_value(method["symbol"], "local", f"new {typ}@{loc(n)}:{span(n)}", n, typ)
+        target_qual = _class_qual(typ)
         constructors = [
             candidate
-            for candidate in classes.get(typ, {}).get("methods", [])
-            if candidate["name"] == typ and len(candidate.get("params", [])) == len(args_of(n))
+            for candidate in classes.get(target_qual or "", {}).get("methods", [])
+            if candidate["name"] == (target_qual or typ).rsplit(".", 1)[-1] and len(candidate.get("params", [])) == len(args_of(n))
         ]
         if len(constructors) == 1:
             wire_args(n, constructors[0], method, cls, locals_map)
@@ -361,16 +428,16 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             on = name_of(obj)
             if on == "this":
                 target_cls = cls
-            elif on in classes:
-                target_cls = on
+            else:
+                target_cls = _class_qual(on)
             local = lookup_local(locals_map, on)
-            if local and local.get("type") in classes:
-                target_cls = local["type"]
+            if local:
+                target_cls = _class_qual(local.get("type") or "") or target_cls
             for p in (method or {}).get("params", []):
-                if p["name"] == on and p.get("type") in classes:
-                    target_cls = p["type"]
-            if on in classes.get(cls, {}).get("fields", {}) and classes[cls]["fields"][on].get("type") in classes:
-                target_cls = classes[cls]["fields"][on]["type"]
+                if p["name"] == on:
+                    target_cls = _class_qual(p.get("type") or "") or target_cls
+            if on in classes.get(cls, {}).get("fields", {}):
+                target_cls = _class_qual(classes[cls]["fields"][on].get("type") or "") or target_cls
         argument_count = len(args_of(n))
         candidates = [
             candidate
@@ -395,7 +462,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             call_metadata = {"argumentIndex": argument_index, "callee": target["id"], "calleeSymbol": target["symbol"]}
             add_edge(src, param.get("id"), "PASSED_AS_ARGUMENT", arg, call_metadata)
             if is_field_value(src):
-                add_edge(src, param.get("id"), "READ_FROM", arg, call_metadata)
+                add_edge(src, param.get("id"), "READ_FROM", arg, {**call_metadata, **field_edge_md(arg, method, cls, locals_map)})
             if target.get("returns") and argument_index in target.get("param_return_deps", set()):
                 add_edge(
                     src,
@@ -449,9 +516,13 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                     nn = named_child(c, "name")
                     nm = name_of(nn) if nn else ""
                     vid = add_value(method["symbol"], "local", nm, nn or c, typ)
-                    source_id = expr_value(named_child(c, "value"), method, cls, locals_map)
+                    source_expr = named_child(c, "value")
+                    source_id = expr_value(source_expr, method, cls, locals_map)
                     bind_local(locals_map, nm, {"id": vid, "type": typ})
-                    add_edge(source_id, vid, "READ_FROM" if is_field_value(source_id) else "FLOWS_TO", c)
+                    if is_field_value(source_id):
+                        add_edge(source_id, vid, "READ_FROM", c, field_edge_md(source_expr, method, cls, locals_map))
+                    else:
+                        add_edge(source_id, vid, "FLOWS_TO", c)
         elif n.type in {"assignment_expression", "assignment"}:
             left = named_child(n, "left")
             right = named_child(n, "right")
@@ -459,14 +530,17 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             target = local_target["id"] if local_target else expr_value(left, method, cls, locals_map)
             source_id = expr_value(right, method, cls, locals_map)
             writes_field = is_field_value(target)
-            add_edge(source_id, target, "WRITTEN_TO" if writes_field else "FLOWS_TO", n)
+            if writes_field:
+                add_edge(source_id, target, "WRITTEN_TO", n, field_edge_md(left, method, cls, locals_map))
+            else:
+                add_edge(source_id, target, "FLOWS_TO", n)
             if local_target and not writes_field:
                 local_target["current"] = source_id
         elif n.type == "return_statement":
             val = next((c for c in n.children if c.is_named), None)
             source_id = expr_value(val, method, cls, locals_map)
             if is_field_value(source_id):
-                add_edge(source_id, method.get("returns"), "READ_FROM", n)
+                add_edge(source_id, method.get("returns"), "READ_FROM", n, field_edge_md(val, method, cls, locals_map))
             add_edge(source_id, method.get("returns"), "RETURNED_AS", n)
             mark_return_dep(method, source_id)
         elif n.type == "method_invocation":
@@ -489,7 +563,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
     for declarator, cls, field_name in pending_field_initializers:
         field = classes.get(cls, {}).get("fields", {}).get(field_name)
         src = expr_value(named_child(declarator, "value"), None, cls, [{}])
-        add_edge(src, (field or {}).get("id"), "WRITTEN_TO", declarator)
+        add_edge(src, (field or {}).get("id"), "WRITTEN_TO", declarator, field_edge_md(named_child(declarator, "name"), None, cls, [{}]))
     for body, method, cls in pending_bodies:
         method["body"] = body
         scan_body(body, method, cls)
