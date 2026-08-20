@@ -1041,3 +1041,325 @@ def test_remed_explored_may_surfaced():
                    receiver_conf="MAY", callee="S.calc(int)", argument_index=0)]
     r = run_data_flow_query(nodes, edges, DataFlowQuery(start="a", max_depth=2))
     assert r.encountered_may_evidence is True
+
+
+# ================================================================ Gate 3B: termination + accounting
+# (06-gate3b-termination-accounting-remediation). P0-1..P0-4 and P1-2 pairwise
+# interaction falsification matrix.
+
+def _sem(r: DataFlowTraversalResult, paths: int, term: str, truncated: bool,
+         complete: bool, visited: int, expanded: int) -> None:
+    assert len(r.paths) == paths, (len(r.paths), r.termination_reason)
+    assert r.termination_reason == term, r.termination_reason
+    assert r.truncated is truncated, r.termination_reason
+    assert r.complete_supported_search is complete
+    assert r.visited_count == visited, r.visited_count
+    assert r.expanded_count == expanded, r.expanded_count
+
+
+# ---- P0-1: max_paths must not hide a real MAX_DEPTH cutoff ----
+def test_3b_depth_and_path_cap_not_false_complete():
+    # A->B->C, max_depth=1, max_paths=1, all-paths. B->C exists beyond depth,
+    # so termination must be a real cutoff (MAX_DEPTH), never COMPLETE.
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "C", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=1, max_paths=1))
+    _sem(r, paths=1, term="MAX_DEPTH", truncated=True, complete=False, visited=2, expanded=1)
+
+
+def test_3b_depth_and_path_cap_backward_symmetric():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "C", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(
+        start="C", direction="BACKWARD", max_depth=1, max_paths=1))
+    _sem(r, paths=1, term="MAX_DEPTH", truncated=True, complete=False, visited=2, expanded=1)
+
+
+def test_3b_path_cap_alone_with_no_continuation_complete():
+    # A->B, max_depth=1, max_paths=1, B has no continuation => exactly one path,
+    # all work exhausted => COMPLETE is allowed.
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=1, max_paths=1))
+    _sem(r, paths=1, term="COMPLETE", truncated=False, complete=True, visited=2, expanded=1)
+
+
+def test_3b_depth_path_both_active_deterministic():
+    # Both depth cutoff and path cap could apply; precedence must be MAX_DEPTH.
+    nodes = [_node("A")] + [_node(f"B{i}", loc=f"L{i}") for i in range(1, 4)]
+    nodes += [_node("C", loc="L9")]
+    edges = [_edge("A", "B1", "FLOWS_TO", loc="L1"), _edge("B1", "C", "FLOWS_TO", loc="L2")]
+    edges += [_edge("A", "B2", "FLOWS_TO", loc="L1"), _edge("A", "B3", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=1, max_paths=2))
+    assert r.termination_reason == "MAX_DEPTH"  # depth (3) precedes path cap (4)
+    assert r.truncated is True and r.complete_supported_search is False
+
+
+def test_3b_depth_path_cap_shuffled_order_stable():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "C", "FLOWS_TO", loc="L2")]
+    base = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=1, max_paths=1))
+    for seed in range(5):
+        sedges = list(edges)
+        random.Random(seed).shuffle(sedges)
+        got = run_data_flow_query(list(reversed(nodes)), sedges,
+                                  DataFlowQuery(start="A", max_depth=1, max_paths=1))
+        assert got.termination_reason == base.termination_reason == "MAX_DEPTH"
+        assert got.complete_supported_search == base.complete_supported_search is False
+
+
+# ---- P0-2: point-to-point target terminality ----
+def test_3b_point_to_point_reached_target_not_pending_work():
+    # A->B->C, target B, max_paths=1: B->C is NOT pending work for "A->B".
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "C", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", target="B", max_depth=5, max_paths=1))
+    _sem(r, paths=1, term="COMPLETE", truncated=False, complete=True, visited=2, expanded=1)
+
+
+def test_3b_point_to_point_alternate_target_path_triggers_max_paths():
+    # Diamond A->B and A->X->B, target B, max_paths=1 => a second target path
+    # remains => MAX_PATHS.
+    nodes = [_node("A"), _node("B", loc="L2"), _node("X", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("A", "X", "FLOWS_TO", loc="L1"),
+             _edge("X", "B", "FLOWS_TO", loc="L3")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", target="B", max_depth=5, max_paths=1))
+    _sem(r, paths=1, term="MAX_PATHS", truncated=True, complete=False, visited=3, expanded=3)
+
+
+def test_3b_point_to_point_diamond_paths2_complete():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("X", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("A", "X", "FLOWS_TO", loc="L1"),
+             _edge("X", "B", "FLOWS_TO", loc="L3")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", target="B", max_depth=5, max_paths=2))
+    _sem(r, paths=2, term="COMPLETE", truncated=False, complete=True, visited=3, expanded=3)
+
+
+def test_3b_point_to_point_reached_target_with_cycle_no_false_truncation():
+    # A->B target B, plus B->A cycle. Outgoing target edges must not create
+    # false MAX_PATHS/MAX_DEPTH.
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "A", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", target="B", max_depth=5, max_paths=1))
+    _sem(r, paths=1, term="COMPLETE", truncated=False, complete=True, visited=2, expanded=1)
+
+
+def test_3b_point_to_point_backward_symmetric():
+    # Single target path backward: chain A->B, from B to target A, max_paths=1
+    # => COMPLETE. The diamond (two target paths) is asserted as MAX_PATHS.
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(
+        start="B", target="A", direction="BACKWARD", max_depth=5, max_paths=1))
+    _sem(r, paths=1, term="COMPLETE", truncated=False, complete=True, visited=2, expanded=1)
+    # Diamond backward has two target paths (A->B and A->X->B) => MAX_PATHS at cap 1.
+    nodes2 = [_node("A"), _node("B", loc="L2"), _node("X", loc="L3")]
+    edges2 = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("A", "X", "FLOWS_TO", loc="L1"),
+              _edge("X", "B", "FLOWS_TO", loc="L3")]
+    r2 = run_data_flow_query(nodes2, edges2, DataFlowQuery(
+        start="B", target="A", direction="BACKWARD", max_depth=5, max_paths=1))
+    assert r2.termination_reason == "MAX_PATHS"
+    assert r2.truncated is True and r2.complete_supported_search is False
+
+
+# ---- P0-3: cycle-only continuations are not remaining work ----
+def test_3b_cycle_only_no_false_depth_cutoff():
+    # A->B, B->A, max_depth=2: the only continuation is cycle-forbidden.
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "A", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=2, max_paths=2))
+    _sem(r, paths=1, term="COMPLETE", truncated=False, complete=True, visited=2, expanded=1)
+
+
+def test_3b_cycle_only_no_false_path_cap():
+    # A->B, B->A plus A->C alternate; max_paths=1. The cycle must not count as
+    # work; MAX_PATHS comes only from the real alternate A->C.
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "A", "FLOWS_TO", loc="L2"),
+             _edge("A", "C", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=5, max_paths=1))
+    _sem(r, paths=1, term="MAX_PATHS", truncated=True, complete=False, visited=3, expanded=2)
+
+
+def test_3b_one_cycle_plus_valid_continuation_detects_work():
+    # A->B, B->A (cycle), B->C (valid continuation): valid work is explored.
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "A", "FLOWS_TO", loc="L2"),
+             _edge("B", "C", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=5, max_paths=10))
+    assert r.termination_reason == "COMPLETE"
+    seqs = {tuple(s) for s in _step_node_seqs(r)}
+    assert ("A", "B") in seqs and ("A", "B", "C") in seqs
+    assert r.complete_supported_search is True
+
+
+def test_3b_self_loop_only_complete_after_cycle_filter():
+    nodes = [_node("A")]
+    edges = [_edge("A", "A", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=5))
+    _sem(r, paths=0, term="COMPLETE", truncated=False, complete=True, visited=1, expanded=0)
+
+
+def test_3b_cycle_filter_backward_symmetric():
+    # Backward: A->B, B->A cycle-only. Start B backward.
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "A", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="B", direction="BACKWARD", max_depth=2))
+    _sem(r, paths=1, term="COMPLETE", truncated=False, complete=True, visited=2, expanded=1)
+
+
+# ---- P0-4: visited_count / expanded_count truthful accounting ----
+def test_3b_p2p_no_match_visited_reflects_explored_nodes():
+    # A->B->C, target Z not present => visited reflects reached nodes A,B,C.
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3"), _node("Z", loc="L9")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "C", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", target="Z", max_depth=5))
+    assert r.visited_count == 3  # A, B, C reached
+    assert r.expanded_count == 2
+    assert r.complete_supported_search is True  # complete search, no path
+
+
+def test_3b_p2p_no_match_explored_partial_branch_visited_gt_zero():
+    # Explored PARTIAL dead-end with no returned path: visited > 0.
+    nodes = [_node("A"), _node("B", loc="L2"), _node("X", loc="L3"), _node("Z", loc="L9")]
+    edges = [
+        _edge("A", "B", "FLOWS_TO", loc="L1"),
+        {"source": "B", "target": "X", "relation": "FLOWS_TO",
+         "source_file": "f.java", "source_location": "L2",
+         "confidence": "EXTRACTED", "confidence_score": 0.8, "weight": 1.0,
+         "metadata": {"provenance": "STATIC_AST", "analysisCompleteness": "PARTIAL"}},
+    ]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", target="Z", max_depth=5))
+    assert r.visited_count == 3  # A, B, X reached even though no target path
+    assert r.complete_supported_search is False  # explored PARTIAL degrades search
+    assert r.search_coverage == "PARTIAL"
+
+
+def test_3b_diamond_unique_node_count_not_path_multiplicative():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3"), _node("D", loc="L4")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("A", "C", "FLOWS_TO", loc="L1"),
+             _edge("B", "D", "FLOWS_TO", loc="L2"), _edge("C", "D", "FLOWS_TO", loc="L3")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", target="D", max_depth=5))
+    assert r.visited_count == 4  # unique nodes A,B,C,D, not path-multiplicative
+    assert len(r.paths) == 2
+
+
+def test_3b_cycle_no_double_count():
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "A", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=5))
+    assert r.visited_count == 2  # A, B counted once despite cycle
+    assert r.expanded_count == 1  # only A->B accepted; B->A cycle-rejected
+
+
+def test_3b_max_expansions_cutoff_counts_only_reached():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3"), _node("D", loc="L4")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "C", "FLOWS_TO", loc="L2"),
+             _edge("C", "D", "FLOWS_TO", loc="L3")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=5, max_expansions=1))
+    assert r.termination_reason == "MAX_EXPANSIONS"
+    assert r.visited_count == 2  # A (start) + B (frontier of the single expansion)
+    assert r.expanded_count == 1
+
+
+def test_3b_backward_visited_accounting():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "C", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="C", direction="BACKWARD", max_depth=5))
+    assert r.visited_count == 3  # C, B, A reached backward
+    assert r.expanded_count == 2
+
+
+def test_3b_identity_path_visited_one():
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", target="A", max_depth=3))
+    _sem(r, paths=1, term="COMPLETE", truncated=False, complete=True, visited=1, expanded=0)
+
+
+def test_3b_missing_start_visited_zero():
+    nodes = [_node("A")]
+    edges = [_edge("A", "A", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="NOPE", max_depth=3))
+    assert r.visited_count == 0
+    assert r.expanded_count == 0
+
+
+# ---- P1-2: pairwise interaction falsification matrix ----
+def test_3b_matrix_target_x_max_depth():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "C", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", target="C", max_depth=1))
+    _sem(r, paths=0, term="MAX_DEPTH", truncated=True, complete=False, visited=2, expanded=1)
+
+
+def test_3b_matrix_target_x_max_paths():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("X", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("A", "X", "FLOWS_TO", loc="L1"),
+             _edge("X", "B", "FLOWS_TO", loc="L3")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", target="B", max_paths=1))
+    _sem(r, paths=1, term="MAX_PATHS", truncated=True, complete=False, visited=3, expanded=3)
+
+
+def test_3b_matrix_target_x_max_expansions():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("X", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("A", "X", "FLOWS_TO", loc="L1"),
+             _edge("X", "B", "FLOWS_TO", loc="L3")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", target="B", max_expansions=2))
+    _sem(r, paths=1, term="MAX_EXPANSIONS", truncated=True, complete=False, visited=3, expanded=2)
+
+
+def test_3b_matrix_depth_x_paths():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "C", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=1, max_paths=1))
+    _sem(r, paths=1, term="MAX_DEPTH", truncated=True, complete=False, visited=2, expanded=1)
+
+
+def test_3b_matrix_depth_x_expansions():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "C", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=1, max_expansions=5))
+    _sem(r, paths=1, term="MAX_DEPTH", truncated=True, complete=False, visited=2, expanded=1)
+
+
+def test_3b_matrix_paths_x_expansions():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3"), _node("D", loc="L4")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("A", "C", "FLOWS_TO", loc="L1"),
+             _edge("A", "D", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_paths=2, max_expansions=2))
+    _sem(r, paths=2, term="MAX_EXPANSIONS", truncated=True, complete=False, visited=3, expanded=2)
+
+
+def test_3b_matrix_cycles_x_depth():
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "A", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=1))
+    _sem(r, paths=1, term="COMPLETE", truncated=False, complete=True, visited=2, expanded=1)
+
+
+def test_3b_matrix_cycles_x_paths():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "A", "FLOWS_TO", loc="L2"),
+             _edge("A", "C", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_paths=1))
+    _sem(r, paths=1, term="MAX_PATHS", truncated=True, complete=False, visited=3, expanded=2)
+
+
+def test_3b_matrix_stop_nodes_x_depth():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "C", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=2, stop_nodes=frozenset({"B"})))
+    assert r.termination_reason == "COMPLETE"
+    assert r.complete_supported_search is True  # stopped at B by design, not truncated
+    seqs = {tuple(s) for s in _step_node_seqs(r)}
+    assert ("A", "B") in seqs and ("A", "B", "C") not in seqs
+
+
+def test_3b_matrix_stop_nodes_x_paths():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3"), _node("D", loc="L4")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "C", "FLOWS_TO", loc="L2"),
+             _edge("A", "D", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_paths=1, stop_nodes=frozenset({"B"})))
+    assert r.termination_reason == "MAX_PATHS"  # alternate A->D target path remains
+    assert r.truncated is True and r.complete_supported_search is False

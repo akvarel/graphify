@@ -39,6 +39,24 @@ Remediation (supervising review ``05-gate3-supervising-review-remediation``):
   references to the underlying diagnostic.
 - ``MAX_PATHS`` means an actual cutoff, not merely ``len(paths) == cap``.
 - Query inputs (direction and bounds) are validated at runtime.
+
+Remediation (supervising review ``06-gate3b-termination-accounting-remediation``):
+
+- Termination arbitration is centralized: a single classifier derives
+  ``termination_reason`` from semantic facts (input resolution, and which bounds
+  suppressed known eligible work) with an explicit documented precedence, never
+  from incidental ``if`` ordering. ``COMPLETE`` is impossible whenever a known
+  eligible frontier was suppressed by ``max_depth`` / ``max_paths`` /
+  ``max_expansions``.
+- Point-to-point target terminality: outgoing edges from a reached target are not
+  pending query work, while alternate unexplored branches that could reach the
+  target still count toward ``max_paths``.
+- Cycle-filtered eligible frontier: all completeness/cutoff decisions use the
+  same cycle-safe "can expand" definition as the walker; a cycle-only
+  continuation is never mistaken for remaining work.
+- ``visited_count`` truthfully counts unique graph nodes reached/examined
+  (including dead-ends and non-target branches), independent of emitted paths;
+  ``expanded_count`` counts accepted edge expansions.
 """
 
 from __future__ import annotations
@@ -431,6 +449,55 @@ def _collect_boundary_events(
     return events
 
 
+def _eligible_next(
+    adjacency: _Adjacency,
+    node: str,
+    direction: Direction,
+    visited_set: frozenset[str],
+) -> list[dict[str, Any]]:
+    """The edges a frame may actually expand, identical to walker rules (P0-3).
+
+    A continuation is eligible iff its frontier node is not already in the
+    current path's ``visited_set`` (which also excludes self-loops, since the
+    current node is in its own path visited-set). All completeness/cutoff
+    decisions must use this cycle-filtered definition, never raw adjacency
+    existence, so a cycle-only frontier is never mistaken for remaining work.
+    """
+    return [
+        e for e in adjacency.outgoing(node, direction)
+        if _frontier(e, direction) not in visited_set
+    ]
+
+
+def _classify_termination(facts: dict[str, Any]) -> tuple[str, bool]:
+    """Single deterministic termination classifier (P1-1).
+
+    ``facts`` carries only semantic facts (input resolution, and which bounds
+    suppressed known eligible work). Precedence is explicit and documented in
+    ``GVR-DERIVED-EVIDENCE-CONTRACT.md``:
+
+    1. input-resolution failure (missing start/target) -> not truncation;
+    2. expansion budget exhausted while eligible work remains -> MAX_EXPANSIONS;
+    3. depth cutoff with an eligible non-cycle continuation -> MAX_DEPTH;
+    4. path cap prevented an additional result/work item -> MAX_PATHS;
+    5. otherwise COMPLETE.
+
+    ``COMPLETE`` is impossible whenever any known eligible frontier was
+    suppressed by a bound, so ``complete_supported_search == True`` can never
+    coexist with suppressed eligible work.
+    """
+    reason = str(facts.get("input_resolution") or "RESOLVED")
+    if reason != "RESOLVED":
+        return (reason, False)
+    if facts.get("expansion_cap_prevented_work"):
+        return ("MAX_EXPANSIONS", True)
+    if facts.get("depth_cutoff_with_eligible"):
+        return ("MAX_DEPTH", True)
+    if facts.get("path_cap_prevented_work"):
+        return ("MAX_PATHS", True)
+    return ("COMPLETE", False)
+
+
 def _validate_query(query: DataFlowQuery) -> None:
     """Validate public query inputs before traversal (P1-2).
 
@@ -490,41 +557,36 @@ def run_data_flow_query(
     else:
         input_resolution = "RESOLVED"
 
-    # Boundary-event bookkeeping uses the files actually reached by the search.
+    # Node id -> repo-relative source_file map for O(1) reachability bookkeeping.
+    node_file = {str(n.get("id") or ""): str(n.get("source_file") or "") for n in nodes}
     reachable_files: set[str] = set()
-    if start_found:
-        for n in nodes:
-            if str(n.get("id") or "") == start:
-                sf = str(n.get("source_file") or "")
-                if sf:
-                    reachable_files.add(sf)
+    visited_reached: set[str] = set()
+    explored_state = {"partial": False, "unknown": False, "may": False}
+
+    def _record_reached(node_id: str) -> None:
+        """Mark a node as reached/examined and bookkeep its file for boundaries."""
+        sf = node_file.get(node_id)
+        if sf:
+            reachable_files.add(sf)
+        visited_reached.add(node_id)
+
+    # TerminationFacts (P1-1): termination is derived from semantic facts, not
+    # from the order of `if` statements. Each bound flag means "a known eligible
+    # traversal work item was suppressed by a bound". Precedence is enforced in
+    # _classify_termination, never by incidental statement ordering.
+    facts: dict[str, Any] = {
+        "input_resolution": input_resolution,
+        "expansion_cap_prevented_work": False,
+        "depth_cutoff_with_eligible": False,
+        "path_cap_prevented_work": False,
+    }
 
     paths: list[DataFlowPath] = []
     seen_path_identities: set[tuple[str, ...]] = set()
     expanded = 0
-    visited: set[str] = set()
-    truncated = False
-    termination_reason = "COMPLETE"
-    cut_at_depth = False  # an edge existed beyond max_depth
-    hit_path_cap = False
-    hit_expansion_cap = False
-    explored_state = {"partial": False, "unknown": False, "may": False}
-
-    if start_found and start == target:
-        # A trivial identity path (start == target) with no steps.
-        paths.append(DataFlowPath(
-            steps=(),
-            supporting_evidence=(),
-            path_identity=(),
-            path_exactness="EXACT_FOR_RETURNED_PATH",
-            path_receiver_confidence="PROVEN",
-            path_coverage="COMPLETE_FOR_SUPPORTED_CONSTRUCT",
-        ))
-        visited.add(start)
 
     def _emit(flow_edges: list[dict[str, Any]]) -> None:
         """Record a derived path from flow-ordered direct edges (deduplicated)."""
-        nonlocal visited
         path_identity = tuple(e["_df_key"] for e in flow_edges)
         if path_identity in seen_path_identities:
             return
@@ -560,112 +622,106 @@ def run_data_flow_query(
             path_receiver_confidence=receiver,
             path_coverage=coverage,
         ))
-        visited.update(ref.source for ref in refs)
-        if flow_edges:
-            visited.add(_frontier(flow_edges[-1], direction))
 
-    if input_resolution == "RESOLVED" and start != target and max_depth == 0:
-        # P0-4: zero-depth never traverses. If at least one eligible edge exists
-        # in the selected direction, the search was cut off before examining
-        # reachable flow -> MAX_DEPTH (machine-visible), incomplete. The eligible
-        # edges are part of the reached frontier, so their epistemic state is
-        # recorded. If none exist, a zero-expansion search is complete.
-        eligible = adjacency.outgoing(start, direction)
-        for edge in eligible:
-            _record_edge_state(edge, explored_state)
-        if eligible:
-            cut_at_depth = True
+    if input_resolution == "RESOLVED":
+        _record_reached(start)
+        if start == target:
+            # Identity path (start == target): the point-to-point question is
+            # trivially answered. Outgoing edges beyond the reached target are
+            # not pending query work (P0-2 target terminality), so this is
+            # COMPLETE regardless of max_depth/max_paths.
+            if len(paths) < max_paths:
+                paths.append(DataFlowPath(
+                    steps=(),
+                    supporting_evidence=(),
+                    path_identity=(),
+                    path_exactness="EXACT_FOR_RETURNED_PATH",
+                    path_receiver_confidence="PROVEN",
+                    path_coverage="COMPLETE_FOR_SUPPORTED_CONSTRUCT",
+                ))
+            else:
+                facts["path_cap_prevented_work"] = True
+        elif max_depth == 0:
+            # Zero-depth never traverses. Any eligible (non-cycle) edge in the
+            # selected direction is a depth cutoff; the reached-frontier edges
+            # contribute to explored-region epistemic state.
+            for edge in adjacency.outgoing(start, direction):
+                _record_edge_state(edge, explored_state)
+            if _eligible_next(adjacency, start, direction, frozenset({start})):
+                facts["depth_cutoff_with_eligible"] = True
+        else:
+            # DFS over paths: each frame is (path of edges, visited-set, depth).
+            stack: list[tuple[list[dict[str, Any]], frozenset[str], int]] = []
+            start_visited = frozenset({start})
+            for edge in adjacency.outgoing(start, direction):
+                if expanded >= max_expansions:
+                    facts["expansion_cap_prevented_work"] = True
+                    break
+                f = _frontier(edge, direction)
+                if f in start_visited:
+                    continue  # a self-loop makes no flow progress; skip
+                expanded += 1
+                _record_edge_state(edge, explored_state)
+                _record_reached(f)
+                stack.append(([edge], start_visited | {f}, 1))
 
-    elif input_resolution == "RESOLVED" and start != target and max_depth > 0:
-        # DFS over paths: each stack frame is (path of edges, visited-set, depth).
-        # Using an explicit stack keeps it iterative (cycle-safe, bounded).
-        stack: list[tuple[list[dict[str, Any]], frozenset[str], int]] = []
-        start_visited = frozenset({start})
-        for edge in adjacency.outgoing(start, direction):
-            if expanded >= max_expansions:
-                hit_expansion_cap = True
-                break
-            if _frontier(edge, direction) in start_visited:
-                continue  # a self-loop makes no flow progress; skip
-            expanded += 1
-            _record_edge_state(edge, explored_state)
-            stack.append(([edge], start_visited | {_frontier(edge, direction)}, 1))
+            while stack:
+                path_edges, visited_set, depth = stack.pop()
+                last_node = _frontier(path_edges[-1], direction)
+                _record_reached(last_node)
+                reached_target = (target is not None and last_node == target)
 
-        while stack:
-            path_edges, visited_set, depth = stack.pop()
-            last_node = _frontier(path_edges[-1], direction)
-
-            if last_node in node_ids:
-                for n in nodes:
-                    if str(n.get("id") or "") == last_node:
-                        sf = str(n.get("source_file") or "")
-                        if sf:
-                            reachable_files.add(sf)
-                        break
-
-            reached_target = (target is not None and last_node == target)
-            if target is None or reached_target:
                 # Present steps in flow direction (forward for FORWARD walks,
                 # reversed for BACKWARD walks) so a backward result is the same
                 # flow chain a forward walk would find for the same direct facts.
-                flow_edges = (
-                    list(reversed(path_edges))
-                    if direction == "BACKWARD"
-                    else path_edges
-                )
-                _emit(flow_edges)
+                if target is None or reached_target:
+                    if len(paths) < max_paths:
+                        flow_edges = (
+                            list(reversed(path_edges))
+                            if direction == "BACKWARD"
+                            else path_edges
+                        )
+                        _emit(flow_edges)
+                    else:
+                        # A candidate path exists but the path budget prevented
+                        # emitting it -> a real MAX_PATHS cutoff.
+                        facts["path_cap_prevented_work"] = True
 
-                # P1-1: MAX_PATHS is a real cutoff, not mere equality with the
-                # cap. Only when the cap prevented emitting an additional
-                # candidate path (unexplored frontier remains) do we truncate.
-                if len(paths) >= max_paths:
-                    more_work = bool(stack)
-                    if not more_work and depth < max_depth and last_node not in query.stop_nodes:
-                        more_work = bool(adjacency.outgoing(last_node, direction))
-                    if more_work:
-                        hit_path_cap = True
-                    break
+                # P0-2 target terminality: once the target is reached, its
+                # outgoing edges are NOT pending work for this query. Other
+                # stack branches (alternate paths to target) still matter.
+                if reached_target:
+                    continue
 
-            if reached_target:
-                continue  # point-to-point: a path is complete at the target
-            if depth >= max_depth:
-                if adjacency.outgoing(last_node, direction):
-                    cut_at_depth = True
-                continue
-            if last_node in query.stop_nodes:
-                continue
-            outgoing = adjacency.outgoing(last_node, direction)
-            for edge in outgoing:
-                if expanded >= max_expansions:
-                    hit_expansion_cap = True
-                    break
-                tgt = _frontier(edge, direction)
-                if tgt in visited_set:
-                    continue  # cycle-safe: never revisit a node within one path
-                expanded += 1
-                _record_edge_state(edge, explored_state)
-                stack.append((path_edges + [edge], visited_set | {tgt}, depth + 1))
-            if hit_expansion_cap:
-                break
+                if last_node in query.stop_nodes:
+                    continue
 
-    if input_resolution == "START_NODE_NOT_FOUND":
-        truncated = False
-        termination_reason = "START_NODE_NOT_FOUND"
-    elif input_resolution == "TARGET_NODE_NOT_FOUND":
-        truncated = False
-        termination_reason = "TARGET_NODE_NOT_FOUND"
-    elif hit_expansion_cap:
-        truncated = True
-        termination_reason = "MAX_EXPANSIONS"
-    elif hit_path_cap:
-        truncated = True
-        termination_reason = "MAX_PATHS"
-    elif cut_at_depth:
-        truncated = True
-        termination_reason = "MAX_DEPTH"
-    else:
-        truncated = False
-        termination_reason = "COMPLETE"
+                # P0-3: eligible next edges are cycle-filtered (frontier not
+                # already in this path), identical to the rule the walker uses.
+                # Raw adjacency existence is never used as a work proxy.
+                eligible = _eligible_next(adjacency, last_node, direction, visited_set)
+                if not eligible:
+                    continue
+
+                if depth >= max_depth:
+                    # P0-1: an eligible non-cycle continuation exists beyond the
+                    # depth budget -> a real MAX_DEPTH cutoff (never COMPLETE,
+                    # even if the path cap was reached at the same time).
+                    facts["depth_cutoff_with_eligible"] = True
+                    continue
+
+                for edge in eligible:
+                    if expanded >= max_expansions:
+                        facts["expansion_cap_prevented_work"] = True
+                        break
+                    expanded += 1
+                    _record_edge_state(edge, explored_state)
+                    f = _frontier(edge, direction)
+                    _record_reached(f)
+                    stack.append((path_edges + [edge], visited_set | {f}, depth + 1))
+
+    # Single deterministic termination classifier (P1-1).
+    termination_reason, truncated = _classify_termination(facts)
 
     boundary_events = tuple(_collect_boundary_events(reachable_files, nodes))
     has_blocking_boundary = len(boundary_events) > 0
@@ -704,7 +760,7 @@ def run_data_flow_query(
         start=start,
         target=target,
         direction=direction,
-        visited_count=len(visited),
+        visited_count=len(visited_reached),
         expanded_count=expanded,
         truncated=truncated,
         termination_reason=termination_reason,
