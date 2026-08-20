@@ -2,18 +2,29 @@
 from __future__ import annotations
 
 import importlib
+import json
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 from graphify.extractors.base import _file_stem, _make_id, _read_text
-from graphify.extractors.engine import _JAVA_BUILTIN_TYPES  # noqa: E402
+from graphify.extractors.engine import (  # noqa: E402
+    _JAVA_BUILTIN_TYPES,
+    _java_annotation_names,
+    _java_annotation_nodes,
+)
 from graphify.security import sanitize_metadata
 
 DATA_VALUE_TYPE = "data_value"
 
 _JAVA_PRIMITIVES = frozenset({
     "byte", "short", "int", "long", "float", "double", "char", "boolean", "void",
+})
+
+_JPA_NAMESPACES = frozenset({"jakarta.persistence", "javax.persistence"})
+_SPRING_DATA_CONTRACTS = frozenset({
+    "org.springframework.data.repository.CrudRepository",
+    "org.springframework.data.jpa.repository.JpaRepository",
 })
 
 
@@ -94,6 +105,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
     java_package = ""
     java_imports: dict[str, str] = {}
     java_has_wildcard_import = False
+    java_wildcard_imports: set[str] = set()
     for child in root.children:
         if child.type == "package_declaration":
             java_package = _read_text(child, source)[len("package"):].strip().rstrip(";").strip()
@@ -103,6 +115,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                 body = body[len("static "):].strip()
             if body.endswith(".*"):
                 java_has_wildcard_import = True
+                java_wildcard_imports.add(body[:-2])
                 continue
             if "." not in body:
                 continue
@@ -117,6 +130,10 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
     # flow also records deterministic cross-file intent.
     cross_file_calls: list[dict[str, Any]] = []
     xf_by_call: dict[object, dict[str, Any]] = {}
+    persistence_entities: list[dict[str, Any]] = []
+    persistence_repositories: list[dict[str, Any]] = []
+    persistence_calls: list[dict[str, Any]] = []
+    persistence_by_call: dict[object, dict[str, Any]] = {}
 
     def line(n) -> int:
         return n.start_point[0] + 1
@@ -331,10 +348,13 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         cross_file_calls.append(rec)
 
     def _capture_xf_sink(n, sink_id, sink_kind: str) -> None:
-        """Attach a cross-file call's return sink (caller-side receiving value)."""
+        """Attach a call's return sink to cross-file and persistence records."""
         if n is not None and n in xf_by_call:
             xf_by_call[n]["returnSink"] = sink_id
             xf_by_call[n]["returnSinkKind"] = sink_kind
+        if n is not None and n in persistence_by_call:
+            persistence_by_call[n]["returnSink"] = sink_id
+            persistence_by_call[n]["returnSinkKind"] = sink_kind
 
     def named_child(n, *fields):
         for f in fields:
@@ -342,6 +362,314 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             if c is not None:
                 return c
         return None
+
+    def _type_fqn(raw: str) -> tuple[str | None, str]:
+        """Resolve a declared Java type with the existing import/package facts."""
+        base = raw.strip().split("<", 1)[0].strip().replace("[]", "")
+        if not base:
+            return None, "UNRESOLVED"
+        if "." in base:
+            return base, "EXACT"
+        if base in java_imports:
+            return java_imports[base], "EXACT"
+        if java_has_wildcard_import:
+            supported = sorted(
+                candidate
+                for candidate in (f"{pkg}.{base}" for pkg in java_wildcard_imports)
+                if candidate in _SPRING_DATA_CONTRACTS
+            )
+            if len(supported) == 1:
+                return supported[0], "EXACT"
+            return None, "AMBIGUOUS"
+        if java_package:
+            return f"{java_package}.{base}", "EXACT"
+        return base, "UNRESOLVED"
+
+    def _resolved_annotation(decl, simple: str) -> tuple[Any | None, str | None, str]:
+        """Return the supported JPA annotation node/FQN/resolution, fail closed."""
+        names = {raw: name for name, raw in _java_annotation_names(decl, source)}
+        for raw, name in names.items():
+            if name != simple:
+                continue
+            if "." in raw:
+                fqn = raw
+                return (next((a for a in _java_annotation_nodes(decl)
+                              if _read_text(a.child_by_field_name("name"), source) == raw), None),
+                        fqn, "EXACT" if fqn.rpartition(".")[0] in _JPA_NAMESPACES else "UNSUPPORTED")
+            imported = java_imports.get(simple)
+            if imported:
+                return (next((a for a in _java_annotation_nodes(decl)
+                              if _read_text(a.child_by_field_name("name"), source) == raw), None),
+                        imported,
+                        "EXACT" if imported.rpartition(".")[0] in _JPA_NAMESPACES else "UNSUPPORTED")
+            candidates = sorted(
+                f"{pkg}.{simple}" for pkg in java_wildcard_imports if pkg in _JPA_NAMESPACES
+            )
+            if len(candidates) == 1:
+                return (next((a for a in _java_annotation_nodes(decl)
+                              if _read_text(a.child_by_field_name("name"), source) == raw), None),
+                        candidates[0], "EXACT")
+            if len(candidates) > 1:
+                return None, None, "AMBIGUOUS"
+            return None, None, "UNRESOLVED"
+        return None, None, "ABSENT"
+
+    def _literal_name_value(annotation) -> tuple[str | None, str]:
+        """Extract annotation ``name`` only when it is a Java string literal."""
+        if annotation is None:
+            return None, "UNSPECIFIED"
+        arguments = annotation.child_by_field_name("arguments")
+        if arguments is None:
+            return None, "UNSPECIFIED"
+        for pair in arguments.children:
+            if pair.type != "element_value_pair":
+                continue
+            key = next((c for c in pair.children if c.type == "identifier"), None)
+            if key is None or _read_text(key, source) != "name":
+                continue
+            value = pair.child_by_field_name("value")
+            if value is None or value.type != "string_literal":
+                return None, "UNKNOWN"
+            try:
+                decoded = json.loads(_read_text(value, source))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None, "UNKNOWN"
+            return (decoded, "EXPLICIT") if isinstance(decoded, str) else (None, "UNKNOWN")
+        return None, "UNSPECIFIED"
+
+    def _access_value(decl) -> str | None:
+        annotation, _fqn, state = _resolved_annotation(decl, "Access")
+        if state != "EXACT" or annotation is None:
+            return None
+        arguments = annotation.child_by_field_name("arguments")
+        text = _read_text(arguments, source) if arguments is not None else ""
+        if text.endswith(".FIELD)") or text == "(FIELD)":
+            return "FIELD"
+        if text.endswith(".PROPERTY)") or text == "(PROPERTY)":
+            return "PROPERTY"
+        return "UNKNOWN"
+
+    def _direct_declarations(body, node_type: str) -> list[Any]:
+        if body is None:
+            return []
+        return [child for child in body.children if child.type == node_type]
+
+    def _generic_parent_specs(interface_node) -> list[dict[str, Any]]:
+        specs: list[dict[str, Any]] = []
+        extends = next((c for c in interface_node.children if c.type == "extends_interfaces"), None)
+        if extends is None:
+            return specs
+        type_list = next((c for c in extends.children if c.type == "type_list"), None)
+        if type_list is None:
+            return specs
+        for parent in (c for c in type_list.children if c.is_named):
+            if parent.type == "generic_type":
+                base_node = next((c for c in parent.children
+                                  if c.type in {"type_identifier", "scoped_type_identifier"}), None)
+                args_node = next((c for c in parent.children if c.type == "type_arguments"), None)
+                args = [_read_text(c, source) for c in (args_node.children if args_node else [])
+                        if c.is_named]
+            else:
+                base_node = parent
+                args = []
+            raw_base = _read_text(base_node, source) if base_node is not None else ""
+            base_fqn, state = _type_fqn(raw_base)
+            specs.append({"base": raw_base, "baseFqn": base_fqn,
+                          "baseResolution": state, "genericArgs": args})
+        return specs
+
+    def _persistence_diagnostic(
+        decl,
+        resolution: str,
+        reason: str,
+        *,
+        entity_fqn: str = "",
+        repository_fqn: str = "",
+        mapping_target: str = "",
+    ) -> None:
+        location = loc(decl)
+        loc_slug = location.replace(":", "_")
+        nid = _make_id(stem, "persistence_resolution", reason, loc_slug)
+        if nid in seen_nodes:
+            return
+        seen_nodes.add(nid)
+        coverage = "PARTIAL" if resolution in {"PARTIAL", "UNSUPPORTED", "AMBIGUOUS", "UNRESOLVED"} else "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
+        nodes.append({
+            "id": nid,
+            "label": "Java persistence resolution",
+            "file_type": "code",
+            "type": "extraction_diagnostic",
+            "source_file": str_path,
+            "source_location": location,
+            "confidence": "EXTRACTED",
+            "confidence_score": 0.8 if root.has_error or resolution == "PARTIAL" else 0.5,
+            "metadata": sanitize_metadata({
+                "language": "java",
+                "capability": "persistence_boundary",
+                "kind": "persistence_resolution",
+                "resolution": resolution,
+                "coverage": coverage,
+                "reason": reason,
+                "callerFile": str_path,
+                "callerLocation": location,
+                "entityFqn": entity_fqn,
+                "repositoryFqn": repository_fqn,
+                "mappingTarget": mapping_target,
+                "extractor": "graphify",
+            }),
+            "_origin": "persistence_resolution",
+        })
+
+    def _enrich_node(node_id: str | None, metadata: dict[str, Any]) -> None:
+        if not node_id:
+            return
+        for graph_node in nodes:
+            if graph_node.get("id") == node_id:
+                graph_node["metadata"] = sanitize_metadata({
+                    **(graph_node.get("metadata") or {}),
+                    **metadata,
+                })
+                return
+
+    def _collect_persistence_declarations(n, qual: str | None = None) -> None:
+        declaration_types = {
+            "class_declaration", "interface_declaration", "record_declaration",
+            "enum_declaration", "annotation_type_declaration",
+        }
+        if n.type in declaration_types:
+            name_node = named_child(n, "name")
+            name = _read_text(name_node, source) if name_node is not None else ""
+            child_qual = f"{qual}.{name}" if qual and name else (name or qual)
+            if not child_qual:
+                return
+            fqn = f"{java_package}.{child_qual}" if java_package else child_qual
+
+            entity_annotation, entity_annotation_fqn, entity_state = _resolved_annotation(n, "Entity")
+            if entity_state == "AMBIGUOUS":
+                _persistence_diagnostic(n, "AMBIGUOUS", "entity_annotation_ambiguous",
+                                        entity_fqn=fqn)
+            elif entity_state == "EXACT" and entity_annotation is not None:
+                body = named_child(n, "body")
+                fields = _direct_declarations(body, "field_declaration")
+                methods = _direct_declarations(body, "method_declaration")
+                class_access = _access_value(n)
+                field_id_nodes = [field for field in fields
+                                  if _resolved_annotation(field, "Id")[2] == "EXACT"]
+                method_id_nodes = [method for method in methods
+                                   if _resolved_annotation(method, "Id")[2] == "EXACT"]
+                field_property_access = any(_access_value(field) == "PROPERTY" for field in fields)
+                field_unknown_access = any(_access_value(field) == "UNKNOWN" for field in fields)
+                if class_access == "PROPERTY" or method_id_nodes:
+                    access_strategy = "PROPERTY"
+                    access_reason = "property_access_unsupported"
+                elif field_id_nodes and not field_property_access and class_access in {None, "FIELD"}:
+                    access_strategy = "FIELD"
+                    access_reason = ""
+                elif field_id_nodes and field_property_access:
+                    access_strategy = "UNSUPPORTED"
+                    access_reason = "mixed_access_unsupported"
+                elif field_unknown_access or class_access == "UNKNOWN":
+                    access_strategy = "UNKNOWN"
+                    access_reason = "access_strategy_unresolved"
+                else:
+                    access_strategy = "UNKNOWN"
+                    access_reason = "field_access_unproven"
+
+                table_annotation, _table_fqn, table_state = _resolved_annotation(n, "Table")
+                table_name, table_mapping = (
+                    _literal_name_value(table_annotation)
+                    if table_state == "EXACT"
+                    else (None, "UNKNOWN" if table_state not in {"ABSENT"} else "UNSPECIFIED")
+                )
+                if table_mapping == "UNKNOWN":
+                    _persistence_diagnostic(n, "UNSUPPORTED", "non_literal_or_unresolved_table_name",
+                                            entity_fqn=fqn, mapping_target="table")
+                if access_reason:
+                    _persistence_diagnostic(n, "UNSUPPORTED", access_reason, entity_fqn=fqn)
+
+                entity_record: dict[str, Any] = {
+                    "file": str_path,
+                    "location": loc(n),
+                    "package": java_package,
+                    "entity": child_qual,
+                    "entityFqn": fqn,
+                    "entityNodeId": classes.get(child_qual, {}).get("id"),
+                    "entityNamespace": str(entity_annotation_fqn).rpartition(".")[0],
+                    "accessStrategy": access_strategy,
+                    "tableMapping": table_mapping,
+                    "tableName": table_name,
+                    "analysisCompleteness": "PARTIAL" if root.has_error else "COMPLETE_FOR_SUPPORTED_CONSTRUCT",
+                    "fields": [],
+                }
+                _enrich_node(entity_record["entityNodeId"], {
+                    "persistenceEntity": True,
+                    "entityFqn": fqn,
+                    "entityNamespace": entity_record["entityNamespace"],
+                    "accessStrategy": access_strategy,
+                    "tableMapping": table_mapping,
+                    **({"tableName": table_name} if table_name is not None else {}),
+                    "analysisCompleteness": entity_record["analysisCompleteness"],
+                    "persistenceProvenance": "STATIC_AST",
+                })
+
+                for field in fields:
+                    id_state = _resolved_annotation(field, "Id")[2]
+                    column_annotation, _column_fqn, column_state = _resolved_annotation(field, "Column")
+                    column_name, column_mapping = (
+                        _literal_name_value(column_annotation)
+                        if column_state == "EXACT"
+                        else (None, "UNKNOWN" if column_state not in {"ABSENT"} else "UNSPECIFIED")
+                    )
+                    if column_mapping == "UNKNOWN":
+                        _persistence_diagnostic(field, "UNSUPPORTED",
+                                                "non_literal_or_unresolved_column_name",
+                                                entity_fqn=fqn, mapping_target="column")
+                    for declarator in (c for c in field.children if c.type == "variable_declarator"):
+                        field_name_node = named_child(declarator, "name")
+                        field_name = _read_text(field_name_node, source) if field_name_node is not None else ""
+                        field_id = classes.get(child_qual, {}).get("fields", {}).get(field_name, {}).get("id")
+                        field_record = {
+                            "name": field_name,
+                            "fieldNodeId": field_id,
+                            "persistenceId": id_state == "EXACT",
+                            "columnMapping": column_mapping,
+                            "columnName": column_name,
+                        }
+                        entity_record["fields"].append(field_record)
+                        if access_strategy == "FIELD":
+                            _enrich_node(field_id, {
+                                "persistenceAttribute": True,
+                                "entityFqn": fqn,
+                                "attributeName": field_name,
+                                "persistenceId": id_state == "EXACT",
+                                "columnMapping": column_mapping,
+                                **({"columnName": column_name} if column_name is not None else {}),
+                                "analysisCompleteness": entity_record["analysisCompleteness"],
+                                "persistenceProvenance": "STATIC_AST",
+                            })
+                persistence_entities.append(entity_record)
+
+            if n.type == "interface_declaration":
+                parent_specs = _generic_parent_specs(n)
+                if parent_specs:
+                    persistence_repositories.append({
+                        "file": str_path,
+                        "location": loc(n),
+                        "package": java_package,
+                        "repository": child_qual,
+                        "repositoryFqn": fqn,
+                        "repositoryNodeId": classes.get(child_qual, {}).get("id"),
+                        "parents": parent_specs,
+                        "imports": dict(java_imports),
+                        "hasWildcardImport": java_has_wildcard_import,
+                        "analysisCompleteness": "PARTIAL" if root.has_error else "COMPLETE_FOR_SUPPORTED_CONSTRUCT",
+                    })
+
+            for child in n.children:
+                _collect_persistence_declarations(child, child_qual)
+            return
+        for child in n.children:
+            _collect_persistence_declarations(child, qual)
 
     def first_type_text(n) -> str:
         c = named_child(n, "type")
@@ -578,6 +906,53 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         path, conf = receiver_identity(obj, method, cls, locals_map)
         return {"receiver": path, "receiverConfidence": conf}
 
+    def _record_persistence_call(call_node, target_cls: str | None, name: str,
+                                 method, cls: str, locals_map, obj) -> None:
+        """Record a save/findById candidate; global Java resolution proves it."""
+        if name not in {"save", "findById"} or obj is None or not target_cls:
+            return
+        if call_node in persistence_by_call:
+            return
+        receiver_fqn, receiver_resolution = _receiver_fqn(target_cls)
+        receiver_path, receiver_confidence = receiver_identity(obj, method, cls, locals_map)
+        base = target_cls.split("<", 1)[0].strip()
+        if "." in base:
+            import_context = "qualified"
+        elif base in java_imports:
+            import_context = "explicit_import"
+        elif java_has_wildcard_import:
+            import_context = "wildcard"
+        elif java_package:
+            import_context = "same_package"
+        else:
+            import_context = "default_package"
+        rec: dict[str, Any] = {
+            "file": str_path,
+            "package": java_package,
+            "location": f"{loc(call_node)}:{span(call_node)}",
+            "receiver": target_cls,
+            "receiverPath": receiver_path,
+            "receiverFqn": receiver_fqn,
+            "receiverResolution": receiver_resolution,
+            "receiverConfidence": receiver_confidence,
+            "importContext": import_context,
+            "imports": dict(java_imports),
+            "operation": name,
+            "argCount": len(args_of(call_node)),
+            "argValues": [],
+            "returnSink": None,
+            "returnSinkKind": None,
+            "analysisCompleteness": (
+                "PARTIAL" if root.has_error else "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
+            ),
+        }
+        for index, argument in enumerate(args_of(call_node)):
+            value_id = expr_value(argument, method, cls, locals_map)
+            if value_id:
+                rec["argValues"].append({"index": index, "value": value_id})
+        persistence_by_call[call_node] = rec
+        persistence_calls.append(rec)
+
     def expr_value(n, method, cls: str, locals_map) -> str | None:
         if n is None:
             return None
@@ -631,6 +1006,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         target_cls = cls if obj is None else None
         if obj is not None:
             on = name_of(obj)
+            target_cls = receiver_type(obj, method, cls, locals_map)
             if on == "this":
                 target_cls = cls
             else:
@@ -648,6 +1024,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                 # (e.g. `PricingService.calculate(x)`). Falls through to a
                 # cross-file record when not a same-file class.
                 target_cls = on
+        _record_persistence_call(n, target_cls, name, method, cls, locals_map, obj)
         argument_count = len(args_of(n))
         candidates = [
             candidate
@@ -779,6 +1156,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
 
     collect_method_name_counts(root)
     walk(root)
+    _collect_persistence_declarations(root)
     for declarator, cls, field_name in pending_field_initializers:
         field = classes.get(cls, {}).get("fields", {}).get(field_name)
         src = expr_value(named_child(declarator, "value"), None, cls, [{}])
@@ -821,4 +1199,11 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                         break
     if cross_file_calls:
         result.setdefault("data_flow", {}).setdefault("java", {}).setdefault("cross_file_calls", []).extend(cross_file_calls)
+    java_flow = result.setdefault("data_flow", {}).setdefault("java", {})
+    if persistence_entities:
+        java_flow.setdefault("persistence_entities", []).extend(persistence_entities)
+    if persistence_repositories:
+        java_flow.setdefault("persistence_repositories", []).extend(persistence_repositories)
+    if persistence_calls:
+        java_flow.setdefault("persistence_calls", []).extend(persistence_calls)
     return result

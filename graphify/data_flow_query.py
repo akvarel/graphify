@@ -377,10 +377,14 @@ def _boundary_evidence_key(node: dict[str, Any]) -> str:
     fields: list[tuple[str, str]] = [
         ("sf", str(node.get("source_file") or "")),
         ("loc", str(metadata.get("callerLocation") or "")),
+        ("kind", str(metadata.get("kind") or "")),
+        ("cap", str(metadata.get("capability") or "")),
         ("res", str(metadata.get("resolution") or "")),
         ("method", str(metadata.get("method") or "")),
         ("arity", str(metadata.get("arity") or 0)),
         ("rfqn", str(metadata.get("receiverFqn") or "")),
+        ("repo", str(metadata.get("repositoryFqn") or "")),
+        ("entity", str(metadata.get("entityFqn") or "")),
         ("reason", str(metadata.get("reason") or "")),
     ]
     canonical = json.dumps(sorted(fields), sort_keys=True, separators=(",", ":"))
@@ -406,7 +410,8 @@ def _collect_boundary_events(
         if node.get("type") != "extraction_diagnostic":
             continue
         metadata = node.get("metadata") or {}
-        if metadata.get("kind") != "cross_file_resolution":
+        diagnostic_kind = str(metadata.get("kind") or "")
+        if diagnostic_kind not in {"cross_file_resolution", "persistence_resolution"}:
             continue
         resolution = str(metadata.get("resolution") or "")
         if resolution not in BLOCKING_RESOLUTIONS:
@@ -428,6 +433,8 @@ def _collect_boundary_events(
         canonical_sf = str(node.get("source_file") or "")
         events.append({
             "type": "boundary_event",
+            "diagnostic_kind": diagnostic_kind,
+            "capability": str(metadata.get("capability") or ""),
             "boundary_evidence_key": _boundary_evidence_key(node),
             "diagnostic_node_id": node_id,
             "diagnostic_evidence_key": f"diag:{node_id}",
@@ -442,6 +449,9 @@ def _collect_boundary_events(
             "arity": int(metadata.get("arity") or 0),
             "import_context": str(metadata.get("importContext") or "unknown"),
             "candidate_count": int(metadata.get("candidateCount") or 0),
+            "repository_fqn": str(metadata.get("repositoryFqn") or ""),
+            "entity_fqn": str(metadata.get("entityFqn") or ""),
+            "mapping_target": str(metadata.get("mappingTarget") or ""),
         })
     events.sort(key=lambda e: (
         e["canonical_caller_file"], e["caller_location"], e["resolution"], e["reason"]

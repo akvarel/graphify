@@ -6789,6 +6789,16 @@ def extract(
                 ext_id_remap[key] = canonical_id
         item["source_file"] = new_sf
 
+    # Gate 4A diagnostics are public evidence and must be checkout-root
+    # independent in their full normalized content, not only in node IDs. The
+    # resolver runs before source_file relativization (so it can match raw
+    # per-file records); once the canonical source_file is known, replace the
+    # raw caller path on persistence diagnostics with that canonical value.
+    for node in all_nodes:
+        metadata = node.get("metadata") or {}
+        if metadata.get("kind") == "persistence_resolution" and node.get("source_file"):
+            metadata["callerFile"] = node["source_file"]
+
     if ext_id_remap:
         # Bash entrypoint ids are the file-level id + "__entry"
         # (extractors/bash.py); rewrite the suffixed form of any learned key

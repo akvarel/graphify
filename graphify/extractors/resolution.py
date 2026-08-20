@@ -3105,6 +3105,403 @@ def _pascal_resolve_class(from_path: Path, class_name: str) -> str | None:
     return None
 
 
+_SPRING_DATA_PERSISTENCE_CONTRACTS = frozenset({
+    "org.springframework.data.repository.CrudRepository",
+    "org.springframework.data.jpa.repository.JpaRepository",
+})
+
+
+def _resolve_java_persistence_records(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> dict[str, int]:
+    """Resolve Gate 4A entity/repository/call records inside the Java resolver.
+
+    Records are emitted by ``augment_java_data_flow`` from the same parse used by
+    Java value-flow extraction. This function performs only deterministic
+    repository-wide identity matching; it is invoked by the existing Java
+    resolver before canonical ID remapping. Positive boundary evidence requires
+    an exact supported Spring Data contract and an exact entity identity.
+    """
+    entity_records: list[dict[str, Any]] = []
+    repository_records: list[dict[str, Any]] = []
+    call_records: list[dict[str, Any]] = []
+    for file_result in per_file:
+        java = (file_result.get("data_flow") or {}).get("java", {})
+        entity_records.extend(java.get("persistence_entities") or [])
+        repository_records.extend(java.get("persistence_repositories") or [])
+        call_records.extend(java.get("persistence_calls") or [])
+
+    entities_by_fqn: dict[str, list[dict[str, Any]]] = {}
+    entities_by_simple: dict[str, list[dict[str, Any]]] = {}
+    for entity in entity_records:
+        fqn = str(entity.get("entityFqn") or "")
+        if not fqn:
+            continue
+        entities_by_fqn.setdefault(fqn, []).append(entity)
+        entities_by_simple.setdefault(fqn.rsplit(".", 1)[-1], []).append(entity)
+
+    node_by_id = {str(node.get("id") or ""): node for node in all_nodes}
+    owned = set(node_by_id)
+    seen_node_ids = set(owned)
+    seen_edges = {
+        (edge.get("source"), edge.get("target"), edge.get("relation"),
+         edge.get("source_location"))
+        for edge in all_edges
+    }
+
+    def enrich(node_id: str | None, metadata: dict[str, Any]) -> None:
+        if not node_id:
+            return
+        node = node_by_id.get(node_id)
+        if node is not None:
+            node["metadata"] = sanitize_metadata({
+                **(node.get("metadata") or {}),
+                **metadata,
+            })
+
+    def emit_diagnostic(
+        rec: dict[str, Any], resolution: str, reason: str,
+        candidate_count: int = 0, candidates: list[str] | None = None,
+    ) -> None:
+        source_file = str(rec.get("file") or "")
+        location = str(rec.get("location") or "")
+        stem = _file_stem(Path(source_file)) if source_file else "unknown"
+        loc_slug = re.sub(r"[^A-Za-z0-9]", "_", location)[:48]
+        operation = str(rec.get("operation") or "repository")
+        node_id = _make_id(stem, "persistence_resolution", operation, reason, loc_slug)
+        if node_id in seen_node_ids:
+            return
+        seen_node_ids.add(node_id)
+        coverage = "PARTIAL"
+        all_nodes.append({
+            "id": node_id,
+            "label": "Java persistence resolution",
+            "file_type": "code",
+            "type": "extraction_diagnostic",
+            "source_file": source_file,
+            "source_location": location,
+            "confidence": "EXTRACTED",
+            "confidence_score": 0.8 if resolution == "PARTIAL" else 0.5,
+            "metadata": sanitize_metadata({
+                "language": "java",
+                "capability": "persistence_boundary",
+                "kind": "persistence_resolution",
+                "resolution": resolution,
+                "coverage": coverage,
+                "reason": reason,
+                "callerFile": source_file,
+                "callerLocation": location,
+                "receiver": rec.get("receiver") or "",
+                "receiverFqn": rec.get("receiverFqn") or "",
+                "receiverConfidence": rec.get("receiverConfidence") or "MAY",
+                "repositoryFqn": rec.get("repositoryFqn") or rec.get("receiverFqn") or "",
+                "entityFqn": rec.get("entityFqn") or "",
+                "method": operation,
+                "arity": int(rec.get("argCount") or 0),
+                "importContext": rec.get("importContext") or "unknown",
+                "candidateCount": candidate_count,
+                **({"candidates": candidates} if candidates else {}),
+                "extractor": "graphify",
+            }),
+            "_origin": "persistence_resolution",
+        })
+
+    resolved_repositories: dict[str, list[dict[str, Any]]] = {}
+    repositories_by_simple: dict[str, list[dict[str, Any]]] = {}
+    for repository in repository_records:
+        supported_parents = [
+            parent for parent in repository.get("parents") or []
+            if parent.get("baseResolution") == "EXACT"
+            and parent.get("baseFqn") in _SPRING_DATA_PERSISTENCE_CONTRACTS
+        ]
+        if not supported_parents:
+            continue  # repository-like name alone is not persistence evidence
+        if len(supported_parents) != 1:
+            emit_diagnostic(repository, "AMBIGUOUS", "multiple_supported_repository_contracts",
+                            len(supported_parents))
+            continue
+        parent = supported_parents[0]
+        generic_args = list(parent.get("genericArgs") or [])
+        if not generic_args:
+            emit_diagnostic(repository, "UNSUPPORTED", "repository_entity_generic_missing")
+            continue
+        raw_entity = str(generic_args[0]).strip()
+        imports = repository.get("imports") or {}
+        if "." in raw_entity:
+            entity_fqn = raw_entity
+            identity_kind = "qualified"
+        elif raw_entity in imports:
+            entity_fqn = str(imports[raw_entity])
+            identity_kind = "explicit_import"
+        else:
+            package = str(repository.get("package") or "")
+            entity_fqn = f"{package}.{raw_entity}" if package else raw_entity
+            identity_kind = "same_package"
+        matched_entities = entities_by_fqn.get(entity_fqn, [])
+        if len(matched_entities) == 1:
+            entity = matched_entities[0]
+            final_resolution = "EXACT"
+        elif len(matched_entities) > 1:
+            entity = None
+            final_resolution = "AMBIGUOUS"
+        else:
+            simple_candidates = entities_by_simple.get(raw_entity.rsplit(".", 1)[-1], [])
+            if identity_kind == "same_package" and len(simple_candidates) > 1:
+                final_resolution = "AMBIGUOUS"
+            else:
+                final_resolution = "UNRESOLVED"
+            entity = None
+
+        resolved: dict[str, Any] = {
+            **repository,
+            "framework": "SPRING_DATA",
+            "contractFqn": parent.get("baseFqn"),
+            "entityTypeRaw": raw_entity,
+            "entityFqn": entity_fqn,
+            "entityResolution": final_resolution,
+            "entity": entity,
+        }
+        repository_fqn = str(repository.get("repositoryFqn") or "")
+        resolved_repositories.setdefault(repository_fqn, []).append(resolved)
+        repositories_by_simple.setdefault(repository_fqn.rsplit(".", 1)[-1], []).append(resolved)
+        if final_resolution != "EXACT":
+            emit_diagnostic(
+                {**repository, "entityFqn": entity_fqn}, final_resolution,
+                "repository_entity_ambiguous" if final_resolution == "AMBIGUOUS"
+                else "repository_entity_unresolved",
+                len(entities_by_simple.get(raw_entity.rsplit(".", 1)[-1], [])),
+                sorted(e.get("entityFqn") or "" for e in entities_by_simple.get(raw_entity.rsplit(".", 1)[-1], [])),
+            )
+            continue
+        assert entity is not None
+        enrich(repository.get("repositoryNodeId"), {
+            "persistenceRepository": True,
+            "framework": "SPRING_DATA",
+            "repositoryFqn": repository_fqn,
+            "repositoryContractFqn": parent.get("baseFqn"),
+            "entityFqn": entity_fqn,
+            "entityResolution": "EXACT",
+            "analysisCompleteness": (
+                "PARTIAL" if "PARTIAL" in {
+                    repository.get("analysisCompleteness"), entity.get("analysisCompleteness")
+                } else "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
+            ),
+            "persistenceProvenance": "FRAMEWORK_CONTRACT",
+        })
+
+    emitted_boundaries = 0
+    emitted_edges = 0
+
+    def push(source: str | None, target: str | None, rec: dict[str, Any],
+             boundary: dict[str, Any], completeness: str) -> None:
+        nonlocal emitted_edges
+        if not source or not target or source not in owned or target not in owned:
+            return
+        key = (source, target, "FLOWS_TO", rec.get("location"))
+        if key in seen_edges:
+            return
+        seen_edges.add(key)
+        receiver_confidence = str(rec.get("receiverConfidence") or "MAY")
+        score = 1.0 if receiver_confidence == "PROVEN" else 0.5
+        if completeness == "PARTIAL":
+            score = min(score, 0.8)
+        all_edges.append({
+            "source": source,
+            "target": target,
+            "relation": "FLOWS_TO",
+            "confidence": "EXTRACTED",
+            "confidence_score": score,
+            "source_file": rec.get("file") or "",
+            "source_location": rec.get("location"),
+            "weight": 1.0,
+            "metadata": sanitize_metadata({
+                "provenance": "FRAMEWORK_CONTRACT",
+                "sourceProvenance": "STATIC_AST",
+                "boundaryKind": boundary["boundaryKind"],
+                "framework": "SPRING_DATA",
+                "operation": rec.get("operation"),
+                "repositoryFqn": boundary["repositoryFqn"],
+                "entityFqn": boundary["entityFqn"],
+                "receiver": rec.get("receiverPath") or rec.get("receiver") or "",
+                "receiverConfidence": receiver_confidence,
+                "analysisCompleteness": completeness,
+                "persistenceBoundary": True,
+            }),
+        })
+        emitted_edges += 1
+
+    # Dedupe per call site, preferring the record that captured a return sink.
+    best_calls: dict[tuple[str, str], dict[str, Any]] = {}
+    for call in call_records:
+        key = (str(call.get("file") or ""), str(call.get("location") or ""))
+        current = best_calls.get(key)
+        if current is None or (call.get("returnSink") and not current.get("returnSink")):
+            best_calls[key] = call
+
+    for call in best_calls.values():
+        operation = str(call.get("operation") or "")
+        if operation not in {"save", "findById"}:
+            continue
+        receiver_resolution = str(call.get("receiverResolution") or "UNRESOLVED")
+        receiver_fqn = str(call.get("receiverFqn") or "")
+        receiver_simple = str(call.get("receiver") or "").split("<", 1)[0].rsplit(".", 1)[-1]
+        if receiver_resolution != "EXACT":
+            candidates = repositories_by_simple.get(receiver_simple, [])
+            if candidates:
+                emit_diagnostic(call, receiver_resolution, "repository_receiver_unresolved",
+                                len(candidates), sorted(c.get("repositoryFqn") or "" for c in candidates))
+            continue
+        repositories = resolved_repositories.get(receiver_fqn, [])
+        if not repositories:
+            continue  # random save/findById method: no persistence semantics
+        if len(repositories) != 1:
+            emit_diagnostic(call, "AMBIGUOUS", "repository_identity_ambiguous",
+                            len(repositories))
+            continue
+        repository = repositories[0]
+        entity = repository.get("entity")
+        if repository.get("entityResolution") != "EXACT" or entity is None:
+            emit_diagnostic(
+                {**call, "repositoryFqn": receiver_fqn,
+                 "entityFqn": repository.get("entityFqn") or ""},
+                str(repository.get("entityResolution") or "UNRESOLVED"),
+                "repository_entity_not_exact",
+            )
+            continue
+        if int(call.get("argCount") or 0) != 1:
+            emit_diagnostic(call, "UNSUPPORTED", "unsupported_persistence_operation_signature")
+            continue
+
+        arg0 = next((entry.get("value") for entry in call.get("argValues") or []
+                     if entry.get("index") == 0), None)
+        if operation == "save":
+            argument_node = node_by_id.get(str(arg0 or ""))
+            argument_type = str((argument_node or {}).get("metadata", {}).get("java_type") or "")
+            imports = call.get("imports") or {}
+            if "." in argument_type:
+                argument_fqn = argument_type
+            elif argument_type in imports:
+                argument_fqn = str(imports[argument_type])
+            else:
+                package = str(call.get("package") or "")
+                argument_fqn = f"{package}.{argument_type}" if package and argument_type else argument_type
+            if not arg0 or not argument_type:
+                emit_diagnostic(call, "UNRESOLVED", "save_argument_value_or_type_unresolved")
+                continue
+            if argument_fqn != entity.get("entityFqn"):
+                emit_diagnostic(
+                    {**call, "entityFqn": entity.get("entityFqn") or ""},
+                    "UNSUPPORTED", "save_argument_entity_type_mismatch",
+                )
+                continue
+
+        # The generic cross-file pass cannot resolve Spring Data's inherited
+        # framework methods because no source callee declaration exists. Once the
+        # supported repository contract is proven here, its earlier
+        # `callee_unresolved` diagnostic is superseded by the exact framework
+        # boundary and must not falsely degrade Gate 3 search completeness.
+        all_nodes[:] = [
+            node for node in all_nodes
+            if not (
+                node.get("type") == "extraction_diagnostic"
+                and (node.get("metadata") or {}).get("kind") == "cross_file_resolution"
+                and (node.get("metadata") or {}).get("callerFile") == call.get("file")
+                and (node.get("metadata") or {}).get("callerLocation") == call.get("location")
+                and (node.get("metadata") or {}).get("method") == operation
+            )
+        ]
+
+        completeness = "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
+        if (
+            call.get("analysisCompleteness") == "PARTIAL"
+            or repository.get("analysisCompleteness") == "PARTIAL"
+            or entity.get("analysisCompleteness") == "PARTIAL"
+            or entity.get("accessStrategy") != "FIELD"
+        ):
+            completeness = "PARTIAL"
+        if entity.get("accessStrategy") != "FIELD":
+            mapping_completeness = "PARTIAL"
+        elif entity.get("tableMapping") == "UNKNOWN":
+            mapping_completeness = "PARTIAL"
+        elif entity.get("tableMapping") == "EXPLICIT":
+            mapping_completeness = "EXPLICIT"
+        else:
+            mapping_completeness = "LOGICAL_ONLY"
+
+        source_file = str(call.get("file") or "")
+        location = str(call.get("location") or "")
+        stem = _file_stem(Path(source_file)) if source_file else "unknown"
+        loc_slug = re.sub(r"[^A-Za-z0-9]", "_", location)[:48]
+        boundary_id = _make_id(stem, "persistence_boundary", operation, loc_slug)
+        boundary_kind = "PERSISTENCE_WRITE" if operation == "save" else "PERSISTENCE_READ"
+        boundary_metadata: dict[str, Any] = {
+            "language": "java",
+            "capability": "persistence_boundary",
+            "kind": "persistence_boundary",
+            "boundaryKind": boundary_kind,
+            "framework": "SPRING_DATA",
+            "operation": operation,
+            "repositoryFqn": receiver_fqn,
+            "repositoryContractFqn": repository.get("contractFqn"),
+            "entityFqn": entity.get("entityFqn"),
+            "accessStrategy": entity.get("accessStrategy"),
+            "mappingCompleteness": mapping_completeness,
+            "tableMapping": entity.get("tableMapping"),
+            "receiver": call.get("receiverPath") or call.get("receiver") or "",
+            "receiverConfidence": call.get("receiverConfidence") or "MAY",
+            "analysisCompleteness": completeness,
+            "provenance": "FRAMEWORK_CONTRACT",
+            "sourceProvenance": "STATIC_AST",
+        }
+        if entity.get("tableName") is not None:
+            boundary_metadata["tableName"] = entity.get("tableName")
+        explicit_columns = sorted(
+            field.get("columnName") for field in entity.get("fields") or []
+            if field.get("columnMapping") == "EXPLICIT" and field.get("columnName") is not None
+        )
+        if explicit_columns:
+            boundary_metadata["explicitColumns"] = explicit_columns
+        if boundary_id not in seen_node_ids:
+            seen_node_ids.add(boundary_id)
+            boundary_node = {
+                "id": boundary_id,
+                "label": f"Java persistence {operation} boundary",
+                "file_type": "code",
+                "type": "persistence_boundary",
+                "source_file": source_file,
+                "source_location": location,
+                "confidence": "EXTRACTED",
+                "confidence_score": (
+                    0.8 if completeness == "PARTIAL"
+                    else (1.0 if call.get("receiverConfidence") == "PROVEN" else 0.5)
+                ),
+                "metadata": sanitize_metadata(boundary_metadata),
+            }
+            all_nodes.append(boundary_node)
+            node_by_id[boundary_id] = boundary_node
+            owned.add(boundary_id)
+            emitted_boundaries += 1
+        boundary = {
+            "boundaryKind": boundary_kind,
+            "repositoryFqn": receiver_fqn,
+            "entityFqn": entity.get("entityFqn"),
+        }
+        if operation == "save":
+            push(arg0, boundary_id, call, boundary, completeness)
+        elif call.get("returnSink"):
+            push(boundary_id, call.get("returnSink"), call, boundary, completeness)
+
+    return {
+        "entities": len(entity_records),
+        "repositories": sum(len(v) for v in resolved_repositories.values()),
+        "calls": len(best_calls),
+        "boundaries": emitted_boundaries,
+        "edges": emitted_edges,
+    }
+
+
 def _resolve_cross_file_java_data_flow(
     per_file: list[dict],
     paths: list[Path],
@@ -3372,7 +3769,10 @@ def _resolve_cross_file_java_data_flow(
                     **base_md,
                     "relationKind": rec.get("returnSinkKind"),
                 })
+    persistence_stats = _resolve_java_persistence_records(per_file, all_nodes, all_edges)
     counts["emitted"] = emitted
+    counts["persistence_boundaries"] = persistence_stats["boundaries"]
+    counts["persistence_edges"] = persistence_stats["edges"]
     return counts
 
 
