@@ -72,3 +72,27 @@ benchmark. These are the vendor's marketing numbers at inspection date and are
 **not** treated as validated evidence for BugZero; they are recorded for
 awareness only. Gate 2B's correctness is validated by its own public-boundary
 tests and the full suite, not by third-party benchmark claims.
+
+---
+
+## Gate 3 delta (appended)
+
+**Inspected for Gate 3 (2026-08-20):** the primary GitNexus references were
+re-inspected for material change relevant to bounded traversal. The GitNexus
+architecture relevant to Gate 3 — impact/traversal queries, process/path
+summarization, PDG/query concepts, confidence/epistemic handling, and bounded
+retrieval/query interfaces — has **not** materially changed since the Gate 2B
+inspection in a way that would require redesigning Gate 3. The licensing
+boundary (PolyForm Noncommercial 1.0.0) is preserved; nothing is copied.
+
+Gate 3 implements a **bounded, query-time data-flow path** layer aligned with
+GitNexus's "data flow never crosses the repo boundary" and exact/epistemic
+reporting principles, but as Graphify's own design: an explicit value-flow
+relation allowlist (`FLOWS_TO`/`PASSED_AS_ARGUMENT`/`RETURNED_AS`/`READ_FROM`/
+`WRITTEN_TO`/`TRANSFORMED_BY`), per-query `max_depth`/`max_paths`/
+`max_expansions`, deterministic checkout-root-independent evidence keys, and
+conservative epistemic propagation with machine-visible boundary/truncation
+events. No PDG/CFG/taint engine, no Process nodes, no Leiden clustering, no
+GitNexus storage schema, and no closure table were added (all recorded as
+future-gate / rejected for Gate 3). See
+`docs/data-flow/GATE-3-BOUNDED-TRAVERSAL-IMPLEMENTATION-REPORT.md`.
