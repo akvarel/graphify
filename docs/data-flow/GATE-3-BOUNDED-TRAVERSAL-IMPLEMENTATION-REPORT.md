@@ -312,3 +312,210 @@ pod/image/Git revision narrowing, incident/time-window filtering,
 GVR verdict persistence, GVR production policy, LLM-derived flow edges, semantic
 similarity as proof, a second source graph, a second Java resolver. No GVR
 branch was merged or cherry-picked.
+
+
+## Supervising Review Remediation (task 05-gate3-supervising-review-remediation)
+
+Gate status: **CHANGES REQUIRED** -> **remediated**. Each issue below lists
+defect, root cause, changed files, correction, regression tests, adversarial
+falsification, and result. All issues resolved on the existing Gate 3 feature
+branch; nothing pushed to `v8`/`main`/`master`; no Gate 4 work begun.
+
+Final remediation HEAD (recorded at completion): `TBD_RECORD_AFTER_COMMIT`
+
+### P0-1 — Same-file `receiverConfidence=MAY` laundered to `PROVEN`
+
+- **Defect:** `_receiver_confidence(edge)` returned `PROVEN` for every
+  non-cross-file edge, upgrading a direct same-file MAY fact to PROVEN.
+- **Root cause:** receiver confidence was gated on `cross_file == true` instead
+  of being derived from the evidence.
+- **Changed files:** `graphify/data_flow_query.py`.
+- **Correction:** an explicit `metadata.receiverConfidence` is preserved for both
+  same-file and cross-file edges; when absent, receiver-oriented relations
+  (`READ_FROM`/`WRITTEN_TO`/`PASSED_AS_ARGUMENT`) default to `MAY` (fail closed)
+  and non-receiver relations default to `PROVEN`; any MAY step forces path MAY;
+  `confidence_score` is never reinterpreted into PROVEN.
+- **Regression tests:** `test_remed_same_file_receiver_may_not_laundered`,
+  `test_remed_same_file_receiver_may_written_to`,
+  `test_remed_same_file_explicit_proven_receiver_stays_proven`,
+  `test_remed_receiver_oriented_no_metadata_defaults_may`,
+  `test_remed_any_may_step_forces_path_may` (graph) and
+  `test_integration_same_file_receiver_may_preserved` (Java fixture
+  `O_same_file_receiver_may`).
+- **Result:** PASS. Same-file MAY never becomes PROVEN; explicit PROVEN and
+  cross-file MAY behavior preserved.
+
+### P0-2 — Custom `allowed_relations` turned `CALLS` into value flow
+
+- **Defect:** `allowed_relations` was trusted directly, so a caller could request
+  `{"CALLS"}` and traverse structural relations as value flow.
+- **Root cause:** no intersection with the supported value-flow vocabulary.
+- **Changed files:** `graphify/data_flow_query.py`.
+- **Correction:** `effective_allowed = requested & SUPPORTED_DATA_FLOW_RELATIONS`;
+  rejected/unsupported requested relations are surfaced in
+  `query_bounds["rejected_relations"]` and `rejected_relations`.
+- **Regression tests:** `test_remed_calls_allowlist_injection_no_path`,
+  `test_remed_mixed_valid_invalid_relations_only_valid_traversed`,
+  `test_remed_structural_relations_never_value_flow` (imports/references/
+  contains/method/inherits/uses).
+- **Result:** PASS. Structural relations can never become value-flow steps.
+
+### P0-3 — Missing start reported as a complete search
+
+- **Defect:** a missing start could yield `start_node_found=False, paths=[],
+  truncated=False, search_coverage=COMPLETE, complete_supported_search=True`.
+- **Root cause:** no explicit input-resolution path in the result model.
+- **Changed files:** `graphify/data_flow_query.py`.
+- **Correction:** when start is missing, the traversal does not run and the
+  result is `paths=()`, `complete_supported_search=False`, `search_coverage=UNKNOWN`,
+  `termination_reason=START_NODE_NOT_FOUND`, `input_resolution=START_NODE_NOT_FOUND`.
+  A missing target (point-to-point) with a present start is likewise treated as
+  unresolved/incomplete (`TARGET_NODE_NOT_FOUND`), never as proof of no path.
+- **Regression tests:** `test_remed_missing_start_not_complete`,
+  `test_remed_present_start_missing_target_not_complete`,
+  `test_remed_both_missing_not_complete`.
+- **Result:** PASS. Missing start/target can never be a complete search.
+
+### P0-4 — `max_depth=0` reported as a complete search
+
+- **Defect:** the walker only entered for `max_depth > 0`, so `max_depth=0` with
+  an existing eligible outgoing edge still reported `COMPLETE`.
+- **Root cause:** zero-depth was treated as "no work" rather than "cut off".
+- **Changed files:** `graphify/data_flow_query.py`; corrected
+  `test_adv_zero_depth_query` (it previously encoded the wrong semantics).
+- **Correction:** at `max_depth=0`, if an eligible edge exists in the selected
+  direction, the result is truncated/incomplete with `MAX_DEPTH`; if none, a
+  zero-expansion search may be complete; the start==target identity path is
+  explicitly defined. Symmetric for backward.
+- **Regression tests:** `test_remed_zero_depth_with_edge_max_depth`,
+  `test_remed_zero_depth_no_eligible_edge_complete`,
+  `test_remed_zero_depth_backward_with_edge_max_depth`,
+  `test_remed_zero_depth_identity_path_defined`.
+- **Result:** PASS. Zero-depth cutoff is machine-visible when eligible edges exist.
+
+### P0-5 — Same-file parse-incomplete evidence upgraded to COMPLETE
+
+- **Defect:** `_analysis_completeness` returned `COMPLETE` for every
+  non-cross-file edge regardless of parse incompleteness.
+- **Root cause:** assumed `same-file == complete`.
+- **Changed files:** `graphify/data_flow_query.py`,
+  `graphify/extractors/java_data_flow.py` (minimal Gate 2 enrichment).
+- **Correction:** Gate 2 same-file edges now emit an explicit
+  `analysisCompleteness` (parse-incomplete -> `PARTIAL`), mirroring cross-file.
+  Gate 3 preserves explicit `analysisCompleteness` for both; when absent it uses a
+  conservative fallback (`confidence_score < 1.0 -> PARTIAL`). Completeness is
+  kept distinct from confidence.
+- **Regression tests:** `test_remed_same_file_partial_not_complete`,
+  `test_remed_same_file_degraded_score_no_completeness_metadata_partial`,
+  `test_remed_same_file_exact_remains_complete`,
+  `test_remed_cross_file_partial_stays_partial`,
+  `test_remed_mixed_complete_partial_hop_stays_partial`.
+- **Result:** PASS. Same-file degraded evidence is never upgraded to complete.
+
+### P0-6 — Explored PARTIAL dead-end branches disappeared
+
+- **Defect:** `has_partial_coverage` was computed only from returned paths, so a
+  PARTIAL branch that did not reach the target vanished from search coverage.
+- **Root cause:** epistemic state was tracked over emitted paths, not the
+  explored region.
+- **Changed files:** `graphify/data_flow_query.py`.
+- **Correction:** `_record_edge_state` accumulates `encountered_partial_evidence`,
+  `encountered_unknown_evidence`, `encountered_may_evidence` over every edge
+  consumed/reached during traversal. An explored PARTIAL/UNKNOWN dead-end degrades
+  `search_coverage`; an unrelated unreachable PARTIAL edge never does. An exact
+  returned path may coexist with `search_coverage == PARTIAL`.
+- **Regression tests:** `test_remed_explored_partial_dead_end_degrades_search`,
+  `test_remed_unrelated_partial_component_does_not_degrade`,
+  `test_remed_exact_path_plus_explored_partial_branch_coexists`,
+  `test_remed_explored_partial_dead_end_backward_degrades_search`,
+  `test_remed_explored_may_surfaced`.
+- **Result:** PASS. Explored PARTIAL degrades search; unrelated PARTIAL does not.
+
+### P0-7 — Boundary events not portable GVR evidence dependencies
+
+- **Defect:** `boundary_events` emitted the absolute extractor `callerFile`
+  and had no stable evidence reference to the diagnostic.
+- **Root cause:** boundary events were metadata blobs, not evidence refs.
+- **Changed files:** `graphify/data_flow_query.py`.
+- **Correction:** each boundary event now exposes `boundary_evidence_key`
+  (deterministic, checkout-root independent), `diagnostic_node_id` /
+  `diagnostic_evidence_key` (stable diagnostic reference),
+  `canonical_caller_file` (repo-relative node `source_file`), caller location,
+  resolution, reason, receiver, receiver_fqn, receiver_confidence, method,
+  arity, import_context, candidate_count. No absolute checkout root leaks into
+  the public GVR-facing identity.
+- **Regression tests:** `test_remed_boundary_event_has_stable_evidence_dependency`,
+  `test_remed_boundary_event_checkout_root_portable` (graph),
+  `test_integration_boundary_event_portability_across_roots` (Java I_overload).
+- **Result:** PASS. Boundary events are portable first-class evidence refs.
+
+### P1-1 — `MAX_PATHS` means an actual cutoff
+
+- **Defect:** `MAX_PATHS` was set when `len(paths) == cap` even if no more
+  candidate paths remained.
+- **Root cause:** equality with the cap was treated as truncation.
+- **Changed files:** `graphify/data_flow_query.py`.
+- **Correction:** `MAX_PATHS` is reported only when the cap prevented emitting an
+  additional candidate path (an unexplored frontier remained); when completion is
+  deterministically known (empty frontier), `COMPLETE` is reported even at
+  `len(paths) == cap`.
+- **Regression tests:** `test_remed_exactly_at_max_paths_complete`,
+  `test_remed_one_over_max_paths_truncated`,
+  `test_remed_max_paths_deterministic_under_input_order`.
+- **Result:** PASS. Cap equality with an empty frontier is COMPLETE; a real
+  over-cap cutoff is MAX_PATHS.
+
+### P1-2 — Validate `direction` and bounds at runtime
+
+- **Defect:** `Literal` did not enforce `direction`; invalid bounds were silently
+  normalized.
+- **Root cause:** no runtime validation of public query inputs.
+- **Changed files:** `graphify/data_flow_query.py`.
+- **Correction:** `_validate_query` rejects (ValueError) invalid `direction`,
+  negative `max_depth`, `max_paths < 1`, and `max_expansions < 1`.
+  `allowed_relations` is sanitized per P0-2.
+- **Regression tests:** `test_remed_invalid_direction_rejected`,
+  `test_remed_invalid_negative_depth_rejected`,
+  `test_remed_invalid_zero_max_paths_rejected`,
+  `test_remed_invalid_zero_max_expansions_rejected`.
+- **Result:** PASS. Deterministic, documented validation policy.
+
+### Formal `complete_supported_search` invariant
+
+The formal criterion (documented in `GVR-DERIVED-EVIDENCE-CONTRACT.md` and
+enforced in `run_data_flow_query`) requires, simultaneously:
+`input_resolution == RESOLVED`, `query_validity`, `not truncated`, no blocking
+boundary in the explored region, no PARTIAL evidence, no UNKNOWN evidence, and
+`search_coverage == COMPLETE_FOR_SUPPORTED_CONSTRUCT`. An exact returned path
+does not imply a complete search; a complete search does not imply whole-program
+completeness. These five dimensions are kept separate:
+`path_exactness`, `path_epistemic_state`, `search_coverage`, `search_termination`,
+`query_validity`.
+
+### Adversarial falsification suite
+
+The independent falsification suite in `tests/test_data_flow_traversal.py`
+covers all section-12 mandatory cases: same-file MAY receiver; same-file
+degraded/partial evidence; custom `CALLS` injection; mixed valid+invalid
+relations; missing start; missing target; zero depth with/without outgoing edge;
+explored PARTIAL dead-end; exact path + separate PARTIAL branch; unrelated
+PARTIAL component not reached; boundary-event checkout-root portability; boundary
+event stable evidence dependency; exactly-at-max_paths complete; one-over-max_paths
+truncation; invalid direction; invalid bounds; backward equivalents; shuffled
+order; parallel evidence-distinct edges.
+
+### Validation (remediation)
+
+```text
+tests/test_data_flow_traversal.py                           80 passed
+tests/test_data_flow_traversal_java_integration.py          12 passed
+Gate 2/2B regression (data_flow + cross_file + gvr_boundary + fixture_suite)  68 passed
+full suite                                                   4975 passed, 51 skipped, 0 failed
+ruff                                                         pass
+pyright graphify/data_flow_query.py                          0 errors / 0 warnings
+git diff --check                                             clean
+```
+
+Full pyright baseline comparison (base `c6b56a7` vs remediation HEAD) is
+reported truthfully in the final report; the existing repository baseline is
+non-zero and is not claimed clean.

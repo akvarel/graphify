@@ -14,6 +14,7 @@ yields the continuous 3-hop chain used below.
 
 from __future__ import annotations
 
+import json
 import random
 import shutil
 import tempfile
@@ -188,3 +189,37 @@ def test_integration_point_to_point_truncation_no_completeness_claim():
     # search was bounded/truncated by depth, so it cannot claim complete coverage
     assert r.truncated is True or r.termination_reason in ("MAX_DEPTH",)
     assert r.complete_supported_search is False
+
+
+def test_integration_same_file_receiver_may_preserved():
+    """P0-1: a same-file receiver MAY edge stays MAY, never PROVEN."""
+    result = _extract_case("O_same_file_receiver_may")
+    start = _find_dv(result, "Ord.java", "FIELD", "v")
+    r = run_data_flow_query(result["nodes"], result["edges"],
+                            DataFlowQuery(start=start, max_depth=3))
+    may_steps = [s for p in r.paths for s in p.steps
+                 if s.evidence.receiver_confidence == "MAY"]
+    assert may_steps, "expected a same-file MAY receiver step"
+    for p in r.paths:
+        assert p.path_receiver_confidence == "MAY"
+        assert p.path_receiver_confidence != "PROVEN"
+
+
+def test_integration_boundary_event_portability_across_roots():
+    """P0-7: boundary events are checkout-root independent on real output."""
+    src = FIXTURE_ROOT / "I_overload"
+    results = []
+    for tag in ("rootA", "rootB"):
+        tmp = Path(tempfile.mkdtemp()) / tag
+        shutil.copytree(src, tmp)
+        result = extract(sorted(tmp.rglob("*.java")), root=tmp,
+                         cache_root=Path(tempfile.mkdtemp()))
+        start = _find_dv(result, "AmbigUser.java", "LOCAL", "v")
+        r = run_data_flow_query(result["nodes"], result["edges"],
+                                DataFlowQuery(start=start, max_depth=6))
+        results.append(r)
+    a, b = results
+    assert a.boundary_events and b.boundary_events
+    assert a.boundary_events == b.boundary_events
+    blob = json.dumps(a.boundary_events)
+    assert "/rootA/" not in blob and "/rootB/" not in blob

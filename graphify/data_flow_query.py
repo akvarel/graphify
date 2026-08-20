@@ -21,15 +21,32 @@ Design invariants (see ``docs/data-flow/GATE-3-BOUNDED-TRAVERSAL-IMPLEMENTATION-
   is never upgraded to complete, multiple paths never become definite truth,
   and ambiguous/unresolved/unsupported boundaries are surfaced as machine-visible
   events rather than fabricated flow steps.
+
+Remediation (supervising review ``05-gate3-supervising-review-remediation``):
+
+- Receiver confidence is derived from the direct evidence itself (preserving an
+  explicit ``receiverConfidence`` for both same-file and cross-file edges), never
+  inferred from ``cross_file == false``.
+- ``allowed_relations`` is intersected with the supported value-flow vocabulary;
+  unsupported requested relations can never become value-flow steps and are
+  surfaced in the result.
+- Missing start/target nodes and ``max_depth == 0`` cutoffs are represented
+  explicitly and can never be reported as a complete search.
+- Same-file parse-incomplete evidence is never upgraded to complete.
+- Epistemic state is tracked over the *explored search region*, not only over
+  returned paths.
+- Boundary events are first-class, checkout-root independent evidence
+  references to the underlying diagnostic.
+- ``MAX_PATHS`` means an actual cutoff, not merely ``len(paths) == cap``.
+- Query inputs (direction and bounds) are validated at runtime.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Literal, Sequence
+from typing import Any, Literal, Sequence
 
 # The explicit allowlist of value-flow relations eligible for traversal.
 # CALLS / references / imports / contains / inherits are NOT value flow and are
@@ -42,6 +59,16 @@ DEFAULT_DATA_FLOW_RELATIONS = frozenset({
     "WRITTEN_TO",
     "TRANSFORMED_BY",
 })
+
+# Public alias: the supported value-flow vocabulary. Caller-provided
+# ``allowed_relations`` is intersected with this set so a caller can never turn a
+# structural relation (e.g. CALLS) into a value-flow step (P0-2).
+SUPPORTED_DATA_FLOW_RELATIONS = DEFAULT_DATA_FLOW_RELATIONS
+
+# Relations that inherently name a receiver whose instance identity matters.
+# When such an edge carries no explicit receiver-confidence metadata we default
+# to MAY (fail closed) rather than assuming a proven receiver.
+_RECEIVER_ORIENTED_RELATIONS = frozenset({"READ_FROM", "WRITTEN_TO", "PASSED_AS_ARGUMENT"})
 
 # Blocking resolution states: a boundary we cannot safely cross. These must be
 # surfaced as boundary events, never traversed as flow.
@@ -59,7 +86,8 @@ class DataFlowQuery:
     """A bounded data-flow query.
 
     Bounds are mandatory and never default to an unbounded whole-graph walk.
-    ``allowed_relations`` defaults to :data:`DEFAULT_DATA_FLOW_RELATIONS`.
+    ``allowed_relations`` defaults to :data:`DEFAULT_DATA_FLOW_RELATIONS` and is
+    intersected with :data:`SUPPORTED_DATA_FLOW_RELATIONS` at run time.
     """
 
     start: str
@@ -128,8 +156,9 @@ class DataFlowTraversalResult:
     """The normalized, serializable result of a bounded traversal.
 
     ``complete_supported_search`` is True only when the search was fully bounded,
-    never truncated, and encountered no blocking boundary and no PARTIAL coverage
-    in the reachable region. A zero-path result is therefore only meaningful as
+    never truncated, resolved its start (and, for point-to-point queries, its
+    target), encountered no blocking boundary and no PARTIAL/UNKNOWN coverage in
+    the explored region. A zero-path result is therefore only meaningful as
     "no path" when this flag is True.
     """
 
@@ -147,6 +176,13 @@ class DataFlowTraversalResult:
     complete_supported_search: bool
     start_node_found: bool
     target_node_found: bool | None
+    # ---- remediation fields (supervising review 05) ----
+    query_validity: bool = True
+    input_resolution: str = "RESOLVED"  # RESOLVED / START_NODE_NOT_FOUND / TARGET_NODE_NOT_FOUND
+    rejected_relations: tuple[str, ...] = ()
+    encountered_partial_evidence: bool = False
+    encountered_unknown_evidence: bool = False
+    encountered_may_evidence: bool = False
 
 
 def _evidence_key(edge: dict[str, Any]) -> str:
@@ -204,16 +240,41 @@ def _edge_expansion_key(edge: dict[str, Any], key: str) -> tuple[Any, ...]:
 
 
 def _analysis_completeness(edge: dict[str, Any]) -> str:
+    """Completeness of a direct edge's supported-construct evidence.
+
+    An explicit ``analysisCompleteness`` metadata value is preserved for both
+    same-file and cross-file edges (P0-5). When it is absent (hand-authored
+    fixtures or legacy evidence) we use a conservative fallback: a direct fact
+    with less-than-full confidence cannot be claimed complete for the supported
+    construct. A full-trust edge with no completeness metadata is treated as
+    complete for the supported construct.
+    """
     metadata = edge.get("metadata") or {}
-    if (metadata.get("cross_file") or False):
-        return str(metadata.get("analysisCompleteness") or "UNKNOWN")
+    explicit = metadata.get("analysisCompleteness")
+    if explicit:
+        return str(explicit)
+    score = edge.get("confidence_score")
+    if isinstance(score, (int, float)) and score < 1.0:
+        return "PARTIAL"
     return "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
 
 
 def _receiver_confidence(edge: dict[str, Any]) -> str:
+    """Receiver confidence of a direct edge, derived from the evidence itself.
+
+    P0-1: an explicit ``receiverConfidence`` metadata value is preserved for both
+    same-file and cross-file edges. When it is absent, only receiver-oriented
+    relations (which name a receiver whose instance identity matters) default to
+    ``MAY``; a pure value-flow hop between confirmed data nodes has no receiver
+    to prove and remains ``PROVEN``. We never infer ``PROVEN`` merely from
+    ``cross_file == false``.
+    """
     metadata = edge.get("metadata") or {}
-    if (metadata.get("cross_file") or False):
-        return str(metadata.get("receiverConfidence") or "MAY")
+    value = metadata.get("receiverConfidence")
+    if value in ("MAY", "PROVEN"):
+        return str(value)
+    if str(edge.get("relation") or "") in _RECEIVER_ORIENTED_RELATIONS:
+        return "MAY"
     return "PROVEN"
 
 
@@ -267,16 +328,60 @@ class _Adjacency:
         return index.get(node, [])
 
 
+def _record_edge_state(edge: dict[str, Any], state: dict[str, bool]) -> None:
+    """Accumulate epistemic state over the explored search region (P0-6).
+
+    Called for every direct edge actually consumed or reached during traversal,
+    including branches that later dead-end without producing a returned path. An
+    edge that is never reached (e.g. in an unrelated unreachable component) is
+    never recorded and therefore cannot degrade search coverage.
+    """
+    completeness = _analysis_completeness(edge)
+    if completeness == "PARTIAL":
+        state["partial"] = True
+    elif completeness == "UNKNOWN":
+        state["unknown"] = True
+    if _receiver_confidence(edge) == "MAY":
+        state["may"] = True
+
+
+def _boundary_evidence_key(node: dict[str, Any]) -> str:
+    """Deterministic, checkout-root independent boundary evidence fingerprint.
+
+    Derived only from canonical public evidence fields (repo-relative source
+    file, caller location, resolution, method/arity, receiver FQN, reason). The
+    diagnostic node id is intentionally *not* part of the fingerprint because its
+    stability across a Graphify remap is not guaranteed; it is surfaced separately
+    as ``diagnostic_node_id`` / ``diagnostic_evidence_key``. No absolute checkout
+    path participates, so the key is identical across different checkout roots.
+    """
+    metadata = node.get("metadata") or {}
+    fields: list[tuple[str, str]] = [
+        ("sf", str(node.get("source_file") or "")),
+        ("loc", str(metadata.get("callerLocation") or "")),
+        ("res", str(metadata.get("resolution") or "")),
+        ("method", str(metadata.get("method") or "")),
+        ("arity", str(metadata.get("arity") or 0)),
+        ("rfqn", str(metadata.get("receiverFqn") or "")),
+        ("reason", str(metadata.get("reason") or "")),
+    ]
+    canonical = json.dumps(sorted(fields), sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"bnd:{digest}"
+
+
 def _collect_boundary_events(
     reachable_files: set[str], nodes: Sequence[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Machine-visible blocking-boundary events.
+    """Machine-visible blocking-boundary events as first-class evidence refs.
 
     A blocking diagnostic (AMBIGUOUS / UNRESOLVED / UNSUPPORTED) is surfaced
     when the traversal reached at least one data value in the diagnostic's
     caller file. It is a coverage caveat (the search could not safely cross
-    that boundary), never a fabricated flow step. Deterministic order by file,
-    location, resolution, reason.
+    that boundary), never a fabricated flow step. Each event exposes a
+    deterministic, checkout-root independent evidence key and a stable reference
+    to the underlying diagnostic node (P0-7). Deterministic order by canonical
+    caller file, location, resolution, reason.
     """
     events: list[dict[str, Any]] = []
     for node in nodes:
@@ -288,33 +393,60 @@ def _collect_boundary_events(
         resolution = str(metadata.get("resolution") or "")
         if resolution not in BLOCKING_RESOLUTIONS:
             continue
-        caller_file = str(metadata.get("callerFile") or "")
+        caller_abs = str(metadata.get("callerFile") or "")
         # The diagnostic's callerFile is the per-file extractor's path (absolute
         # under the cache_root fallback), while node source_file is repo-relative.
         # Match when the callerFile is the same physical file as a reached node
         # (repo-relative path is a /-delimited suffix of the caller file).
         if not any(
-            caller_file == sf or caller_file.endswith("/" + sf)
+            caller_abs == sf or caller_abs.endswith("/" + sf)
             for sf in reachable_files
         ):
             continue
+        node_id = str(node.get("id") or "")
+        # The canonical caller file is the repo-relative node source_file, never
+        # the absolute extractor callerFile, so no checkout root leaks into the
+        # public GVR-facing identity.
+        canonical_sf = str(node.get("source_file") or "")
         events.append({
             "type": "boundary_event",
+            "boundary_evidence_key": _boundary_evidence_key(node),
+            "diagnostic_node_id": node_id,
+            "diagnostic_evidence_key": f"diag:{node_id}",
+            "canonical_caller_file": canonical_sf,
+            "caller_location": str(metadata.get("callerLocation") or ""),
             "resolution": resolution,
             "reason": str(metadata.get("reason") or resolution.lower()),
-            "callerFile": caller_file,
-            "callerLocation": str(metadata.get("callerLocation") or ""),
             "receiver": str(metadata.get("receiver") or ""),
-            "receiverFqn": str(metadata.get("receiverFqn") or ""),
+            "receiver_fqn": str(metadata.get("receiverFqn") or ""),
+            "receiver_confidence": str(metadata.get("receiverConfidence") or "MAY"),
             "method": str(metadata.get("method") or ""),
             "arity": int(metadata.get("arity") or 0),
-            "importContext": str(metadata.get("importContext") or "unknown"),
-            "candidateCount": int(metadata.get("candidateCount") or 0),
+            "import_context": str(metadata.get("importContext") or "unknown"),
+            "candidate_count": int(metadata.get("candidateCount") or 0),
         })
     events.sort(key=lambda e: (
-        e["callerFile"], e["callerLocation"], e["resolution"], e["reason"]
+        e["canonical_caller_file"], e["caller_location"], e["resolution"], e["reason"]
     ))
     return events
+
+
+def _validate_query(query: DataFlowQuery) -> None:
+    """Validate public query inputs before traversal (P1-2).
+
+    Invalid direction and out-of-range bounds are rejected deterministically
+    (ValueError). ``max_depth >= 0``, ``max_paths >= 1``, ``max_expansions >= 1``.
+    ``allowed_relations`` are not rejected here; they are intersected with the
+    supported vocabulary (P0-2).
+    """
+    if query.direction not in ("FORWARD", "BACKWARD"):
+        raise ValueError(f"invalid direction: {query.direction!r}")
+    if int(query.max_depth) < 0:
+        raise ValueError("max_depth must be >= 0")
+    if int(query.max_paths) < 1:
+        raise ValueError("max_paths must be >= 1")
+    if int(query.max_expansions) < 1:
+        raise ValueError("max_expansions must be >= 1")
 
 
 def run_data_flow_query(
@@ -327,17 +459,36 @@ def run_data_flow_query(
     ``nodes`` and ``edges`` are the public extraction graph lists. The query is
     evaluated query-time; nothing is persisted into the graph.
     """
+    _validate_query(query)
+    direction = query.direction
     start = query.start
     target = query.target
-    max_depth = max(0, int(query.max_depth))
-    max_paths = max(1, int(query.max_paths))
-    max_expansions = max(1, int(query.max_expansions))
+    max_depth = int(query.max_depth)
+    max_paths = int(query.max_paths)
+    max_expansions = int(query.max_expansions)
 
-    adjacency = _Adjacency(edges, query.allowed_relations)
+    # P0-2: effective allowlist is the intersection of the caller's requested
+    # relations with the supported value-flow vocabulary. Structural relations
+    # requested by a caller can never become value-flow steps.
+    requested = frozenset(query.allowed_relations)
+    effective_allowed = requested & SUPPORTED_DATA_FLOW_RELATIONS
+    rejected_relations = tuple(sorted(requested - SUPPORTED_DATA_FLOW_RELATIONS))
+
+    adjacency = _Adjacency(edges, effective_allowed)
 
     node_ids = {str(n.get("id") or "") for n in nodes}
     start_found = start in node_ids
     target_found = target in node_ids if target is not None else None
+
+    # P0-3: missing start/target are input-resolution failures, never complete
+    # searches. A missing target makes the target search UNKNOWN even when the
+    # start exists (conservative: never "no path" proof).
+    if not start_found:
+        input_resolution = "START_NODE_NOT_FOUND"
+    elif target is not None and not target_found:
+        input_resolution = "TARGET_NODE_NOT_FOUND"
+    else:
+        input_resolution = "RESOLVED"
 
     # Boundary-event bookkeeping uses the files actually reached by the search.
     reachable_files: set[str] = set()
@@ -357,6 +508,7 @@ def run_data_flow_query(
     cut_at_depth = False  # an edge existed beyond max_depth
     hit_path_cap = False
     hit_expansion_cap = False
+    explored_state = {"partial": False, "unknown": False, "may": False}
 
     if start_found and start == target:
         # A trivial identity path (start == target) with no steps.
@@ -377,6 +529,8 @@ def run_data_flow_query(
         if path_identity in seen_path_identities:
             return
         seen_path_identities.add(path_identity)
+        for e in flow_edges:
+            _record_edge_state(e, explored_state)
         refs = tuple(_build_edge_ref(e) for e in flow_edges)
         steps = tuple(
             DataFlowPathStep(
@@ -408,25 +562,38 @@ def run_data_flow_query(
         ))
         visited.update(ref.source for ref in refs)
         if flow_edges:
-            visited.add(_frontier(flow_edges[-1], query.direction))
+            visited.add(_frontier(flow_edges[-1], direction))
 
-    if start_found and start != target and max_depth > 0:
+    if input_resolution == "RESOLVED" and start != target and max_depth == 0:
+        # P0-4: zero-depth never traverses. If at least one eligible edge exists
+        # in the selected direction, the search was cut off before examining
+        # reachable flow -> MAX_DEPTH (machine-visible), incomplete. The eligible
+        # edges are part of the reached frontier, so their epistemic state is
+        # recorded. If none exist, a zero-expansion search is complete.
+        eligible = adjacency.outgoing(start, direction)
+        for edge in eligible:
+            _record_edge_state(edge, explored_state)
+        if eligible:
+            cut_at_depth = True
+
+    elif input_resolution == "RESOLVED" and start != target and max_depth > 0:
         # DFS over paths: each stack frame is (path of edges, visited-set, depth).
         # Using an explicit stack keeps it iterative (cycle-safe, bounded).
         stack: list[tuple[list[dict[str, Any]], frozenset[str], int]] = []
         start_visited = frozenset({start})
-        for edge in adjacency.outgoing(start, query.direction):
+        for edge in adjacency.outgoing(start, direction):
             if expanded >= max_expansions:
                 hit_expansion_cap = True
                 break
-            if _frontier(edge, query.direction) in start_visited:
+            if _frontier(edge, direction) in start_visited:
                 continue  # a self-loop makes no flow progress; skip
             expanded += 1
-            stack.append(([edge], start_visited | {_frontier(edge, query.direction)}, 1))
+            _record_edge_state(edge, explored_state)
+            stack.append(([edge], start_visited | {_frontier(edge, direction)}, 1))
 
-        while stack and len(paths) < max_paths:
+        while stack:
             path_edges, visited_set, depth = stack.pop()
-            last_node = _frontier(path_edges[-1], query.direction)
+            last_node = _frontier(path_edges[-1], direction)
 
             if last_node in node_ids:
                 for n in nodes:
@@ -443,38 +610,51 @@ def run_data_flow_query(
                 # flow chain a forward walk would find for the same direct facts.
                 flow_edges = (
                     list(reversed(path_edges))
-                    if query.direction == "BACKWARD"
+                    if direction == "BACKWARD"
                     else path_edges
                 )
                 _emit(flow_edges)
 
-            if len(paths) >= max_paths:
-                hit_path_cap = True
-                break
+                # P1-1: MAX_PATHS is a real cutoff, not mere equality with the
+                # cap. Only when the cap prevented emitting an additional
+                # candidate path (unexplored frontier remains) do we truncate.
+                if len(paths) >= max_paths:
+                    more_work = bool(stack)
+                    if not more_work and depth < max_depth and last_node not in query.stop_nodes:
+                        more_work = bool(adjacency.outgoing(last_node, direction))
+                    if more_work:
+                        hit_path_cap = True
+                    break
 
-            # Expand further (unless a terminal / stop node / depth bound).
             if reached_target:
                 continue  # point-to-point: a path is complete at the target
             if depth >= max_depth:
-                if adjacency.outgoing(last_node, query.direction):
+                if adjacency.outgoing(last_node, direction):
                     cut_at_depth = True
                 continue
             if last_node in query.stop_nodes:
                 continue
-            outgoing = adjacency.outgoing(last_node, query.direction)
+            outgoing = adjacency.outgoing(last_node, direction)
             for edge in outgoing:
                 if expanded >= max_expansions:
                     hit_expansion_cap = True
                     break
-                tgt = _frontier(edge, query.direction)
+                tgt = _frontier(edge, direction)
                 if tgt in visited_set:
                     continue  # cycle-safe: never revisit a node within one path
                 expanded += 1
+                _record_edge_state(edge, explored_state)
                 stack.append((path_edges + [edge], visited_set | {tgt}, depth + 1))
             if hit_expansion_cap:
                 break
 
-    if hit_expansion_cap:
+    if input_resolution == "START_NODE_NOT_FOUND":
+        truncated = False
+        termination_reason = "START_NODE_NOT_FOUND"
+    elif input_resolution == "TARGET_NODE_NOT_FOUND":
+        truncated = False
+        termination_reason = "TARGET_NODE_NOT_FOUND"
+    elif hit_expansion_cap:
         truncated = True
         termination_reason = "MAX_EXPANSIONS"
     elif hit_path_cap:
@@ -483,22 +663,36 @@ def run_data_flow_query(
     elif cut_at_depth:
         truncated = True
         termination_reason = "MAX_DEPTH"
+    else:
+        truncated = False
+        termination_reason = "COMPLETE"
 
     boundary_events = tuple(_collect_boundary_events(reachable_files, nodes))
     has_blocking_boundary = len(boundary_events) > 0
-    has_partial_coverage = any(p.path_coverage == "PARTIAL" for p in paths)
-    if not paths and has_blocking_boundary:
-        search_coverage = "PARTIAL"
-    elif not paths and (truncated or has_blocking_boundary):
-        search_coverage = "PARTIAL"
-    elif has_partial_coverage or has_blocking_boundary:
+
+    # Formal invariant (section 11): complete_supported_search is allowed only
+    # when the start (and, when required, target) resolved, the search was fully
+    # bounded, encountered no blocking boundary and no PARTIAL/UNKNOWN evidence
+    # in the explored region. An exact returned path does NOT imply a complete
+    # search; a complete search does NOT imply whole-program completeness.
+    if input_resolution != "RESOLVED":
+        search_coverage = "UNKNOWN"
+    elif (
+        truncated
+        or has_blocking_boundary
+        or explored_state["partial"]
+        or explored_state["unknown"]
+    ):
         search_coverage = "PARTIAL"
     else:
         search_coverage = "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
 
     complete_supported_search = (
-        (not truncated)
+        input_resolution == "RESOLVED"
+        and (not truncated)
         and (not has_blocking_boundary)
+        and (not explored_state["partial"])
+        and (not explored_state["unknown"])
         and search_coverage == "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
     )
 
@@ -509,17 +703,19 @@ def run_data_flow_query(
         paths=tuple(paths),
         start=start,
         target=target,
-        direction=query.direction,
+        direction=direction,
         visited_count=len(visited),
         expanded_count=expanded,
         truncated=truncated,
         termination_reason=termination_reason,
         query_bounds={
-            "direction": query.direction,
-            "max_depth": query.max_depth,
-            "max_paths": query.max_paths,
-            "max_expansions": query.max_expansions,
-            "allowed_relations": sorted(query.allowed_relations),
+            "direction": direction,
+            "max_depth": max_depth,
+            "max_paths": max_paths,
+            "max_expansions": max_expansions,
+            "requested_allowed_relations": sorted(requested),
+            "effective_allowed_relations": sorted(effective_allowed),
+            "rejected_relations": list(rejected_relations),
             "stop_nodes": sorted(query.stop_nodes),
         },
         boundary_events=boundary_events,
@@ -527,6 +723,12 @@ def run_data_flow_query(
         complete_supported_search=complete_supported_search,
         start_node_found=start_found,
         target_node_found=target_found,
+        query_validity=True,
+        input_resolution=input_resolution,
+        rejected_relations=rejected_relations,
+        encountered_partial_evidence=explored_state["partial"],
+        encountered_unknown_evidence=explored_state["unknown"],
+        encountered_may_evidence=explored_state["may"],
     )
 
 

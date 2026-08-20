@@ -167,9 +167,20 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         # explicitly downgraded (MAY) rather than presented as definite truth.
         if (md or {}).get("receiverConfidence") == "MAY":
             score = min(score, 0.5)
+        # P0-5: make same-file analysis completeness explicit and machine-readable
+        # (mirrors the cross-file representation). A parse-incomplete file is
+        # PARTIAL; otherwise the supported-construct analysis is complete. This
+        # is kept distinct from confidence_score (receiver MAY lowers confidence,
+        # not completeness).
+        edge_metadata = {
+            "provenance": "STATIC_AST",
+            "analysisCompleteness": (
+                "PARTIAL" if root.has_error else "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
+            ),
+        } | (md or {})
         edge = {"source": src, "target": tgt, "relation": rel, "confidence": "EXTRACTED", "confidence_score": score,
                 "source_file": str_path, "source_location": loc(n), "weight": 1.0,
-                "metadata": sanitize_metadata({"provenance": "STATIC_AST"} | (md or {}))}
+                "metadata": sanitize_metadata(edge_metadata)}
         edges.append(edge)
 
     classes: dict[str, dict[str, Any]] = {}

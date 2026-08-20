@@ -8,6 +8,7 @@ dependency tests, and an adversarial falsification pass.
 
 from __future__ import annotations
 
+import json
 import random
 
 from graphify.data_flow_query import (
@@ -488,10 +489,13 @@ def test_adv_self_loop_terminates():
 
 
 def test_adv_zero_depth_query():
+    # Corrected semantics (P0-4): an eligible outgoing edge exists beyond the
+    # zero-depth budget, so the search was cut off -> MAX_DEPTH, incomplete.
     nodes = [_node("A"), _node("B", loc="L2")]
     edges = [_edge("A", "B", "FLOWS_TO", loc="L1")]
     r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=0))
-    assert r.truncated is False
+    assert r.truncated is True and r.termination_reason == "MAX_DEPTH"
+    assert r.complete_supported_search is False
 
 
 def test_adv_start_equals_target_identity_path():
@@ -584,3 +588,456 @@ def test_adv_backward_consistency():
     # the same 2-hop relationship is reachable both directions
     assert any(p.steps[-1].target == "C" and len(p.steps) == 2 for p in fwd.paths)
     assert any(len(p.steps) == 2 for p in bwd.paths)
+
+
+# ================================================================ Supervising-review falsification
+# Section 12 mandatory adversarial cases + P0/P1 regressions
+# (05-gate3-supervising-review-remediation). Every false-positive completeness
+# claim and every uncertainty upgrade is a blocker.
+
+# ---- P0-1: same-file receiver MAY must never become PROVEN ----
+def test_remed_same_file_receiver_may_not_laundered():
+    # Hand-authored same-file READ_FROM edge, receiverConfidence=MAY,
+    # cross_file absent/false. Must stay MAY at step and path level.
+    nodes = [_node("a", "O.java"), _node("f", "O.java", "L2")]
+    edge = {
+        "source": "a", "target": "f", "relation": "READ_FROM",
+        "source_file": "O.java", "source_location": "L2",
+        "confidence": "EXTRACTED", "confidence_score": 0.5,
+        "weight": 1.0,
+        "metadata": {"provenance": "STATIC_AST", "receiverConfidence": "MAY"},
+    }
+    r = run_data_flow_query(nodes, [edge], DataFlowQuery(start="a", max_depth=2))
+    assert len(r.paths) == 1
+    step = r.paths[0].steps[0]
+    assert step.evidence.receiver_confidence == "MAY"
+    assert r.paths[0].path_receiver_confidence == "MAY"
+    assert r.paths[0].path_receiver_confidence != "PROVEN"
+
+
+def test_remed_same_file_receiver_may_written_to():
+    nodes = [_node("a", "O.java"), _node("f", "O.java", "L2")]
+    edge = {
+        "source": "a", "target": "f", "relation": "WRITTEN_TO",
+        "source_file": "O.java", "source_location": "L2",
+        "confidence": "EXTRACTED", "confidence_score": 0.5,
+        "weight": 1.0,
+        "metadata": {"provenance": "STATIC_AST", "receiverConfidence": "MAY"},
+    }
+    r = run_data_flow_query(nodes, [edge], DataFlowQuery(start="a", max_depth=2))
+    assert r.paths[0].path_receiver_confidence == "MAY"
+
+
+def test_remed_same_file_explicit_proven_receiver_stays_proven():
+    nodes = [_node("a", "O.java"), _node("f", "O.java", "L2")]
+    edge = {
+        "source": "a", "target": "f", "relation": "READ_FROM",
+        "source_file": "O.java", "source_location": "L2",
+        "confidence": "EXTRACTED", "confidence_score": 1.0,
+        "weight": 1.0,
+        "metadata": {"provenance": "STATIC_AST", "receiverConfidence": "PROVEN"},
+    }
+    r = run_data_flow_query(nodes, [edge], DataFlowQuery(start="a", max_depth=2))
+    assert r.paths[0].path_receiver_confidence == "PROVEN"
+
+
+def test_remed_receiver_oriented_no_metadata_defaults_may():
+    # A receiver-oriented relation with no receiverConfidence metadata cannot be
+    # assumed PROVEN (P0-1: never infer PROVEN from cross_file == false).
+    nodes = [_node("a", "O.java"), _node("f", "O.java", "L2")]
+    edge = _edge("a", "f", "READ_FROM", "O.java", loc="L2")  # same-file, no metadata
+    r = run_data_flow_query(nodes, [edge], DataFlowQuery(start="a", max_depth=2))
+    assert r.paths[0].path_receiver_confidence == "MAY"
+
+
+def test_remed_any_may_step_forces_path_may():
+    # A chain where one hop is receiver MAY forces the whole path to MAY.
+    nodes = [_node("a", "O.java"), _node("b", "O.java", "L2"), _node("c", "O.java", "L3")]
+    e1 = {
+        "source": "a", "target": "b", "relation": "FLOWS_TO",
+        "source_file": "O.java", "source_location": "L1",
+        "confidence": "EXTRACTED", "confidence_score": 1.0, "weight": 1.0,
+        "metadata": {"provenance": "STATIC_AST"},
+    }
+    e2 = {
+        "source": "b", "target": "c", "relation": "FLOWS_TO",
+        "source_file": "O.java", "source_location": "L3",
+        "confidence": "EXTRACTED", "confidence_score": 1.0, "weight": 1.0,
+        "metadata": {"provenance": "STATIC_AST", "receiverConfidence": "MAY"},
+    }
+    r = run_data_flow_query(nodes, [e1, e2], DataFlowQuery(start="a", max_depth=5))
+    two_hop = [p for p in r.paths if len(p.steps) == 2]
+    assert two_hop and two_hop[0].path_receiver_confidence == "MAY"
+
+
+# ---- P0-2: custom allowed_relations cannot turn CALLS/structural into value flow ----
+def test_remed_calls_allowlist_injection_no_path():
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [_edge("A", "B", "CALLS", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(
+        start="A", max_depth=2, allowed_relations=frozenset({"CALLS"})))
+    assert r.paths == ()
+    assert "CALLS" in r.rejected_relations
+    assert "CALLS" not in r.query_bounds["effective_allowed_relations"]
+
+
+def test_remed_mixed_valid_invalid_relations_only_valid_traversed():
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(
+        start="A", max_depth=2, allowed_relations=frozenset({"FLOWS_TO", "CALLS"})))
+    assert len(r.paths) == 1  # only FLOWS_TO traversed
+    assert r.rejected_relations == ("CALLS",)
+
+
+def test_remed_structural_relations_never_value_flow():
+    for rel in ("imports", "references", "contains", "method", "inherits", "uses"):
+        nodes = [_node("A"), _node("B", loc="L2")]
+        edges = [_edge("A", "B", rel, loc="L1")]
+        r = run_data_flow_query(nodes, edges, DataFlowQuery(
+            start="A", max_depth=2, allowed_relations=frozenset({rel})))
+        assert r.paths == (), f"{rel} must not become a value-flow step"
+        assert rel in r.rejected_relations
+
+
+# ---- P0-3: missing start/target never a complete search ----
+def test_remed_missing_start_not_complete():
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="NOPE", max_depth=3))
+    assert r.start_node_found is False
+    assert r.paths == ()
+    assert r.truncated is False
+    assert r.termination_reason == "START_NODE_NOT_FOUND"
+    assert r.input_resolution == "START_NODE_NOT_FOUND"
+    assert r.search_coverage == "UNKNOWN"
+    assert r.complete_supported_search is False
+
+
+def test_remed_present_start_missing_target_not_complete():
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", target="NOPE2", max_depth=3))
+    assert r.start_node_found is True and r.target_node_found is False
+    assert r.paths == ()
+    assert r.termination_reason == "TARGET_NODE_NOT_FOUND"
+    assert r.input_resolution == "TARGET_NODE_NOT_FOUND"
+    assert r.search_coverage == "UNKNOWN"
+    assert r.complete_supported_search is False
+
+
+def test_remed_both_missing_not_complete():
+    nodes = [_node("A")]
+    edges = []
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="NOPE", target="NOPE2", max_depth=3))
+    assert r.start_node_found is False and r.target_node_found is False
+    assert r.complete_supported_search is False
+    assert r.search_coverage == "UNKNOWN"
+
+
+# ---- P0-4: zero-depth semantics ----
+def test_remed_zero_depth_no_eligible_edge_complete():
+    nodes = [_node("A")]
+    r = run_data_flow_query(nodes, [], DataFlowQuery(start="A", max_depth=0))
+    assert r.truncated is False and r.termination_reason == "COMPLETE"
+    assert r.complete_supported_search is True  # zero-expansion complete
+
+
+def test_remed_zero_depth_with_edge_max_depth():
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=0))
+    assert r.truncated is True and r.termination_reason == "MAX_DEPTH"
+    assert r.complete_supported_search is False
+
+
+def test_remed_zero_depth_backward_with_edge_max_depth():
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(
+        start="B", direction="BACKWARD", max_depth=0))
+    assert r.truncated is True and r.termination_reason == "MAX_DEPTH"
+    assert r.complete_supported_search is False
+
+
+def test_remed_zero_depth_identity_path_defined():
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", target="A", max_depth=0))
+    # identity path is emitted and explicitly defined even at zero depth
+    assert len(r.paths) == 1 and r.paths[0].steps == ()
+
+
+# ---- P0-5: same-file degraded/partial evidence never upgraded to complete ----
+def test_remed_same_file_partial_not_complete():
+    nodes = [_node("a", "O.java"), _node("f", "O.java", "L2")]
+    edge = {
+        "source": "a", "target": "f", "relation": "FLOWS_TO",
+        "source_file": "O.java", "source_location": "L2",
+        "confidence": "EXTRACTED", "confidence_score": 0.8, "weight": 1.0,
+        "metadata": {"provenance": "STATIC_AST", "analysisCompleteness": "PARTIAL"},
+    }
+    r = run_data_flow_query(nodes, [edge], DataFlowQuery(start="a", max_depth=2))
+    assert r.paths[0].path_coverage == "PARTIAL"
+    assert r.search_coverage == "PARTIAL"
+    assert r.complete_supported_search is False
+
+
+def test_remed_same_file_degraded_score_no_completeness_metadata_partial():
+    # Same-file edge with degraded confidence_score and no explicit completeness
+    # metadata: conservative fallback must not upgrade it to complete (P0-5).
+    nodes = [_node("a", "O.java"), _node("f", "O.java", "L2")]
+    edge = {
+        "source": "a", "target": "f", "relation": "FLOWS_TO",
+        "source_file": "O.java", "source_location": "L2",
+        "confidence": "EXTRACTED", "confidence_score": 0.8, "weight": 1.0,
+        "metadata": {"provenance": "STATIC_AST"},
+    }
+    r = run_data_flow_query(nodes, [edge], DataFlowQuery(start="a", max_depth=2))
+    assert r.paths[0].path_coverage == "PARTIAL"
+
+
+def test_remed_same_file_exact_remains_complete():
+    nodes = [_node("a", "O.java"), _node("f", "O.java", "L2")]
+    edge = _edge("a", "f", "FLOWS_TO", "O.java", loc="L2")
+    r = run_data_flow_query(nodes, [edge], DataFlowQuery(start="a", max_depth=2))
+    assert r.paths[0].path_coverage == "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
+    assert r.complete_supported_search is True
+
+
+def test_remed_cross_file_partial_stays_partial():
+    nodes = [_node("a", "O.java"), _node("p", "S.java", "L1")]
+    edges = [_edge("a", "p", "PASSED_AS_ARGUMENT", "O.java", cross_file=True,
+                   completeness="PARTIAL", callee="S.calc(int)", argument_index=0)]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="a", max_depth=2))
+    assert r.paths[0].path_coverage == "PARTIAL"
+    assert r.complete_supported_search is False
+
+
+def test_remed_mixed_complete_partial_hop_stays_partial():
+    nodes = [_node("a", "O.java"), _node("b", "O.java", "L2"), _node("c", "O.java", "L3")]
+    e1 = _edge("a", "b", "FLOWS_TO", "O.java", loc="L1")  # complete
+    e2 = {
+        "source": "b", "target": "c", "relation": "FLOWS_TO",
+        "source_file": "O.java", "source_location": "L3",
+        "confidence": "EXTRACTED", "confidence_score": 0.8, "weight": 1.0,
+        "metadata": {"provenance": "STATIC_AST", "analysisCompleteness": "PARTIAL"},
+    }
+    r = run_data_flow_query(nodes, [e1, e2], DataFlowQuery(start="a", max_depth=5))
+    two_hop = [p for p in r.paths if len(p.steps) == 2]
+    assert two_hop and two_hop[0].path_coverage == "PARTIAL"
+
+
+# ---- P0-6: explored PARTIAL dead-end branch must degrade search ----
+def test_remed_explored_partial_dead_end_degrades_search():
+    # A->B (complete) -> X (PARTIAL dead end); target Z not reached.
+    nodes = [_node("A"), _node("B", loc="L2"), _node("X", loc="L3"), _node("Z", loc="L9")]
+    edges = [
+        _edge("A", "B", "FLOWS_TO", loc="L1"),
+        {
+            "source": "B", "target": "X", "relation": "FLOWS_TO",
+            "source_file": "f.java", "source_location": "L2",
+            "confidence": "EXTRACTED", "confidence_score": 0.8, "weight": 1.0,
+            "metadata": {"provenance": "STATIC_AST", "analysisCompleteness": "PARTIAL"},
+        },
+    ]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", target="Z", max_depth=5))
+    assert not any(p.steps[-1].target == "Z" for p in r.paths)
+    assert r.search_coverage == "PARTIAL"
+    assert r.complete_supported_search is False
+
+
+def test_remed_unrelated_partial_component_does_not_degrade():
+    # A->B complete; a separate unreachable component has a PARTIAL edge.
+    nodes = [_node("A", "a.java"), _node("B", "a.java", "L2"),
+             _node("U", "unrel.java"), _node("V", "unrel.java", "L2")]
+    edges = [
+        _edge("A", "B", "FLOWS_TO", "a.java", loc="L1"),
+        {
+            "source": "U", "target": "V", "relation": "FLOWS_TO",
+            "source_file": "unrel.java", "source_location": "L2",
+            "confidence": "EXTRACTED", "confidence_score": 0.8, "weight": 1.0,
+            "metadata": {"provenance": "STATIC_AST", "analysisCompleteness": "PARTIAL"},
+        },
+    ]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=2))
+    assert r.complete_supported_search is True  # unrelated PARTIAL not reached
+    assert r.encountered_partial_evidence is False
+
+
+def test_remed_exact_path_plus_explored_partial_branch_coexists():
+    # A->B exact; A->C->X explored PARTIAL branch; target B reached exactly.
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3"), _node("X", loc="L4")]
+    edges = [
+        _edge("A", "B", "FLOWS_TO", loc="L1"),
+        _edge("A", "C", "FLOWS_TO", loc="L1"),
+        {
+            "source": "C", "target": "X", "relation": "FLOWS_TO",
+            "source_file": "f.java", "source_location": "L3",
+            "confidence": "EXTRACTED", "confidence_score": 0.8, "weight": 1.0,
+            "metadata": {"provenance": "STATIC_AST", "analysisCompleteness": "PARTIAL"},
+        },
+    ]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=5))
+    assert any(p.steps[-1].target == "B" for p in r.paths)
+    assert any(p.path_exactness == "EXACT_FOR_RETURNED_PATH" for p in r.paths)
+    assert r.search_coverage == "PARTIAL"  # exact path coexists with partial search
+    assert r.complete_supported_search is False
+
+
+def test_remed_explored_partial_dead_end_backward_degrades_search():
+    # Backward from X through a partial branch.
+    nodes = [_node("A"), _node("B", loc="L2"), _node("X", loc="L3")]
+    edges = [
+        _edge("A", "B", "FLOWS_TO", loc="L1"),
+        {
+            "source": "B", "target": "X", "relation": "FLOWS_TO",
+            "source_file": "f.java", "source_location": "L2",
+            "confidence": "EXTRACTED", "confidence_score": 0.8, "weight": 1.0,
+            "metadata": {"provenance": "STATIC_AST", "analysisCompleteness": "PARTIAL"},
+        },
+    ]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="X", direction="BACKWARD", max_depth=5))
+    assert r.search_coverage == "PARTIAL"
+    assert r.complete_supported_search is False
+
+
+# ---- P0-7: boundary-event portability + stable evidence dependency ----
+def test_remed_boundary_event_has_stable_evidence_dependency():
+    nodes = [_node("v", "User.java", "L4"), _node("x", "Other.java", "L1")]
+    edges = [_edge("v", "x", "FLOWS_TO", "User.java", loc="L4")]
+    diag = _diag("AMBIGUOUS", "User.java", "L4:C10", "wildcard_import_ambiguous")
+    r = run_data_flow_query(nodes + [diag], edges, DataFlowQuery(start="v", max_depth=5))
+    assert len(r.boundary_events) == 1
+    ev = r.boundary_events[0]
+    assert ev["boundary_evidence_key"].startswith("bnd:")
+    assert ev["diagnostic_evidence_key"].startswith("diag:")
+    assert ev["diagnostic_node_id"]
+    assert ev["canonical_caller_file"] == "User.java"
+    assert ev["resolution"] == "AMBIGUOUS"
+
+
+def test_remed_boundary_event_checkout_root_portable():
+    # Same diagnostic surfaced from two checkout roots must produce identical
+    # boundary-event identity (no absolute checkout path leaks).
+    nodes = [_node("v", "User.java", "L4"), _node("x", "Other.java", "L1")]
+    edges = [_edge("v", "x", "FLOWS_TO", "User.java", loc="L4")]
+    results = []
+    for root in ("/rootA/project", "/rootB/project"):
+        diag = {
+            # Real Gate 2 diagnostic node ids derive from the file stem (not the
+            # absolute checkout path), so the node id is root-independent here.
+            "id": "diag_cross_file_data_flow_go_1_L4_C10",
+            "type": "extraction_diagnostic", "source_file": "User.java",
+            "source_location": "L4:C10",
+            "metadata": {
+                "kind": "cross_file_resolution", "resolution": "AMBIGUOUS",
+                "reason": "wildcard_import_ambiguous", "callerFile": f"{root}/User.java",
+                "callerLocation": "L4:C10", "method": "go", "arity": 1,
+                "receiver": "R", "receiverFqn": "pkg.R", "importContext": "wildcard",
+                "candidateCount": 2,
+            },
+        }
+        r = run_data_flow_query(nodes + [diag], edges, DataFlowQuery(start="v", max_depth=5))
+        results.append(r)
+    a, b = results
+    assert a.boundary_events[0] == b.boundary_events[0]
+    assert a.boundary_events[0]["diagnostic_node_id"] == b.boundary_events[0]["diagnostic_node_id"]
+    # no absolute checkout root leaks into the public GVR-facing identity
+    blob = json.dumps(a.boundary_events[0])
+    assert "/rootA/" not in blob and "/rootB/" not in blob
+
+
+# ---- P1-1: MAX_PATHS means an actual cutoff ----
+def test_remed_exactly_at_max_paths_complete():
+    # A->B, A->B->C = exactly 2 paths, cap 2 => COMPLETE (not truncated).
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3")]
+    edges = [_edge("A", "B", "FLOWS_TO", loc="L1"), _edge("B", "C", "FLOWS_TO", loc="L2")]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=5, max_paths=2))
+    assert r.termination_reason == "COMPLETE"
+    assert r.truncated is False
+    assert len(r.paths) == 2
+
+
+def test_remed_one_over_max_paths_truncated():
+    nodes = [_node("A")] + [_node(f"B{i}", loc=f"L{i}") for i in range(4)]
+    edges = [_edge("A", f"B{i}", "FLOWS_TO", loc="L1") for i in range(4)]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=1, max_paths=3))
+    assert r.termination_reason == "MAX_PATHS"
+    assert r.truncated is True
+    assert len(r.paths) == 3
+
+
+def test_remed_max_paths_deterministic_under_input_order():
+    nodes = [_node("A")] + [_node(f"B{i}", loc=f"L{i}") for i in range(4)]
+    edges = [_edge("A", f"B{i}", "FLOWS_TO", loc="L1") for i in range(4)]
+    base = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=1, max_paths=3))
+    sedges = list(edges)
+    random.Random(1).shuffle(sedges)
+    shuffled = run_data_flow_query(nodes, sedges, DataFlowQuery(start="A", max_depth=1, max_paths=3))
+    assert [p.path_identity for p in base.paths] == [p.path_identity for p in shuffled.paths]
+    assert base.termination_reason == shuffled.termination_reason == "MAX_PATHS"
+
+
+# ---- P1-2: validate direction and bounds at runtime ----
+def test_remed_invalid_direction_rejected():
+    import pytest as _pt
+    # Intentionally passes an invalid runtime value that the Literal type would
+    # normally forbid; the module must reject it at runtime (P1-2).
+    with _pt.raises(ValueError):
+        run_data_flow_query([_node("A")], [], DataFlowQuery(start="A", direction="SIDEWAYS"))  # type: ignore[arg-type]
+
+
+def test_remed_invalid_negative_depth_rejected():
+    import pytest as _pt
+    with _pt.raises(ValueError):
+        run_data_flow_query([_node("A")], [], DataFlowQuery(start="A", max_depth=-1))
+
+
+def test_remed_invalid_zero_max_paths_rejected():
+    import pytest as _pt
+    with _pt.raises(ValueError):
+        run_data_flow_query([_node("A")], [], DataFlowQuery(start="A", max_paths=0))
+
+
+def test_remed_invalid_zero_max_expansions_rejected():
+    import pytest as _pt
+    with _pt.raises(ValueError):
+        run_data_flow_query([_node("A")], [], DataFlowQuery(start="A", max_expansions=0))
+
+
+# ---- Shuffled order + parallel evidence-distinct (section 12 items 19-20) ----
+def test_remed_shuffled_node_edge_order_stable():
+    nodes = [_node("A"), _node("B", loc="L2"), _node("C", loc="L3"), _node("D", loc="L4")]
+    edges = [
+        _edge("A", "B", "FLOWS_TO", loc="L1"),
+        _edge("B", "C", "FLOWS_TO", loc="L2"),
+        _edge("A", "D", "FLOWS_TO", loc="L1"),
+        _edge("C", "D", "FLOWS_TO", loc="L3"),
+    ]
+    base = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=5))
+    for seed in range(5):
+        sedges = list(edges)
+        random.Random(seed).shuffle(sedges)
+        got = run_data_flow_query(list(reversed(nodes)), sedges, DataFlowQuery(start="A", max_depth=5))
+        assert [p.path_identity for p in base.paths] == [p.path_identity for p in got.paths]
+
+
+def test_remed_parallel_evidence_distinct_edges_stay_distinct():
+    nodes = [_node("A"), _node("B", loc="L2")]
+    edges = [
+        _edge("A", "B", "READ_FROM", loc="L1"),
+        _edge("A", "B", "FLOWS_TO", loc="L1"),
+        _edge("A", "B", "WRITTEN_TO", loc="L1"),
+    ]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=2))
+    assert len(r.paths) == 3
+    assert len({p.path_identity for p in r.paths}) == 3
+
+
+def test_remed_explored_may_surfaced():
+    nodes = [_node("a", "O.java"), _node("p", "S.java", "L1")]
+    edges = [_edge("a", "p", "PASSED_AS_ARGUMENT", "O.java", cross_file=True,
+                   receiver_conf="MAY", callee="S.calc(int)", argument_index=0)]
+    r = run_data_flow_query(nodes, edges, DataFlowQuery(start="a", max_depth=2))
+    assert r.encountered_may_evidence is True

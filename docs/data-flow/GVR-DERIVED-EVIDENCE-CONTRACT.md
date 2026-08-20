@@ -151,3 +151,112 @@ three independent-looking paths => definite truth   forbidden
 
 Multiple paths are multiple evidence alternatives; whether they strengthen a
 claim is a later verifier/policy decision, not a traversal decision.
+
+## 11. Supervising-review remediation contract (task 05)
+
+The following semantics are part of the public contract and are enforced by
+`graphify/data_flow_query.py`.
+
+### Query validity (P1-2)
+
+Invalid direction (`direction not in {FORWARD, BACKWARD}`), negative
+`max_depth`, `max_paths < 1`, or `max_expansions < 1` are rejected
+deterministically with `ValueError` before any traversal. There is no silent
+normalization and no contradictory behavior.
+
+### Effective relation allowlist (P0-2)
+
+The caller's `allowed_relations` is intersected with the supported value-flow
+vocabulary `SUPPORTED_DATA_FLOW_RELATIONS` = `DEFAULT_DATA_FLOW_RELATIONS`. The
+effective allowlist drives adjacency. Unsupported requested relations (e.g.
+`CALLS`, `imports`, `references`, `contains`, `method`, `inherits`, `uses`)
+are exposed in `query_bounds["rejected_relations"]` and `rejected_relations` and
+can never become value-flow steps, regardless of what a caller requests.
+
+### Same-file and cross-file receiver confidence (P0-1)
+
+Receiver confidence is derived from the direct evidence itself, never from
+`cross_file == false`. An explicit `metadata.receiverConfidence` is preserved for
+both same-file and cross-file edges. When it is absent, receiver-oriented
+relations (`READ_FROM`, `WRITTEN_TO`, `PASSED_AS_ARGUMENT`) default to `MAY`
+(fail closed: identity cannot be proven from the evidence); non-receiver
+relations (`FLOWS_TO`, `RETURNED_AS`, `TRANSFORMED_BY`) default to `PROVEN` (no
+receiver to prove). Any `MAY` step forces `path_receiver_confidence == MAY`.
+`confidence_score` is never numerically reinterpreted into `PROVEN`.
+
+### Same-file incomplete evidence (P0-5)
+
+Completeness is distinct from confidence. Gate 2 emits an explicit
+`analysisCompleteness` for same-file edges (parse-incomplete -> `PARTIAL`,
+otherwise `COMPLETE_FOR_SUPPORTED_CONSTRUCT`), mirroring the cross-file
+representation. Gate 3 preserves an explicit `analysisCompleteness` for both
+same-file and cross-file edges. When completeness metadata is absent (e.g.
+hand-authored fixtures), a conservative fallback applies: a direct fact with
+`confidence_score < 1.0` is treated as `PARTIAL` (never upgraded to complete);
+a full-trust edge is treated as `COMPLETE_FOR_SUPPORTED_CONSTRUCT`. Any
+`PARTIAL` step makes `path_coverage == PARTIAL` and degrades search coverage.
+
+### Explored-region vs returned-path search coverage (P0-6)
+
+Epistemic state is tracked over the **explored search region**, not only over
+returned target paths. `encountered_partial_evidence`,
+`encountered_unknown_evidence`, and `encountered_may_evidence` are surfaced on
+the result. An explored `PARTIAL`/`UNKNOWN` dead-end branch degrades
+`search_coverage` to `PARTIAL` even when it produces no returned path. A
+`PARTIAL` edge in an unrelated, unreachable component never degrades search
+(because it is never consumed). An exact returned path may coexist with
+`search_coverage == PARTIAL`.
+
+### Missing start / target semantics (P0-3)
+
+When the start node is absent, the traversal does not run and the result is:
+`paths == ()`, `complete_supported_search == False`, `search_coverage == UNKNOWN`,
+`termination_reason == START_NODE_NOT_FOUND`, `input_resolution == START_NODE_NOT_FOUND`.
+For a point-to-point query with a present start but a missing target, the target
+search is treated as unresolved/incomplete (never as proof of no path):
+`termination_reason == TARGET_NODE_NOT_FOUND`, `input_resolution == TARGET_NODE_NOT_FOUND`,
+`complete_supported_search == False`. Neither case is ordinary truncation and
+neither can be reported as a complete search.
+
+### Zero-depth semantics (P0-4)
+
+`max_depth == 0` never traverses. If at least one eligible edge exists in the
+selected direction from the start, the result is truncated/incomplete with
+`termination_reason == MAX_DEPTH` (machine-visible cutoff before examining
+reachable flow). If no eligible edge exists, a zero-expansion search may be
+complete. The start == target identity path is emitted and explicitly defined
+at any depth, including zero. The rule is symmetric for backward traversal.
+
+### Boundary evidence identity and portability (P0-7)
+
+Boundary events are first-class evidence references, not prose metadata blobs.
+Each exposes: `boundary_evidence_key` (deterministic, checkout-root independent,
+derived only from canonical public evidence fields), `diagnostic_node_id` and
+`diagnostic_evidence_key` (stable reference to the underlying diagnostic node),
+`canonical_caller_file` (repo-relative node `source_file`, never the absolute
+extractor path), `caller_location`, `resolution`, `reason`, `receiver`,
+`receiver_fqn`, `receiver_confidence`, `method`, `arity`, `import_context`,
+`candidate_count`. No absolute checkout root participates in the public
+GVR-facing boundary identity. The boundary evidence key deliberately excludes
+the diagnostic node id (its stability across a Graphify remap is not guaranteed);
+the node id is surfaced separately as a reference.
+
+### Formal criterion for `complete_supported_search`
+
+`complete_supported_search == True` is allowed **only if all** of the following
+hold (and is otherwise `False`):
+
+```text
+input_resolution == RESOLVED
+query_validity == True
+not truncated
+no blocking boundary in the explored/relevant search region
+no PARTIAL evidence encountered in the explored region
+no UNKNOWN evidence encountered in the explored region
+search_coverage == COMPLETE_FOR_SUPPORTED_CONSTRUCT
+```
+
+An exact returned path does not imply a complete search. A complete search does
+not imply whole-program completeness. `MAX_PATHS` is reported only when the cap
+prevented emitting an additional candidate path (unexplored frontier remained),
+never merely when `len(paths) == cap`.
