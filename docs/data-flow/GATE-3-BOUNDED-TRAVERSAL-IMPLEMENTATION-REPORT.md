@@ -13,7 +13,7 @@ evidence). Ready for supervising review. **STOP FOR SUPERVISING REVIEW.**
 - Gate 2B implementation/remediation: `53afba492040bbe61b45632eb3617e98bd4b2c7e`
 - Target branch: `feature/java-bounded-data-flow-traversal-v8`
 - Starting SHA (branch base): `c6b56a761039f813fe12fbbcddcc7925dc9ee214`
-- Final SHA: `[FINAL_SHA]` (set at commit time)
+- Final SHA: `13d503052f3e5e33de55d8e20dcd82b5c7f83a6c`
 - `upstream/v8` HEAD: `b14b52e94ec3d9840413d81777f4c134eac0a40d` (unchanged)
 - Merge-base with `upstream/v8`: `b14b52e94ec3d9840413d81777f4c134eac0a40d`
 - ahead / behind vs `upstream/v8`: 37 ahead / 0 behind
