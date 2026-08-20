@@ -321,7 +321,7 @@ defect, root cause, changed files, correction, regression tests, adversarial
 falsification, and result. All issues resolved on the existing Gate 3 feature
 branch; nothing pushed to `v8`/`main`/`master`; no Gate 4 work begun.
 
-Final remediation HEAD (recorded at completion): `TBD_RECORD_AFTER_COMMIT`
+Final remediation HEAD (recorded at completion): `5f99db5a35c26786c47a4120a41b2bd30a4c9d13`
 
 ### P0-1 — Same-file `receiverConfidence=MAY` laundered to `PROVEN`
 
