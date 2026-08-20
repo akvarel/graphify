@@ -21,6 +21,12 @@ from .core import (
     verify,
 )
 from .counterexamples import Counterexample, counterexamples
+from .text import (
+    TextSearchAssertion,
+    TextSearchResult,
+    TextSearchVerifier,
+    evaluate_text_search,
+)
 
 __all__ = [
     "Action",
@@ -30,6 +36,9 @@ __all__ = [
     "IndeterminateValue",
     "Predicate",
     "Proposal",
+    "TextSearchAssertion",
+    "TextSearchResult",
+    "TextSearchVerifier",
     "VerificationContext",
     "VerificationIssue",
     "VerificationReport",
@@ -37,5 +46,6 @@ __all__ = [
     "VerifierRegistry",
     "counterexamples",
     "default_registry",
+    "evaluate_text_search",
     "verify",
 ]
