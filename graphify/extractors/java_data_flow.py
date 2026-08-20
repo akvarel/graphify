@@ -26,6 +26,10 @@ _SPRING_DATA_CONTRACTS = frozenset({
     "org.springframework.data.repository.CrudRepository",
     "org.springframework.data.jpa.repository.JpaRepository",
 })
+_PERSISTENCE_CALL_NAMES = frozenset({
+    "save", "findById", "delete", "deleteById",
+    "persist", "merge", "find", "remove",
+})
 
 
 def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]:
@@ -252,6 +256,12 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             return None, "UNRESOLVED"
         cls = cls.split("<", 1)[0].strip()
         simple = cls.rsplit(".", 1)[-1]
+        # A source-declared class in this file is stronger identity evidence than
+        # an import with the same simple name. This also fails closed for
+        # semantically invalid/conflicting sources instead of laundering a custom
+        # `EntityManager` into the JPA framework contract.
+        if cls in classes:
+            return (f"{java_package}.{cls}" if java_package else cls), "EXACT"
         if cls in java_imports:
             return java_imports[cls], "EXACT"
         # JDK builtin/primitive receiver: the analyzer knows this is not an
@@ -908,14 +918,14 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
 
     def _record_persistence_call(call_node, target_cls: str | None, name: str,
                                  method, cls: str, locals_map, obj) -> None:
-        """Record a save/findById candidate; global Java resolution proves it."""
-        if name not in {"save", "findById"} or obj is None or not target_cls:
+        """Record a persistence-looking call; global Java resolution proves it."""
+        if name not in _PERSISTENCE_CALL_NAMES or obj is None:
             return
         if call_node in persistence_by_call:
             return
-        receiver_fqn, receiver_resolution = _receiver_fqn(target_cls)
+        receiver_fqn, receiver_resolution = _receiver_fqn(target_cls or "")
         receiver_path, receiver_confidence = receiver_identity(obj, method, cls, locals_map)
-        base = target_cls.split("<", 1)[0].strip()
+        base = (target_cls or "").split("<", 1)[0].strip()
         if "." in base:
             import_context = "qualified"
         elif base in java_imports:
@@ -930,7 +940,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             "file": str_path,
             "package": java_package,
             "location": f"{loc(call_node)}:{span(call_node)}",
-            "receiver": target_cls,
+            "receiver": target_cls or "",
             "receiverPath": receiver_path,
             "receiverFqn": receiver_fqn,
             "receiverResolution": receiver_resolution,
@@ -940,6 +950,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             "operation": name,
             "argCount": len(args_of(call_node)),
             "argValues": [],
+            "argClassLiterals": [],
             "returnSink": None,
             "returnSinkKind": None,
             "analysisCompleteness": (
@@ -950,6 +961,11 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             value_id = expr_value(argument, method, cls, locals_map)
             if value_id:
                 rec["argValues"].append({"index": index, "value": value_id})
+            if argument.type == "class_literal":
+                literal_type = next((child for child in argument.children if child.is_named), None)
+                raw_type = _read_text(literal_type, source).strip() if literal_type is not None else ""
+                if raw_type:
+                    rec["argClassLiterals"].append({"index": index, "rawType": raw_type})
         persistence_by_call[call_node] = rec
         persistence_calls.append(rec)
 

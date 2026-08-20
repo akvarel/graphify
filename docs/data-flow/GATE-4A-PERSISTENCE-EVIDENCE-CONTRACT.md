@@ -169,3 +169,19 @@ PARTIAL; blocking persistence diagnostics prevent unsafe completeness claims in
 the relevant reached caller file. Gate 3 relation allowlist, evidence-key,
 termination/accounting, and `complete_supported_search` invariants remain
 unchanged.
+
+## Gate 4B extension
+
+Gate 4B preserves this Gate 4A baseline and extends the same
+`persistence_boundary` machinery with:
+
+- exact jakarta/javax `EntityManager.persist`, `merge`, `find` and `remove`;
+- exact direct Spring Data `delete` and `deleteById`;
+- `boundaryKind=PERSISTENCE_DELETE` and explicit
+  `persistenceDirection=READ|WRITE|DELETE`;
+- normalized `operationKind` metadata;
+- framework identity in portable Gate 3 persistence diagnostic evidence keys.
+
+Gate 4B does not change entity/attribute mapping or add physical lineage. The
+full extension contract and unsupported matrix are defined in
+`GATE-4B-PERSISTENCE-EVIDENCE-CONTRACT.md`.

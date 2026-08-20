@@ -3109,6 +3109,14 @@ _SPRING_DATA_PERSISTENCE_CONTRACTS = frozenset({
     "org.springframework.data.repository.CrudRepository",
     "org.springframework.data.jpa.repository.JpaRepository",
 })
+_JPA_ENTITY_MANAGER_CONTRACTS = frozenset({
+    "jakarta.persistence.EntityManager",
+    "javax.persistence.EntityManager",
+})
+_JAVA_LANG_REFERENCE_TYPES = frozenset({
+    "Boolean", "Byte", "Character", "Class", "Double", "Float", "Integer",
+    "Long", "Number", "Object", "Short", "String", "Void",
+})
 
 
 def _resolve_java_persistence_records(
@@ -3116,13 +3124,14 @@ def _resolve_java_persistence_records(
     all_nodes: list[dict],
     all_edges: list[dict],
 ) -> dict[str, int]:
-    """Resolve Gate 4A entity/repository/call records inside the Java resolver.
+    """Resolve Gate 4A/4B entity/repository/call records inside the Java resolver.
 
     Records are emitted by ``augment_java_data_flow`` from the same parse used by
     Java value-flow extraction. This function performs only deterministic
     repository-wide identity matching; it is invoked by the existing Java
     resolver before canonical ID remapping. Positive boundary evidence requires
-    an exact supported Spring Data contract and an exact entity identity.
+    an exact supported Spring Data or EntityManager contract and exact entity
+    identity where the operation requires one.
     """
     entity_records: list[dict[str, Any]] = []
     repository_records: list[dict[str, Any]] = []
@@ -3150,6 +3159,18 @@ def _resolve_java_persistence_records(
          edge.get("source_location"))
         for edge in all_edges
     }
+
+    def declared_type_fqn(raw_type: str, imports: dict[str, Any], package: str) -> str:
+        cleaned = raw_type.strip().split("<", 1)[0].strip().replace("[]", "")
+        if not cleaned:
+            return ""
+        if "." in cleaned:
+            return cleaned
+        if cleaned in imports:
+            return str(imports[cleaned])
+        if cleaned in _JAVA_LANG_REFERENCE_TYPES:
+            return f"java.lang.{cleaned}"
+        return f"{package}.{cleaned}" if package else cleaned
 
     def enrich(node_id: str | None, metadata: dict[str, Any]) -> None:
         if not node_id:
@@ -3196,8 +3217,14 @@ def _resolve_java_persistence_records(
                 "receiver": rec.get("receiver") or "",
                 "receiverFqn": rec.get("receiverFqn") or "",
                 "receiverConfidence": rec.get("receiverConfidence") or "MAY",
-                "repositoryFqn": rec.get("repositoryFqn") or rec.get("receiverFqn") or "",
+                "framework": rec.get("framework") or "",
+                "repositoryFqn": (
+                    rec.get("repositoryFqn")
+                    or (rec.get("receiverFqn") if rec.get("framework") == "SPRING_DATA" else "")
+                    or ""
+                ),
                 "entityFqn": rec.get("entityFqn") or "",
+                "repositoryIdTypeFqn": rec.get("repositoryIdTypeFqn") or "",
                 "method": operation,
                 "arity": int(rec.get("argCount") or 0),
                 "importContext": rec.get("importContext") or "unknown",
@@ -3262,6 +3289,12 @@ def _resolve_java_persistence_records(
             "entityFqn": entity_fqn,
             "entityResolution": final_resolution,
             "entity": entity,
+            "idTypeRaw": str(generic_args[1]).strip() if len(generic_args) > 1 else "",
+            "idTypeFqn": declared_type_fqn(
+                str(generic_args[1]).strip() if len(generic_args) > 1 else "",
+                imports,
+                str(repository.get("package") or ""),
+            ),
         }
         repository_fqn = str(repository.get("repositoryFqn") or "")
         resolved_repositories.setdefault(repository_fqn, []).append(resolved)
@@ -3281,6 +3314,7 @@ def _resolve_java_persistence_records(
             "framework": "SPRING_DATA",
             "repositoryFqn": repository_fqn,
             "repositoryContractFqn": parent.get("baseFqn"),
+            "repositoryIdTypeFqn": resolved.get("idTypeFqn") or "",
             "entityFqn": entity_fqn,
             "entityResolution": "EXACT",
             "analysisCompleteness": (
@@ -3320,9 +3354,10 @@ def _resolve_java_persistence_records(
                 "provenance": "FRAMEWORK_CONTRACT",
                 "sourceProvenance": "STATIC_AST",
                 "boundaryKind": boundary["boundaryKind"],
-                "framework": "SPRING_DATA",
+                "framework": boundary["framework"],
                 "operation": rec.get("operation"),
-                "repositoryFqn": boundary["repositoryFqn"],
+                "receiverFqn": boundary.get("receiverFqn") or "",
+                "repositoryFqn": boundary.get("repositoryFqn") or "",
                 "entityFqn": boundary["entityFqn"],
                 "receiver": rec.get("receiverPath") or rec.get("receiver") or "",
                 "receiverConfidence": receiver_confidence,
@@ -3340,68 +3375,46 @@ def _resolve_java_persistence_records(
         if current is None or (call.get("returnSink") and not current.get("returnSink")):
             best_calls[key] = call
 
-    for call in best_calls.values():
+    def argument_value(call: dict[str, Any], index: int) -> str | None:
+        return next((entry.get("value") for entry in call.get("argValues") or []
+                     if entry.get("index") == index), None)
+
+    def resolve_entity_type(
+        raw_type: str, call: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, str, str, list[str]]:
+        """Resolve a source type to one exact supported JPA entity, fail closed."""
+        cleaned = raw_type.strip().split("<", 1)[0].strip().replace("[]", "")
+        imports = call.get("imports") or {}
+        package = str(call.get("package") or "")
+        if not cleaned:
+            return None, "UNRESOLVED", "", []
+        if "." in cleaned:
+            entity_fqn = cleaned
+        elif cleaned in imports:
+            entity_fqn = str(imports[cleaned])
+        else:
+            entity_fqn = f"{package}.{cleaned}" if package else cleaned
+        matches = entities_by_fqn.get(entity_fqn, [])
+        if len(matches) == 1:
+            return matches[0], "EXACT", entity_fqn, [entity_fqn]
+        if len(matches) > 1:
+            return None, "AMBIGUOUS", entity_fqn, [entity_fqn] * len(matches)
+        simple = cleaned.rsplit(".", 1)[-1]
+        candidates = sorted(str(entity.get("entityFqn") or "")
+                            for entity in entities_by_simple.get(simple, []))
+        resolution = "AMBIGUOUS" if len(candidates) > 1 else "UNRESOLVED"
+        return None, resolution, entity_fqn, candidates
+
+    def entity_for_value(
+        call: dict[str, Any], value_id: str | None
+    ) -> tuple[dict[str, Any] | None, str, str, list[str]]:
+        value_node = node_by_id.get(str(value_id or ""))
+        raw_type = str((value_node or {}).get("metadata", {}).get("java_type") or "")
+        return resolve_entity_type(raw_type, call)
+
+    def suppress_exact_framework_diagnostic(call: dict[str, Any]) -> None:
+        """Suppress only the generic unresolved-callee event for this exact call."""
         operation = str(call.get("operation") or "")
-        if operation not in {"save", "findById"}:
-            continue
-        receiver_resolution = str(call.get("receiverResolution") or "UNRESOLVED")
-        receiver_fqn = str(call.get("receiverFqn") or "")
-        receiver_simple = str(call.get("receiver") or "").split("<", 1)[0].rsplit(".", 1)[-1]
-        if receiver_resolution != "EXACT":
-            candidates = repositories_by_simple.get(receiver_simple, [])
-            if candidates:
-                emit_diagnostic(call, receiver_resolution, "repository_receiver_unresolved",
-                                len(candidates), sorted(c.get("repositoryFqn") or "" for c in candidates))
-            continue
-        repositories = resolved_repositories.get(receiver_fqn, [])
-        if not repositories:
-            continue  # random save/findById method: no persistence semantics
-        if len(repositories) != 1:
-            emit_diagnostic(call, "AMBIGUOUS", "repository_identity_ambiguous",
-                            len(repositories))
-            continue
-        repository = repositories[0]
-        entity = repository.get("entity")
-        if repository.get("entityResolution") != "EXACT" or entity is None:
-            emit_diagnostic(
-                {**call, "repositoryFqn": receiver_fqn,
-                 "entityFqn": repository.get("entityFqn") or ""},
-                str(repository.get("entityResolution") or "UNRESOLVED"),
-                "repository_entity_not_exact",
-            )
-            continue
-        if int(call.get("argCount") or 0) != 1:
-            emit_diagnostic(call, "UNSUPPORTED", "unsupported_persistence_operation_signature")
-            continue
-
-        arg0 = next((entry.get("value") for entry in call.get("argValues") or []
-                     if entry.get("index") == 0), None)
-        if operation == "save":
-            argument_node = node_by_id.get(str(arg0 or ""))
-            argument_type = str((argument_node or {}).get("metadata", {}).get("java_type") or "")
-            imports = call.get("imports") or {}
-            if "." in argument_type:
-                argument_fqn = argument_type
-            elif argument_type in imports:
-                argument_fqn = str(imports[argument_type])
-            else:
-                package = str(call.get("package") or "")
-                argument_fqn = f"{package}.{argument_type}" if package and argument_type else argument_type
-            if not arg0 or not argument_type:
-                emit_diagnostic(call, "UNRESOLVED", "save_argument_value_or_type_unresolved")
-                continue
-            if argument_fqn != entity.get("entityFqn"):
-                emit_diagnostic(
-                    {**call, "entityFqn": entity.get("entityFqn") or ""},
-                    "UNSUPPORTED", "save_argument_entity_type_mismatch",
-                )
-                continue
-
-        # The generic cross-file pass cannot resolve Spring Data's inherited
-        # framework methods because no source callee declaration exists. Once the
-        # supported repository contract is proven here, its earlier
-        # `callee_unresolved` diagnostic is superseded by the exact framework
-        # boundary and must not falsely degrade Gate 3 search completeness.
         all_nodes[:] = [
             node for node in all_nodes
             if not (
@@ -3413,17 +3426,25 @@ def _resolve_java_persistence_records(
             )
         ]
 
+    def emit_boundary(
+        call: dict[str, Any], entity: dict[str, Any], *, framework: str,
+        boundary_kind: str, direction: str,
+        repository: dict[str, Any] | None = None,
+        inputs: list[str | None] | None = None,
+        output: str | None = None,
+    ) -> None:
+        nonlocal emitted_boundaries
+        operation = str(call.get("operation") or "")
+        suppress_exact_framework_diagnostic(call)
         completeness = "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
         if (
             call.get("analysisCompleteness") == "PARTIAL"
-            or repository.get("analysisCompleteness") == "PARTIAL"
+            or (repository or {}).get("analysisCompleteness") == "PARTIAL"
             or entity.get("analysisCompleteness") == "PARTIAL"
             or entity.get("accessStrategy") != "FIELD"
         ):
             completeness = "PARTIAL"
-        if entity.get("accessStrategy") != "FIELD":
-            mapping_completeness = "PARTIAL"
-        elif entity.get("tableMapping") == "UNKNOWN":
+        if entity.get("accessStrategy") != "FIELD" or entity.get("tableMapping") == "UNKNOWN":
             mapping_completeness = "PARTIAL"
         elif entity.get("tableMapping") == "EXPLICIT":
             mapping_completeness = "EXPLICIT"
@@ -3435,16 +3456,32 @@ def _resolve_java_persistence_records(
         stem = _file_stem(Path(source_file)) if source_file else "unknown"
         loc_slug = re.sub(r"[^A-Za-z0-9]", "_", location)[:48]
         boundary_id = _make_id(stem, "persistence_boundary", operation, loc_slug)
-        boundary_kind = "PERSISTENCE_WRITE" if operation == "save" else "PERSISTENCE_READ"
+        receiver_fqn = str(call.get("receiverFqn") or "")
+        repository_fqn = str((repository or {}).get("repositoryFqn") or "")
+        contract_fqn = (
+            (repository or {}).get("contractFqn")
+            if framework == "SPRING_DATA" else receiver_fqn
+        )
+        operation_kind = {
+            "save": "SAVE", "findById": "FIND_BY_ID",
+            "delete": "DELETE", "deleteById": "DELETE_BY_ID",
+            "persist": "PERSIST", "merge": "MERGE",
+            "find": "FIND", "remove": "REMOVE",
+        }.get(operation, operation.upper())
         boundary_metadata: dict[str, Any] = {
             "language": "java",
             "capability": "persistence_boundary",
             "kind": "persistence_boundary",
             "boundaryKind": boundary_kind,
-            "framework": "SPRING_DATA",
+            "persistenceDirection": direction,
+            "framework": framework,
+            "frameworkContractFqn": contract_fqn,
             "operation": operation,
-            "repositoryFqn": receiver_fqn,
-            "repositoryContractFqn": repository.get("contractFqn"),
+            "operationKind": operation_kind,
+            "receiverFqn": receiver_fqn,
+            "repositoryFqn": repository_fqn,
+            "repositoryContractFqn": (repository or {}).get("contractFqn") or "",
+            "repositoryIdTypeFqn": (repository or {}).get("idTypeFqn") or "",
             "entityFqn": entity.get("entityFqn"),
             "accessStrategy": entity.get("accessStrategy"),
             "mappingCompleteness": mapping_completeness,
@@ -3485,13 +3522,188 @@ def _resolve_java_persistence_records(
             emitted_boundaries += 1
         boundary = {
             "boundaryKind": boundary_kind,
-            "repositoryFqn": receiver_fqn,
+            "framework": framework,
+            "receiverFqn": receiver_fqn,
+            "repositoryFqn": repository_fqn,
             "entityFqn": entity.get("entityFqn"),
         }
+        for input_value in inputs or []:
+            push(input_value, boundary_id, call, boundary, completeness)
+        if output:
+            push(boundary_id, output, call, boundary, completeness)
+
+    for call in best_calls.values():
+        operation = str(call.get("operation") or "")
+        receiver_resolution = str(call.get("receiverResolution") or "UNRESOLVED")
+        receiver_fqn = str(call.get("receiverFqn") or "")
+        receiver_simple = str(call.get("receiver") or "").split("<", 1)[0].rsplit(".", 1)[-1]
+
+        if operation in {"persist", "merge", "find", "remove"}:
+            em_call = {**call, "framework": "JPA_ENTITY_MANAGER"}
+            if receiver_resolution != "EXACT":
+                if receiver_simple == "EntityManager" or not receiver_simple:
+                    emit_diagnostic(em_call, receiver_resolution,
+                                    "entity_manager_receiver_unresolved")
+                continue
+            if receiver_fqn not in _JPA_ENTITY_MANAGER_CONTRACTS:
+                if receiver_simple == "EntityManager" or receiver_fqn.endswith(".EntityManager"):
+                    emit_diagnostic(em_call, "UNSUPPORTED", "entity_manager_receiver_not_jpa")
+                continue
+
+            expected_arity = 2 if operation == "find" else 1
+            if int(call.get("argCount") or 0) != expected_arity:
+                emit_diagnostic(em_call, "UNSUPPORTED",
+                                "unsupported_persistence_operation_signature")
+                continue
+            if operation == "find":
+                literal = next((entry for entry in call.get("argClassLiterals") or []
+                                if entry.get("index") == 0), None)
+                if literal is None:
+                    emit_diagnostic(em_call, "UNRESOLVED", "find_entity_class_dynamic")
+                    continue
+                entity, resolution, entity_fqn, candidates = resolve_entity_type(
+                    str(literal.get("rawType") or ""), call
+                )
+                if resolution != "EXACT" or entity is None:
+                    emit_diagnostic(
+                        {**em_call, "entityFqn": entity_fqn}, resolution,
+                        "find_entity_class_ambiguous" if resolution == "AMBIGUOUS"
+                        else "find_entity_class_unresolved",
+                        len(candidates), candidates,
+                    )
+                    continue
+                emit_boundary(
+                    em_call, entity, framework="JPA_ENTITY_MANAGER",
+                    boundary_kind="PERSISTENCE_READ", direction="READ",
+                    inputs=[argument_value(call, 1)], output=call.get("returnSink"),
+                )
+                continue
+
+            arg0 = argument_value(call, 0)
+            entity, resolution, entity_fqn, candidates = entity_for_value(call, arg0)
+            if not arg0:
+                emit_diagnostic(em_call, "UNRESOLVED",
+                                f"{operation}_argument_value_or_type_unresolved")
+                continue
+            if resolution != "EXACT" or entity is None:
+                emit_diagnostic(
+                    {**em_call, "entityFqn": entity_fqn},
+                    "UNSUPPORTED" if resolution == "UNRESOLVED" and not candidates else resolution,
+                    f"{operation}_argument_not_exact_jpa_entity",
+                    len(candidates), candidates,
+                )
+                continue
+            boundary_kind = (
+                "PERSISTENCE_DELETE" if operation == "remove" else "PERSISTENCE_WRITE"
+            )
+            direction = "DELETE" if operation == "remove" else "WRITE"
+            emit_boundary(
+                em_call, entity, framework="JPA_ENTITY_MANAGER",
+                boundary_kind=boundary_kind, direction=direction,
+                inputs=[arg0], output=call.get("returnSink") if operation == "merge" else None,
+            )
+            continue
+
+        if operation not in {"save", "findById", "delete", "deleteById"}:
+            continue
+        spring_call = {**call, "framework": "SPRING_DATA"}
+        if receiver_resolution != "EXACT":
+            candidates = repositories_by_simple.get(receiver_simple, [])
+            if candidates:
+                emit_diagnostic(spring_call, receiver_resolution, "repository_receiver_unresolved",
+                                len(candidates), sorted(c.get("repositoryFqn") or "" for c in candidates))
+            continue
+        repositories = resolved_repositories.get(receiver_fqn, [])
+        if not repositories:
+            continue  # method-name lookalikes are not persistence evidence
+        if len(repositories) != 1:
+            emit_diagnostic(spring_call, "AMBIGUOUS", "repository_identity_ambiguous",
+                            len(repositories))
+            continue
+        repository = repositories[0]
+        spring_call = {
+            **spring_call,
+            "repositoryFqn": receiver_fqn,
+            "entityFqn": repository.get("entityFqn") or "",
+            "repositoryIdTypeFqn": repository.get("idTypeFqn") or "",
+        }
+        entity = repository.get("entity")
+        if repository.get("entityResolution") != "EXACT" or entity is None:
+            emit_diagnostic(
+                {**spring_call, "repositoryFqn": receiver_fqn,
+                 "entityFqn": repository.get("entityFqn") or ""},
+                str(repository.get("entityResolution") or "UNRESOLVED"),
+                "repository_entity_not_exact",
+            )
+            continue
+        if int(call.get("argCount") or 0) != 1:
+            emit_diagnostic(spring_call, "UNSUPPORTED",
+                            "unsupported_persistence_operation_signature")
+            continue
+
+        arg0 = argument_value(call, 0)
+        if operation in {"save", "delete"}:
+            argument_entity, argument_resolution, argument_fqn, candidates = entity_for_value(
+                call, arg0
+            )
+            if not arg0:
+                emit_diagnostic(spring_call, "UNRESOLVED",
+                                f"{operation}_argument_value_or_type_unresolved")
+                continue
+            if (
+                argument_resolution != "EXACT" or argument_entity is None
+                or argument_fqn != entity.get("entityFqn")
+            ):
+                emit_diagnostic(
+                    {**spring_call, "entityFqn": entity.get("entityFqn") or "",
+                     "repositoryIdTypeFqn": repository.get("idTypeFqn") or ""},
+                    "UNSUPPORTED" if argument_resolution == "UNRESOLVED" else argument_resolution,
+                    f"{operation}_argument_entity_type_mismatch",
+                    len(candidates), candidates,
+                )
+                continue
+
+        if operation == "deleteById":
+            argument_node = node_by_id.get(str(arg0 or ""))
+            argument_type = str((argument_node or {}).get("metadata", {}).get("java_type") or "")
+            argument_type_fqn = declared_type_fqn(
+                argument_type, call.get("imports") or {}, str(call.get("package") or "")
+            )
+            if not arg0 or not argument_type_fqn or not repository.get("idTypeFqn"):
+                emit_diagnostic(spring_call, "UNRESOLVED",
+                                "delete_by_id_argument_or_contract_type_unresolved")
+                continue
+            if argument_type_fqn != repository.get("idTypeFqn"):
+                emit_diagnostic(
+                    {**spring_call, "entityFqn": entity.get("entityFqn") or ""},
+                    "UNSUPPORTED", "delete_by_id_argument_type_mismatch",
+                )
+                continue
+
         if operation == "save":
-            push(arg0, boundary_id, call, boundary, completeness)
-        elif call.get("returnSink"):
-            push(boundary_id, call.get("returnSink"), call, boundary, completeness)
+            emit_boundary(
+                spring_call, entity, framework="SPRING_DATA",
+                boundary_kind="PERSISTENCE_WRITE", direction="WRITE",
+                repository=repository, inputs=[arg0],
+            )
+        elif operation == "findById":
+            emit_boundary(
+                spring_call, entity, framework="SPRING_DATA",
+                boundary_kind="PERSISTENCE_READ", direction="READ",
+                repository=repository, output=call.get("returnSink"),
+            )
+        elif operation == "delete":
+            emit_boundary(
+                spring_call, entity, framework="SPRING_DATA",
+                boundary_kind="PERSISTENCE_DELETE", direction="DELETE",
+                repository=repository, inputs=[arg0],
+            )
+        else:
+            emit_boundary(
+                spring_call, entity, framework="SPRING_DATA",
+                boundary_kind="PERSISTENCE_DELETE", direction="DELETE",
+                repository=repository, inputs=[arg0],
+            )
 
     return {
         "entities": len(entity_records),
