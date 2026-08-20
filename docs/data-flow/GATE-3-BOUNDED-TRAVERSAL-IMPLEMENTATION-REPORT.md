@@ -519,3 +519,143 @@ git diff --check                                             clean
 Full pyright baseline comparison (base `c6b56a7` vs remediation HEAD) is
 reported truthfully in the final report; the existing repository baseline is
 non-zero and is not claimed clean.
+
+
+## Gate 3B Termination + Accounting Remediation (task 06-gate3b-termination-accounting-remediation)
+
+Gate status: **CHANGES REQUIRED** -> **remediated**. Each issue lists defect,
+root cause, correction, changed files, regression tests, adversarial
+falsification, result. Remediation commit: `bc4dd03ad1e9d495d735f444f9d78d814e084916`.
+Upstream integration commit: `c6c1f5cf30cb83b533cb2f4e4f005b1ef9e71706`.
+No Gate 4 work begun; nothing pushed to `v8`/`main`/`master`.
+
+### P0-1 — `max_paths` arbitration can hide a real `MAX_DEPTH` cutoff
+
+- **Defect:** the path cap was checked immediately after `_emit` and could break
+  before depth-cutoff handling, so `A->B->C` with `max_depth=1, max_paths=1`
+  could report `COMPLETE` despite an eligible continuation beyond depth.
+- **Root cause:** termination depended on incidental statement order.
+- **Correction:** termination is now centralized. Exploration continues (bounded
+  by `max_expansions`/`max_depth`) independent of the path cap; the path cap only
+  suppresses *emission*. A depth cutoff with an eligible non-cycle continuation
+  is recorded as a fact and reported via precedence.
+- **Changed files:** `graphify/data_flow_query.py`.
+- **Regression tests:** `test_3b_depth_and_path_cap_not_false_complete`,
+  `test_3b_depth_and_path_cap_backward_symmetric`,
+  `test_3b_path_cap_alone_with_no_continuation_complete`,
+  `test_3b_depth_path_both_active_deterministic`,
+  `test_3b_depth_path_cap_shuffled_order_stable`.
+- **Result:** PASS. `max_depth × max_paths` never yields a false `COMPLETE`;
+  precedence is deterministic.
+
+### P0-2 — Point-to-point target can be falsely labeled `MAX_PATHS`
+
+- **Defect:** `more_work` could inspect outgoing edges from a reached target and
+  infer pending work, falsely truncating a complete point-to-point answer.
+- **Root cause:** target terminality was not dominating continuation logic.
+- **Correction:** once a branch reaches the target, its outgoing edges are not
+  pending query work (`continue` on `reached_target`). Alternate unexplored
+  branches that could reach the target still count toward `max_paths`.
+- **Changed files:** `graphify/data_flow_query.py`.
+- **Regression tests:** `test_3b_point_to_point_reached_target_not_pending_work`,
+  `test_3b_point_to_point_alternate_target_path_triggers_max_paths`,
+  `test_3b_point_to_point_diamond_paths2_complete`,
+  `test_3b_point_to_point_reached_target_with_cycle_no_false_truncation`,
+  `test_3b_point_to_point_backward_symmetric`.
+- **Result:** PASS. Reaching the target does not treat outgoing target edges as
+  pending work; alternate target paths still trigger `MAX_PATHS`.
+
+### P0-3 — Cycle-only continuations must not count as remaining work
+
+- **Defect:** cutoff checks used raw `adjacency.outgoing` existence, so a
+  cycle-only continuation (frontier already in the path) could create false
+  `MAX_DEPTH`/`MAX_PATHS`.
+- **Root cause:** two subtly different definitions of "can expand" in traversal
+  and termination.
+- **Correction:** all completeness/cutoff decisions use `_eligible_next`, which
+  applies the same cycle-safe rule the walker uses (frontier not in the current
+  path's visited-set).
+- **Changed files:** `graphify/data_flow_query.py`.
+- **Regression tests:** `test_3b_cycle_only_no_false_depth_cutoff`,
+  `test_3b_cycle_only_no_false_path_cap`,
+  `test_3b_one_cycle_plus_valid_continuation_detects_work`,
+  `test_3b_self_loop_only_complete_after_cycle_filter`,
+  `test_3b_cycle_filter_backward_symmetric`.
+- **Result:** PASS. Cycle-only continuations never create false cutoffs; a real
+  cycle + valid continuation still detects the valid work.
+
+### P0-4 — `visited_count` is not truthful search-region accounting
+
+- **Defect:** `visited` was updated mainly from returned-path evidence, so a
+  point-to-point query that explored edges but returned no path reported
+  `visited_count == 0`.
+- **Root cause:** accounting was coupled to path emission, not exploration.
+- **Correction:** a traversal-level `visited_reached` set records every unique
+  node actually reached/examined (start, dead-ends, non-target branches),
+  independent of emission. `visited_count = len(visited_reached)`.
+  `expanded_count` = accepted edge expansions. Both are documented.
+- **Changed files:** `graphify/data_flow_query.py`.
+- **Regression tests:** `test_3b_p2p_no_match_visited_reflects_explored_nodes`,
+  `test_3b_p2p_no_match_explored_partial_branch_visited_gt_zero`,
+  `test_3b_diamond_unique_node_count_not_path_multiplicative`,
+  `test_3b_cycle_no_double_count`,
+  `test_3b_max_expansions_cutoff_counts_only_reached`,
+  `test_3b_backward_visited_accounting`, `test_3b_identity_path_visited_one`,
+  `test_3b_missing_start_visited_zero`.
+- **Result:** PASS. `visited_count` truthfully reflects explored unique nodes;
+  p2p no-match never reports visited=0 after actual exploration.
+
+### P1-1 — Centralize termination arbitration
+
+- **Defect:** termination semantics were distributed across statement ordering.
+- **Root cause:** no single decision point for termination.
+- **Correction:** `_classify_termination(facts)` is the single classifier, fed by
+  a `facts` dict of semantic facts; precedence is explicit (input-resolution,
+  then expansion, then depth, then path cap, then COMPLETE) and documented in
+  `GVR-DERIVED-EVIDENCE-CONTRACT.md`.
+- **Changed files:** `graphify/data_flow_query.py`.
+- **Regression tests:** all Gate 3B termination tests exercise the classifier and
+  its precedence.
+- **Result:** PASS. Termination is centralized and reviewable.
+
+### P1-2 — Pairwise / interaction falsification matrix
+
+- **Defect:** bounds were tested individually; combination bugs remained.
+- **Correction:** a deliberate pairwise matrix (`target × depth`, `target ×
+  paths`, `target × expansions`, `depth × paths`, `depth × expansions`, `paths ×
+  expansions`, `cycles × depth`, `cycles × paths`, `stop_nodes × depth`,
+  `stop_nodes × paths`) with minimal graphs and single unambiguous expected
+  results, asserting paths/termination_reason/truncated/complete_supported_search/
+  visited_count/expanded_count.
+- **Changed files:** `tests/test_data_flow_traversal.py`.
+- **Regression tests:** `test_3b_matrix_*` (10 cases).
+- **Result:** PASS. Pairwise interactions are falsified.
+
+### Upstream integration (section 8)
+
+`git fetch --all --prune`; inspected the complete upstream delta
+(`b14b52e..b2cd362`, 14 commits). Changes touch C++/CLI normalization
+(`extract.py`), markdown link-index cache, `skipped` manifest handling, nested
+C++ types (`engine.py`), CLI/export/watch/LLM and tests, release 0.9.48. They do
+**not** alter Java data-flow, canonical Java IDs, Java diagnostics, or the
+public graph shape for Java. Integration via `git merge upstream/v8` auto-merged
+cleanly (shared files had non-overlapping edits); no manual conflict resolution
+was required. `upstream/v8 == b2cd36267456c166788c95be6e68574064a92a42`; after
+merge the branch is 42 ahead / 0 behind upstream/v8. Gate 2/2B regressions and
+full suite pass on the integrated state.
+
+### Validation (Gate 3B + integration)
+
+```text
+tests/test_data_flow_traversal.py                           113 passed
+tests/test_data_flow_traversal_java_integration.py           12 passed
+Gate 2/2B regression (data_flow + cross_file + gvr_boundary + fixture_suite)  68 passed
+full suite (integrated)                                      5106 passed, 51 skipped, 0 failed
+ruff                                                         pass
+pyright graphify/data_flow_query.py                          0 errors / 0 warnings
+git diff --check                                             clean
+```
+
+Global pyright baseline on the integrated state is reported truthfully in the
+final report; the existing repository baseline is non-zero and is not claimed
+clean. The changed traversal module has zero new type errors.

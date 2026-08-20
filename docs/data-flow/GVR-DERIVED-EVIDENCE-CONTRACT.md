@@ -260,3 +260,69 @@ An exact returned path does not imply a complete search. A complete search does
 not imply whole-program completeness. `MAX_PATHS` is reported only when the cap
 prevented emitting an additional candidate path (unexplored frontier remained),
 never merely when `len(paths) == cap`.
+
+
+## 12. Gate 3B Termination + Accounting Remediation (task 06)
+
+### `visited_count` semantics (P0-4)
+
+`visited_count` = number of unique graph nodes whose traversal state was actually
+reached/examined, including the start node and every explored dead-end /
+non-target branch, independent of whether a path was emitted. It is the size of a
+traversal-level reached set: the start node (when input resolves), and each
+frontier node actually entered during exploration. Duplicate visits across
+alternative paths count once. Cycle-rejected nodes already in a path do not
+inflate the unique count beyond their existing visit. A missing start produces
+`visited_count == 0`; an identity path (`start == target`) normally produces 1.
+A point-to-point no-match that explored real edges therefore reports
+`visited_count > 0`, never 0.
+
+### `expanded_count` semantics
+
+`expanded_count` = the number of accepted edge expansions, i.e. edges whose
+frontier was actually entered and pushed onto the traversal stack. Edges rejected
+by cycle safety (frontier already in the current path) are not counted. Candidate
+edges skipped because the expansion budget was exhausted are not counted either.
+The implementation and tests match this definition.
+
+### Termination precedence / arbitration (P0-1, P1-1)
+
+Termination is centralized in `_classify_termination`, derived from semantic
+facts rather than statement order. Precedence:
+
+```text
+1. input-resolution failure (missing start / missing target)  -> not truncation
+2. expansion budget exhausted while eligible work remains      -> MAX_EXPANSIONS
+3. depth cutoff with an eligible non-cycle continuation        -> MAX_DEPTH
+4. path cap prevented an additional result/work item           -> MAX_PATHS
+5. otherwise                                                   -> COMPLETE
+```
+
+`COMPLETE` is impossible whenever any known eligible frontier was suppressed by
+`max_depth`, `max_paths`, or `max_expansions`.
+
+### Target terminality vs path/depth bounds (P0-2)
+
+For a point-to-point query (`target != None`), once a path reaches the target,
+that branch is complete and its outgoing edges are **not** pending query work.
+They therefore never create a false `MAX_DEPTH`/`MAX_PATHS`. Alternate unexplored
+branches that could yield additional distinct target paths still count toward
+`max_paths` and trigger `MAX_PATHS` when the cap is reached.
+
+### Cycle-filtered frontier vs raw adjacency (P0-3)
+
+All completeness/cutoff decisions use `_eligible_next`, which returns the edges a
+frame may actually expand under the same rules the walker uses: allowed relation,
+correct direction, and frontier not already in the current path's visited-set
+(which also excludes self-loops). Raw adjacency existence is never used as a work
+proxy, so a cycle-only continuation is never mistaken for remaining work.
+
+### Final `complete_supported_search` invariant
+
+`complete_supported_search == True` requires all of:
+`input_resolution == RESOLVED`, `query_validity`, `not truncated` (no known
+eligible work suppressed by any bound), no blocking boundary in the explored
+region, no PARTIAL evidence, no UNKNOWN evidence, and
+`search_coverage == COMPLETE_FOR_SUPPORTED_CONSTRUCT`. In particular,
+`complete_supported_search == True` implies **no** known eligible traversal work
+was suppressed by `max_depth` / `max_paths` / `max_expansions`.
