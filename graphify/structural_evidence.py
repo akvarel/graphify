@@ -42,8 +42,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 __all__ = [
@@ -74,6 +76,7 @@ __all__ = [
     "StructuralEvidencePath",
     # coverage + scope
     "StructuralEvidenceCoverageState",
+    "GitSourceAuthority",
     "SourceRevisionScope",
     # snapshot
     "StructuralEvidenceSnapshot",
@@ -86,6 +89,7 @@ __all__ = [
     "structural_evidence_fingerprint",
     # builders / serializers
     "build_structural_evidence_snapshot",
+    "derive_git_source_authority",
     "serialize_snapshot",
     "load_snapshot",
     "validate_snapshot",
@@ -125,6 +129,9 @@ SOURCE_REVISION_RE: re.Pattern[str] = re.compile(r"[0-9a-f]{40,64}")
 
 class StructuralEvidenceContractError(ValueError):
     """Raised when structural-evidence content cannot be canonically sealed."""
+
+
+_SOURCE_AUTHORITY_TOKEN = object()
 
 
 # --------------------------------------------------------------------------- #
@@ -621,6 +628,95 @@ class StructuralEvidenceCoverageState:
 # --------------------------------------------------------------------------- #
 # Source revision scope (checkout-root independent identity)
 # --------------------------------------------------------------------------- #
+@dataclass(frozen=True, init=False)
+class GitSourceAuthority:
+    """Captured authority for one clean local Git source materialization.
+
+    Instances can only be created by :func:`derive_git_source_authority`, which
+    verifies that the worktree and index exactly match ``HEAD`` before capturing
+    the commit identity. The captured revision travels with analysis and is not
+    re-read by the snapshot builder after the checkout may have moved.
+    """
+
+    provider_id: str
+    source_class: str
+    source_revision: str
+    repo_root: str
+
+    def __init__(
+        self,
+        *,
+        provider_id: str,
+        source_class: str,
+        source_revision: str,
+        repo_root: str,
+        _token: object,
+    ) -> None:
+        if _token is not _SOURCE_AUTHORITY_TOKEN:
+            raise StructuralEvidenceContractError(
+                "GitSourceAuthority must be derived from a clean Git repository"
+            )
+        object.__setattr__(self, "provider_id", provider_id)
+        object.__setattr__(self, "source_class", source_class)
+        object.__setattr__(self, "source_revision", source_revision)
+        object.__setattr__(self, "repo_root", repo_root)
+
+    def to_scope(self) -> "SourceRevisionScope":
+        return SourceRevisionScope(
+            provider_id=self.provider_id,
+            source_class=self.source_class,
+            source_revision=self.source_revision,
+            repo_root=self.repo_root,
+        )
+
+
+def derive_git_source_authority(repo_root: str | Path) -> GitSourceAuthority:
+    """Derive clean ``git.commit`` authority from the source checkout now.
+
+    Dirty or untracked content fails closed because it cannot truthfully be
+    represented by the clean ``HEAD`` commit. This intentionally avoids labeling
+    worktree content as a commit merely because Git can resolve ``HEAD``.
+    """
+    root = Path(repo_root).resolve()
+    if not root.is_dir():
+        raise StructuralEvidenceContractError(f"source repository does not exist: {root}")
+
+    def _git(*args: str) -> str:
+        try:
+            completed = subprocess.run(
+                ["git", *args],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise StructuralEvidenceContractError(
+                f"cannot derive Git source authority for {root}"
+            ) from exc
+        return completed.stdout.strip()
+
+    top_level = Path(_git("rev-parse", "--show-toplevel")).resolve()
+    if top_level != root:
+        raise StructuralEvidenceContractError(
+            "repo_root must be the authoritative Git worktree root"
+        )
+    if _git("status", "--porcelain=v1", "--untracked-files=all"):
+        raise StructuralEvidenceContractError(
+            "dirty or uncommitted source cannot use git.commit authority"
+        )
+    revision = _git("rev-parse", "--verify", "HEAD^{commit}")
+    if not SOURCE_REVISION_RE.fullmatch(revision):
+        raise StructuralEvidenceContractError("Git HEAD is not a supported commit SHA")
+    return GitSourceAuthority(
+        provider_id=GRAPHIFY_PROVIDER_ID,
+        source_class=SOURCE_CLASS_GIT_COMMIT,
+        source_revision=revision,
+        repo_root=str(root),
+        _token=_SOURCE_AUTHORITY_TOKEN,
+    )
+
+
 @dataclass(frozen=True)
 class SourceRevisionScope:
     """Deterministic, checkout-root independent source identity.
@@ -636,6 +732,8 @@ class SourceRevisionScope:
     repo_root: str = ""
 
     def __post_init__(self) -> None:
+        if not str(self.provider_id or "").strip():
+            raise StructuralEvidenceContractError("source provider_id must be non-empty")
         if self.source_class != SOURCE_CLASS_GIT_COMMIT:
             raise StructuralEvidenceContractError(
                 f"unsupported source_class: {self.source_class!r} (only {SOURCE_CLASS_GIT_COMMIT!r})"
@@ -700,6 +798,10 @@ class StructuralEvidenceSnapshot:
             raise StructuralEvidenceContractError(f"unsupported format: {self.format!r}")
         if self.provider_id != GRAPHIFY_PROVIDER_ID:
             raise StructuralEvidenceContractError(f"unsupported provider_id: {self.provider_id!r}")
+        if self.source_revision_scope.provider_id != self.provider_id:
+            raise StructuralEvidenceContractError(
+                "snapshot provider identity must match source revision scope provider identity"
+            )
         if not str(self.analyzer_revision or "").strip():
             raise StructuralEvidenceContractError("analyzer_revision must be non-empty")
         if "/" not in self.analyzer_revision:
@@ -717,6 +819,28 @@ class StructuralEvidenceSnapshot:
             self, "blockers", _dedup_by_identity(self.blockers, identity=lambda b: b.key)
         )
         object.__setattr__(self, "query", _semantic_query(self.query))
+        fact_keys = {fact.key for fact in self.facts}
+        path_identities = {path.path_identity for path in self.paths}
+        for path in self.paths:
+            if path.path_identity != path.supporting_evidence_keys:
+                raise StructuralEvidenceContractError(
+                    "path identity must exactly match ordered supporting evidence keys"
+                )
+            for key in path.supporting_evidence_keys:
+                if not DATA_FLOW_KEY_RE.fullmatch(key):
+                    raise StructuralEvidenceContractError(
+                        f"path references non-df evidence key: {key}"
+                    )
+                if key not in fact_keys:
+                    raise StructuralEvidenceContractError(
+                        f"path references unknown df key: {key}"
+                    )
+        for fact in self.facts:
+            for path_identity in fact.path_identity:
+                if path_identity not in path_identities:
+                    raise StructuralEvidenceContractError(
+                        f"fact references unknown path identity: {path_identity!r}"
+                    )
 
     @property
     def fingerprint(self) -> str:
@@ -828,9 +952,8 @@ class StructuralEvidenceSnapshot:
 def build_structural_evidence_snapshot(
     result: Any,
     *,
-    repo_root: str,
-    source_revision: str,
-    source_class: str = SOURCE_CLASS_GIT_COMMIT,
+    source_authority: GitSourceAuthority,
+    source_revision: str | None = None,
     analyzer_revision: str = DEFAULT_ANALYZER_REVISION,
     snapshot_query: Mapping[str, Any] | None = None,
 ) -> StructuralEvidenceSnapshot:
@@ -843,12 +966,15 @@ def build_structural_evidence_snapshot(
     public ``df:`` key; blocking boundaries become :class:`StructuralEvidenceBlocker`
     records. No truth verdict is computed or emitted.
     """
-    scope = SourceRevisionScope(
-        provider_id=GRAPHIFY_PROVIDER_ID,
-        source_class=source_class,
-        source_revision=source_revision,
-        repo_root=str(repo_root),
-    )
+    if not isinstance(source_authority, GitSourceAuthority):
+        raise StructuralEvidenceContractError(
+            "source_authority must be derived from the analyzed source context"
+        )
+    if source_revision is not None and source_revision != source_authority.source_revision:
+        raise StructuralEvidenceContractError(
+            "expected source revision does not match authoritative source revision"
+        )
+    scope = source_authority.to_scope()
 
     # Collect unique facts across all paths, keyed by their public df key.
     facts_by_key: dict[str, StructuralEvidenceFact] = {}
@@ -857,10 +983,13 @@ def build_structural_evidence_snapshot(
         identity = tuple(path.path_identity)
         ref_map = {ref.key: ref for ref in path.supporting_evidence}
         for ref in path.supporting_evidence:
-            facts_by_key.setdefault(
-                ref.key,
-                _fact_from_evidence_ref(ref),
-            )
+            candidate = _fact_from_evidence_ref(ref)
+            prior = facts_by_key.get(ref.key)
+            if prior is not None and serialize_snapshot_value(prior.to_dict()) != serialize_snapshot_value(candidate.to_dict()):
+                raise StructuralEvidenceContractError(
+                    f"conflicting structural evidence for immutable identity: {ref.key!r}"
+                )
+            facts_by_key[ref.key] = candidate
             fact_paths.setdefault(ref.key, []).append(identity)
         # Re-keyed facts must not drift from their supporting evidence identity.
         for k in identity:
@@ -876,7 +1005,7 @@ def build_structural_evidence_snapshot(
         object.__setattr__(fact, "path_identity", paths_using)
         facts.append(fact)
 
-    paths = tuple(
+    path_candidates = tuple(
         StructuralEvidencePath(
             path_identity=tuple(path.path_identity),
             supporting_evidence_keys=tuple(ref.key for ref in path.supporting_evidence),
@@ -886,10 +1015,12 @@ def build_structural_evidence_snapshot(
         )
         for path in result.paths
     )
+    paths = _dedup_by_identity(path_candidates, identity=lambda path: path.path_identity)
 
-    blockers = tuple(
+    blocker_candidates = tuple(
         _blocker_from_boundary_event(event) for event in result.boundary_events
     )
+    blockers = _dedup_by_identity(blocker_candidates, identity=lambda blocker: blocker.key)
 
     coverage = StructuralEvidenceCoverageState(
         search_coverage=result.search_coverage,

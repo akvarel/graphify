@@ -7,6 +7,8 @@
 A snapshot records two independent revision axes:
 
 - `source_revision_scope` identifies the analyzed source as `git.commit` plus its commit SHA. The local checkout path is intentionally excluded from public serialization and fingerprints.
+- `derive_git_source_authority(repo_root)` must be called against the clean Git source materialization used for analysis. It captures `HEAD` only after proving the index, tracked files, and untracked-file set are clean. Dirty or uncommitted source fails closed rather than being mislabeled as a clean commit.
+- `build_structural_evidence_snapshot(..., source_authority=...)` accepts that captured authority. The optional `source_revision=` compatibility input is confirmation only. It must equal the captured revision and cannot relabel an analyzed result. The builder never re-reads Git, so a later checkout move cannot silently change the captured source identity.
 - `analyzer_revision` identifies the Graphify analyzer release that produced the evidence. It is namespaced as `graphifyy/<revision>` and changes independently of the source revision.
 
 The snapshot fingerprint covers both axes and all public evidence content. It therefore changes when either the source or analyzer semantics change, while remaining byte-stable across checkout roots and mapping order.
@@ -20,7 +22,9 @@ Observation-only `request_id`, `query_id`, `run_id`, `correlation_id`, and `obse
 - `coverage` records search bounds, termination, truncation, input resolution, encountered partial or unknown constructs, and whether `MAY` evidence was encountered.
 - `blockers` are first-class unresolved, ambiguous, or unsupported boundaries. They carry deterministic `bnd:<sha256>` keys and `diag:` references instead of fabricating a traversable edge.
 
-Identical duplicate facts are collapsed deterministically. Conflicting payloads under one immutable fact, path, or blocker identity fail closed.
+Identical duplicate facts, paths, and blockers are collapsed deterministically at the builder boundary. Conflicting payloads under one immutable `df:`, ordered path, or `bnd:` identity fail closed before any candidate can be overwritten.
+
+For every path, `path_identity` is exactly the ordered tuple of `supporting_evidence_keys`. Every referenced key must be a `df:` fact present in the same snapshot. Fact-to-path references must resolve, and the source-scope provider must equal the snapshot provider. Construction, serialization loading, and validation all enforce these rules.
 
 No snapshot contains a verification verdict. `confidence`, `exactness`, provenance, and coverage describe evidence quality only.
 
@@ -51,11 +55,16 @@ Use:
 ```python
 from graphify.structural_evidence import (
     build_structural_evidence_snapshot,
+    derive_git_source_authority,
     load_snapshot,
     serialize_snapshot,
     validate_snapshot,
 )
 ```
+
+Derive authority before extraction/traversal from the source materialization that
+will be analyzed, retain the immutable authority object with that analysis state,
+and pass it to the builder. A caller-provided SHA is never source authority.
 
 `serialize_snapshot` emits deterministic compact JSON with sorted keys, UTF-8 content, and non-finite numbers rejected. `load_snapshot` and `validate_snapshot` verify schema, namespaces, typed fields, content-addressed keys, and the snapshot fingerprint.
 

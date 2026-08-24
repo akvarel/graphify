@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from graphify.data_flow_query import DataFlowPath, DataFlowTraversalResult
+from graphify.data_flow_query import DataFlowTraversalResult
 from graphify.structural_evidence import (
     GRAPHIFY_PROVIDER_ID,
     StructuralEvidenceContractError,
@@ -19,6 +19,7 @@ from graphify.structural_evidence import (
     derive_git_source_authority,
     load_snapshot,
     serialize_snapshot,
+    structural_evidence_fingerprint,
 )
 from tests.test_structural_evidence_contract import _graph
 from graphify.data_flow_query import DataFlowQuery, run_data_flow_query
@@ -170,11 +171,12 @@ def test_snapshot_rejects_provider_scope_mismatch(tmp_path: Path):
 def test_roundtrip_revalidates_cross_references_and_source_authority(tmp_path: Path):
     snap = _snapshot(_git_repo(tmp_path / "repo"))
     loaded = load_snapshot(serialize_snapshot(snap))
-    assert loaded.source_revision_scope == snap.source_revision_scope
+    assert loaded.source_revision_scope.to_dict() == snap.source_revision_scope.to_dict()
     doc = snap.to_dict()
     doc["paths"][0]["supporting_evidence_keys"] = ["df:" + "0" * 64]
     doc["paths"][0]["path_identity"] = ["df:" + "0" * 64]
-    doc["fingerprint"] = StructuralEvidenceSnapshot.from_dict({**doc, "fingerprint": snap.fingerprint}).fingerprint
+    content = {key: value for key, value in doc.items() if key != "fingerprint"}
+    doc["fingerprint"] = structural_evidence_fingerprint(content)
     with pytest.raises(StructuralEvidenceContractError):
         load_snapshot(json.dumps(doc))
 

@@ -19,8 +19,10 @@ Design non-goals enforced here:
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +53,7 @@ from graphify.structural_evidence import (
     SOURCE_REVISION_RE,
     boundary_evidence_key,
     build_structural_evidence_snapshot,
+    derive_git_source_authority,
     df_key,
     df_key_from_edge,
     is_valid_df_key,
@@ -420,11 +423,31 @@ def test_source_revision_scope():
 # --------------------------------------------------------------------------- #
 # 7. Snapshot: build, serialize, validate, deterministic, root independent
 # --------------------------------------------------------------------------- #
-def _snapshot(revision: str = "a" * 40, root: str = "/abs/repo") -> StructuralEvidenceSnapshot:
+def _authority_repo(content: str = "a") -> Any:
+    with tempfile.TemporaryDirectory(prefix="graphify-authority-") as directory:
+        root = Path(directory)
+        (root / "source.txt").write_text(content, encoding="utf-8")
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Graphify Authority",
+            "GIT_AUTHOR_EMAIL": "authority@example.com",
+            "GIT_COMMITTER_NAME": "Graphify Authority",
+            "GIT_COMMITTER_EMAIL": "authority@example.com",
+            "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+00:00",
+            "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+00:00",
+        }
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True, env=env)
+        subprocess.run(["git", "add", "-A"], cwd=root, check=True, env=env)
+        subprocess.run(["git", "commit", "-q", "-m", "source"], cwd=root, check=True, env=env)
+        return derive_git_source_authority(root)
+
+
+def _snapshot(revision: str = "a", root: str = "") -> StructuralEvidenceSnapshot:
     nodes, edges = _graph()
     result = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=5))
+    authority = _authority_repo(revision)
     return build_structural_evidence_snapshot(
-        result, repo_root=root, source_revision=revision,
+        result, source_authority=authority,
     )
 
 
@@ -436,7 +459,7 @@ def test_snapshot_is_versioned_and_namespaced():
     assert d["provider_id"] == GRAPHIFY_PROVIDER_ID
     assert d["analyzer_revision"] == DEFAULT_ANALYZER_REVISION
     assert d["source_revision_scope"]["source_class"] == "git.commit"
-    assert d["source_revision_scope"]["source_revision"] == "a" * 40
+    assert SOURCE_REVISION_RE.fullmatch(d["source_revision_scope"]["source_revision"])
 
 
 def test_snapshot_has_no_truth_verdicts():
@@ -466,20 +489,19 @@ def test_snapshot_is_checkout_root_independent():
 
 
 def test_snapshot_changes_with_source_revision():
-    a = _snapshot(revision="a" * 40)
-    b = _snapshot(revision="b" * 40)
+    a = _snapshot(revision="a")
+    b = _snapshot(revision="b")
     assert a.fingerprint != b.fingerprint
-    assert a.to_dict()["source_revision_scope"]["source_revision"] == "a" * 40
-    assert b.to_dict()["source_revision_scope"]["source_revision"] == "b" * 40
+    assert a.to_dict()["source_revision_scope"]["source_revision"] != b.to_dict()["source_revision_scope"]["source_revision"]
 
 
 def test_source_and_analyzer_revisions_are_separate_identity_axes():
-    source_a = _snapshot(revision="a" * 40)
-    source_b = _snapshot(revision="b" * 40)
+    source_a = _snapshot(revision="a")
+    source_b = _snapshot(revision="b")
+    authority = _authority_repo("a")
     analyzer_b = build_structural_evidence_snapshot(
         run_data_flow_query(*_graph(), DataFlowQuery(start="A", max_depth=5)),
-        repo_root="/abs/repo",
-        source_revision="a" * 40,
+        source_authority=authority,
         analyzer_revision="graphifyy/next",
     )
     assert source_a.analyzer_revision == source_b.analyzer_revision
@@ -535,16 +557,15 @@ def test_snapshot_rejects_conflicting_content_under_same_fact_key():
 def test_correlation_ids_do_not_change_semantic_snapshot_or_fact_identity():
     nodes, edges = _graph()
     result = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=5))
+    authority = _authority_repo("correlation")
     a = build_structural_evidence_snapshot(
         result,
-        repo_root="/abs/repo",
-        source_revision="a" * 40,
+        source_authority=authority,
         snapshot_query={"start": "A", "request_id": "request-a", "run_id": "run-a"},
     )
     b = build_structural_evidence_snapshot(
         result,
-        repo_root="/abs/repo",
-        source_revision="a" * 40,
+        source_authority=authority,
         snapshot_query={"start": "A", "request_id": "request-b", "run_id": "run-b"},
     )
     assert a.fingerprint == b.fingerprint
@@ -647,7 +668,8 @@ def _commit_source_fixture(tmp_path: Path) -> tuple[str, Path]:
 
 
 def _generate_real_fixture_snapshot(tmp_path: Path) -> dict[str, Any]:
-    revision, repo = _commit_source_fixture(tmp_path)
+    _revision, repo = _commit_source_fixture(tmp_path)
+    authority = derive_git_source_authority(repo)
     files = sorted(repo.rglob("*.java"))
     result = extract(files, root=repo, cache_root=tmp_path / "cache")
     # Find the PARAMETER named "in" in run() to seed the forward query.
@@ -665,7 +687,7 @@ def _generate_real_fixture_snapshot(tmp_path: Path) -> dict[str, Any]:
         result["nodes"], result["edges"], DataFlowQuery(start=start, max_depth=6)
     )
     snap = build_structural_evidence_snapshot(
-        traversal, repo_root=str(repo), source_revision=revision,
+        traversal, source_authority=authority,
     )
     return snap.to_dict()
 
