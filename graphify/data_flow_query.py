@@ -61,10 +61,13 @@ Remediation (supervising review ``06-gate3b-termination-accounting-remediation``
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
+
+from graphify.structural_evidence import (
+    boundary_evidence_key,
+    df_key_from_edge,
+)
 
 # The explicit allowlist of value-flow relations eligible for traversal.
 # CALLS / references / imports / contains / inherits are NOT value flow and are
@@ -211,27 +214,12 @@ def _evidence_key(edge: dict[str, Any]) -> str:
     source location, and (where present) provenance / argument index / callee.
     Volatile fields (absolute checkout paths, wall-clock timestamps, in-memory
     object ids, arbitrary dict ordering) are never included.
+
+    Delegates to :func:`graphify.structural_evidence.df_key_from_edge` (the single
+    source of truth) so data-flow evidence keys are byte-identical to the public
+    structural-evidence contract and to GVR's ``graphify_contract`` validator.
     """
-    metadata = edge.get("metadata") or {}
-    fields: list[tuple[str, str]] = [
-        ("r", str(edge.get("relation") or "")),
-        ("s", str(edge.get("source") or "")),
-        ("t", str(edge.get("target") or "")),
-        ("f", str(edge.get("source_file") or "")),
-        ("l", str(edge.get("source_location") or "")),
-        ("p", str(metadata.get("provenance") or "")),
-    ]
-    ai = metadata.get("argumentIndex")
-    if ai is not None:
-        fields.append(("ai", str(ai)))
-    # NOTE: the Gate 2B cross-file edge metadata also carries a `callee` value
-    # that embeds the absolute checkout-path slug (from the cache_root fallback)
-    # and is therefore NOT checkout-root independent. The callee identity is
-    # already captured canonically by the edge's own `target` node id (included
-    # above), so `callee` is intentionally excluded from the evidence key.
-    canonical = json.dumps(sorted(fields), sort_keys=True, separators=(",", ":"))
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    return f"df:{digest}"
+    return df_key_from_edge(edge)
 
 
 def _frontier(edge: dict[str, Any], direction: Direction) -> str:
@@ -372,25 +360,12 @@ def _boundary_evidence_key(node: dict[str, Any]) -> str:
     stability across a Graphify remap is not guaranteed; it is surfaced separately
     as ``diagnostic_node_id`` / ``diagnostic_evidence_key``. No absolute checkout
     path participates, so the key is identical across different checkout roots.
+
+    Delegates to :func:`graphify.structural_evidence.boundary_evidence_key` (the
+    single source of truth) so boundary evidence keys are byte-identical to the
+    public structural-evidence contract.
     """
-    metadata = node.get("metadata") or {}
-    fields: list[tuple[str, str]] = [
-        ("sf", str(node.get("source_file") or "")),
-        ("loc", str(metadata.get("callerLocation") or "")),
-        ("kind", str(metadata.get("kind") or "")),
-        ("cap", str(metadata.get("capability") or "")),
-        ("framework", str(metadata.get("framework") or "")),
-        ("res", str(metadata.get("resolution") or "")),
-        ("method", str(metadata.get("method") or "")),
-        ("arity", str(metadata.get("arity") or 0)),
-        ("rfqn", str(metadata.get("receiverFqn") or "")),
-        ("repo", str(metadata.get("repositoryFqn") or "")),
-        ("entity", str(metadata.get("entityFqn") or "")),
-        ("reason", str(metadata.get("reason") or "")),
-    ]
-    canonical = json.dumps(sorted(fields), sort_keys=True, separators=(",", ":"))
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    return f"bnd:{digest}"
+    return boundary_evidence_key(node)
 
 
 def _collect_boundary_events(

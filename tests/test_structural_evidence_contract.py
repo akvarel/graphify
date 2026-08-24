@@ -31,6 +31,7 @@ from graphify.extract import extract
 from graphify.structural_evidence import (
     BOUNDARY_KEY_RE,
     DATA_FLOW_KEY_RE,
+    DEFAULT_ANALYZER_REVISION,
     DIAGNOSTIC_KEY_RE,
     GRAPHIFY_PROVIDER_ID,
     SOURCE_CLASS_GIT_COMMIT,
@@ -159,6 +160,7 @@ def test_version_and_format_constants():
     )
     assert GRAPHIFY_PROVIDER_ID == "graphify"
     assert SOURCE_CLASS_GIT_COMMIT == "git.commit"
+    assert DEFAULT_ANALYZER_REVISION.startswith("graphifyy/")
 
 
 def test_evidence_key_regexes_are_anchored():
@@ -432,6 +434,7 @@ def test_snapshot_is_versioned_and_namespaced():
     assert d["schema_version"] == STRUCTURAL_EVIDENCE_SCHEMA_VERSION
     assert d["format"] == STRUCTURAL_EVIDENCE_FORMAT
     assert d["provider_id"] == GRAPHIFY_PROVIDER_ID
+    assert d["analyzer_revision"] == DEFAULT_ANALYZER_REVISION
     assert d["source_revision_scope"]["source_class"] == "git.commit"
     assert d["source_revision_scope"]["source_revision"] == "a" * 40
 
@@ -468,6 +471,22 @@ def test_snapshot_changes_with_source_revision():
     assert a.fingerprint != b.fingerprint
     assert a.to_dict()["source_revision_scope"]["source_revision"] == "a" * 40
     assert b.to_dict()["source_revision_scope"]["source_revision"] == "b" * 40
+
+
+def test_source_and_analyzer_revisions_are_separate_identity_axes():
+    source_a = _snapshot(revision="a" * 40)
+    source_b = _snapshot(revision="b" * 40)
+    analyzer_b = build_structural_evidence_snapshot(
+        run_data_flow_query(*_graph(), DataFlowQuery(start="A", max_depth=5)),
+        repo_root="/abs/repo",
+        source_revision="a" * 40,
+        analyzer_revision="graphifyy/next",
+    )
+    assert source_a.analyzer_revision == source_b.analyzer_revision
+    assert source_a.source_revision_scope.source_revision != source_b.source_revision_scope.source_revision
+    assert analyzer_b.source_revision_scope.source_revision == source_a.source_revision_scope.source_revision
+    assert analyzer_b.analyzer_revision != source_a.analyzer_revision
+    assert analyzer_b.fingerprint != source_a.fingerprint
 
 
 def test_snapshot_facts_are_df_compatible():
@@ -514,6 +533,15 @@ def test_snapshot_roundtrip_json():
     assert loaded.to_dict() == snap.to_dict()
 
 
+def test_fact_path_identity_is_json_native():
+    doc = _snapshot().to_dict()
+    assert all(
+        isinstance(path, list)
+        for fact in doc["facts"]
+        for path in fact["path_identity"]
+    )
+
+
 def test_validate_snapshot_rejects_tampered_fingerprint():
     snap = _snapshot()
     doc = snap.to_dict()
@@ -537,7 +565,7 @@ _FIXTURE_JSON = Path(__file__).parent / "fixtures" / "structural_evidence" / "st
 _FIXTURE_SOURCE = Path(__file__).parent / "fixtures" / "structural_evidence" / "fixture_source"
 
 
-def _commit_source_fixture(tmp_path: Path) -> str:
+def _commit_source_fixture(tmp_path: Path) -> tuple[str, Path]:
     """Create a real git repo with Java source and return the commit SHA.
 
     Fixed author identity + dates make the commit SHA deterministic.
