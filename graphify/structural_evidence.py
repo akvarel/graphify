@@ -109,6 +109,14 @@ DATA_FLOW_KEY_PREFIX: str = "df:"
 BOUNDARY_KEY_PREFIX: str = "bnd:"
 DIAGNOSTIC_KEY_PREFIX: str = "diag:"
 
+_CORRELATION_ONLY_QUERY_KEYS = frozenset({
+    "correlation_id",
+    "observation_id",
+    "query_id",
+    "request_id",
+    "run_id",
+})
+
 DATA_FLOW_KEY_RE: re.Pattern[str] = re.compile(r"^df:[0-9a-f]{64}$")
 BOUNDARY_KEY_RE: re.Pattern[str] = re.compile(r"^bnd:[0-9a-f]{64}$")
 DIAGNOSTIC_KEY_RE: re.Pattern[str] = re.compile(r"^diag:.+$")
@@ -698,11 +706,17 @@ class StructuralEvidenceSnapshot:
             raise StructuralEvidenceContractError(
                 "analyzer_revision must be namespaced as <analyzer>/<revision>"
             )
-        # Deterministic, deduplicated ordering (order does not participate in identity).
-        object.__setattr__(self, "facts", _dedup_sorted(self.facts, key=lambda f: f.key))
-        object.__setattr__(self, "paths", _dedup_sorted(self.paths, key=lambda p: p.path_identity))
-        object.__setattr__(self, "blockers", _dedup_sorted(self.blockers, key=lambda b: b.key))
-        object.__setattr__(self, "query", _snapshot_map(self.query))
+        # Deterministic ordering and fail-closed identity deduplication. Identical
+        # duplicates collapse; conflicting content under one immutable key is an
+        # analyzer contract violation and must never be silently overwritten.
+        object.__setattr__(self, "facts", _dedup_by_identity(self.facts, identity=lambda f: f.key))
+        object.__setattr__(
+            self, "paths", _dedup_by_identity(self.paths, identity=lambda p: p.path_identity)
+        )
+        object.__setattr__(
+            self, "blockers", _dedup_by_identity(self.blockers, identity=lambda b: b.key)
+        )
+        object.__setattr__(self, "query", _semantic_query(self.query))
 
     @property
     def fingerprint(self) -> str:
@@ -1068,13 +1082,36 @@ def _snapshot_map(value: Any) -> Any:
     return value
 
 
-def _dedup_sorted(items: Sequence[Any], *, key: Any) -> tuple[Any, ...]:
-    seen: set[str] = set()
-    out: list[Any] = []
-    for item in sorted(items, key=key):
-        token = repr(item.to_dict() if hasattr(item, "to_dict") else item)
-        if token in seen:
-            continue
-        seen.add(token)
-        out.append(item)
-    return tuple(out)
+def _semantic_query(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Snapshot semantic query inputs without observation/run correlation."""
+    return {
+        str(key): _snapshot_map(item)
+        for key, item in value.items()
+        if str(key) not in _CORRELATION_ONLY_QUERY_KEYS
+    }
+
+
+def _dedup_by_identity(items: Sequence[Any], *, identity: Any) -> tuple[Any, ...]:
+    by_identity: dict[Any, tuple[str, Any]] = {}
+    for item in items:
+        item_identity = identity(item)
+        token = serialize_snapshot_value(item.to_dict() if hasattr(item, "to_dict") else item)
+        prior = by_identity.get(item_identity)
+        if prior is not None and prior[0] != token:
+            raise StructuralEvidenceContractError(
+                f"conflicting structural evidence for immutable identity: {item_identity!r}"
+            )
+        by_identity[item_identity] = (token, item)
+    return tuple(by_identity[item_identity][1] for item_identity in sorted(by_identity))
+
+
+def serialize_snapshot_value(value: Any) -> str:
+    """Canonical JSON used only to compare duplicate identity payloads."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=_CANONICAL_SEPARATORS,
+        ensure_ascii=False,
+        allow_nan=False,
+        default=str,
+    )

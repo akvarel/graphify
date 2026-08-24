@@ -511,6 +511,47 @@ def test_snapshot_facts_are_deduplicated_and_sorted():
     assert keys == sorted(keys)
 
 
+def test_snapshot_rejects_conflicting_content_under_same_fact_key():
+    snap = _snapshot()
+    original = snap.facts[0]
+    conflicting = StructuralEvidenceFact(
+        **{**original.to_dict(), "confidence_score": 0.25}
+    )
+    with pytest.raises(StructuralEvidenceContractError, match="conflicting structural evidence"):
+        StructuralEvidenceSnapshot(
+            schema_version=snap.schema_version,
+            format=snap.format,
+            provider_id=snap.provider_id,
+            analyzer_revision=snap.analyzer_revision,
+            source_revision_scope=snap.source_revision_scope,
+            query=snap.query,
+            coverage=snap.coverage,
+            facts=(original, conflicting),
+            paths=snap.paths,
+            blockers=snap.blockers,
+        )
+
+
+def test_correlation_ids_do_not_change_semantic_snapshot_or_fact_identity():
+    nodes, edges = _graph()
+    result = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=5))
+    a = build_structural_evidence_snapshot(
+        result,
+        repo_root="/abs/repo",
+        source_revision="a" * 40,
+        snapshot_query={"start": "A", "request_id": "request-a", "run_id": "run-a"},
+    )
+    b = build_structural_evidence_snapshot(
+        result,
+        repo_root="/abs/repo",
+        source_revision="a" * 40,
+        snapshot_query={"start": "A", "request_id": "request-b", "run_id": "run-b"},
+    )
+    assert a.fingerprint == b.fingerprint
+    assert [fact.key for fact in a.facts] == [fact.key for fact in b.facts]
+    assert "request_id" not in a.to_dict()["query"]
+
+
 def test_snapshot_to_gvr_traversal_dict_roundtrips_through_gvr():
     """The public dict must be consumable by GVR's graphify adapter unchanged."""
     gvr = pytest.importorskip("gvr")
@@ -580,6 +621,10 @@ def _commit_source_fixture(tmp_path: Path) -> tuple[str, Path]:
         "    Value transform(Value v) { return v; }\n"
         "    Result collect(Value v) { return new Result(v); }\n"
         "}\n",
+        encoding="utf-8",
+    )
+    (src / "Value.java").write_text(
+        "package acme;\nclass Value {}\n",
         encoding="utf-8",
     )
     env = {

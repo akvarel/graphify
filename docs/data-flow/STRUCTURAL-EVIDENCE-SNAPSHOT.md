@@ -11,6 +11,8 @@ A snapshot records two independent revision axes:
 
 The snapshot fingerprint covers both axes and all public evidence content. It therefore changes when either the source or analyzer semantics change, while remaining byte-stable across checkout roots and mapping order.
 
+Observation-only `request_id`, `query_id`, `run_id`, `correlation_id`, and `observation_id` values are excluded from semantic query identity. They cannot alter immutable fact keys or the snapshot content fingerprint.
+
 ## Evidence model
 
 - `facts` are direct, typed source facts. Each carries a content-addressed `df:<sha256>` key, relation, endpoints, source location, provenance, analysis completeness, receiver confidence, and optional argument index.
@@ -18,7 +20,11 @@ The snapshot fingerprint covers both axes and all public evidence content. It th
 - `coverage` records search bounds, termination, truncation, input resolution, encountered partial or unknown constructs, and whether `MAY` evidence was encountered.
 - `blockers` are first-class unresolved, ambiguous, or unsupported boundaries. They carry deterministic `bnd:<sha256>` keys and `diag:` references instead of fabricating a traversable edge.
 
+Identical duplicate facts are collapsed deterministically. Conflicting payloads under one immutable fact, path, or blocker identity fail closed.
+
 No snapshot contains a verification verdict. `confidence`, `exactness`, provenance, and coverage describe evidence quality only.
+
+Downstream GVR consumers must treat absent evidence as `UNKNOWN` unless the separate bounded traversal/search contract certifies complete supported search. Silence in a structural snapshot is not authoritative `NO_PATH` evidence.
 
 ## Exact and partial evidence
 
@@ -31,6 +37,8 @@ Supported provenance values are:
 - `FRAMEWORK_CONTRACT`
 
 Supported construct coverage values are `COMPLETE_FOR_SUPPORTED_CONSTRUCT`, `PARTIAL`, and `UNKNOWN`. Receiver confidence is `PROVEN` or `MAY`.
+
+The v1 traversal-backed export publishes currently proven direct data-flow/reference facts plus persistence/framework blockers already represented by the branch. General `CALL`, general symbol `REFERENCE`, and `IMPORT` export are not promoted to exact structural relations by this contract when the current analyzer cannot prove the target identity. Synthetic architecture edges are out of scope.
 
 ## Data-flow key compatibility
 
