@@ -630,10 +630,10 @@ def _commit_source_fixture(tmp_path: Path) -> tuple[str, Path]:
     env = {
         "GIT_AUTHOR_NAME": "Graphify Fixture",
         "GIT_AUTHOR_EMAIL": "fixture@example.com",
-        "GIT_AUTHOR_DATE": "2026-01-01T00:00:00",
+        "GIT_AUTHOR_DATE": "2026-01-01T00:00:00+00:00",
         "GIT_COMMITTER_NAME": "Graphify Fixture",
         "GIT_COMMITTER_EMAIL": "fixture@example.com",
-        "GIT_COMMITTER_DATE": "2026-01-01T00:00:00",
+        "GIT_COMMITTER_DATE": "2026-01-01T00:00:00+00:00",
     }
     full_env = {**__import__("os").environ, **env}
     subprocess.run(["git", "init", "-q", str(repo)], check=True, env=full_env)
