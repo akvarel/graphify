@@ -21,7 +21,7 @@ from graphify.structural_evidence import (
     serialize_snapshot,
     structural_evidence_fingerprint,
 )
-from tests.test_structural_evidence_contract import _graph
+from tests.test_structural_evidence_contract import _graph, _unsafe_bound_for_contract_test
 from graphify.data_flow_query import DataFlowQuery, run_data_flow_query
 
 
@@ -49,7 +49,9 @@ def _result() -> DataFlowTraversalResult:
 
 def _snapshot(repo: Path, **kwargs) -> StructuralEvidenceSnapshot:
     authority = derive_git_source_authority(repo)
-    return build_structural_evidence_snapshot(_result(), source_authority=authority, **kwargs)
+    return build_structural_evidence_snapshot(
+        _unsafe_bound_for_contract_test(_result(), authority), **kwargs
+    )
 
 
 def test_builder_revision_input_is_confirmation_not_authority(tmp_path: Path):
@@ -57,12 +59,12 @@ def test_builder_revision_input_is_confirmation_not_authority(tmp_path: Path):
     authority = derive_git_source_authority(repo)
     actual = authority.source_revision
     snap = build_structural_evidence_snapshot(
-        _result(), source_authority=authority, source_revision=actual
+        _unsafe_bound_for_contract_test(_result(), authority), source_revision=actual
     )
     assert snap.source_revision_scope.source_revision == actual
     with pytest.raises(StructuralEvidenceContractError, match="expected source revision"):
         build_structural_evidence_snapshot(
-            _result(), source_authority=authority, source_revision="b" * 40
+            _unsafe_bound_for_contract_test(_result(), authority), source_revision="b" * 40
         )
 
 
@@ -84,7 +86,9 @@ def test_authority_is_captured_and_not_reread_after_checkout_moves(tmp_path: Pat
         cwd=repo,
         check=True,
     )
-    snap = build_structural_evidence_snapshot(_result(), source_authority=authority)
+    snap = build_structural_evidence_snapshot(
+        _unsafe_bound_for_contract_test(_result(), authority)
+    )
     assert snap.source_revision_scope.source_revision == captured
 
 
@@ -112,7 +116,9 @@ def test_builder_rejects_conflicting_same_df_candidates(tmp_path: Path):
     conflict_result = replace(result, paths=(path, conflicting_path))
     authority = derive_git_source_authority(_git_repo(tmp_path / "repo"))
     with pytest.raises(StructuralEvidenceContractError, match="conflicting structural evidence"):
-        build_structural_evidence_snapshot(conflict_result, source_authority=authority)
+        build_structural_evidence_snapshot(
+            _unsafe_bound_for_contract_test(conflict_result, authority)
+        )
 
 
 def test_builder_collapses_identical_fact_path_and_blocker_duplicates(tmp_path: Path):
@@ -123,7 +129,9 @@ def test_builder_collapses_identical_fact_path_and_blocker_duplicates(tmp_path: 
         boundary_events=result.boundary_events + result.boundary_events,
     )
     snap = build_structural_evidence_snapshot(
-        duplicate, source_authority=derive_git_source_authority(_git_repo(tmp_path / "repo"))
+        _unsafe_bound_for_contract_test(
+            duplicate, derive_git_source_authority(_git_repo(tmp_path / "repo"))
+        )
     )
     assert len(snap.paths) == len(result.paths)
     assert len(snap.blockers) == len(result.boundary_events)
@@ -136,7 +144,11 @@ def test_builder_rejects_conflicting_same_path_identity(tmp_path: Path):
     conflicting = replace(path, path_exactness="PARTIAL")
     authority = derive_git_source_authority(_git_repo(tmp_path / "repo"))
     with pytest.raises(StructuralEvidenceContractError, match="conflicting structural evidence"):
-        build_structural_evidence_snapshot(replace(result, paths=(path, conflicting)), source_authority=authority)
+        build_structural_evidence_snapshot(
+            _unsafe_bound_for_contract_test(
+                replace(result, paths=(path, conflicting)), authority
+            )
+        )
 
 
 def test_builder_rejects_conflicting_same_blocker_identity(tmp_path: Path):
@@ -146,7 +158,9 @@ def test_builder_rejects_conflicting_same_blocker_identity(tmp_path: Path):
     authority = derive_git_source_authority(_git_repo(tmp_path / "repo"))
     with pytest.raises(StructuralEvidenceContractError, match="conflicting structural evidence"):
         build_structural_evidence_snapshot(
-            replace(result, boundary_events=(event, conflicting)), source_authority=authority
+            _unsafe_bound_for_contract_test(
+                replace(result, boundary_events=(event, conflicting)), authority
+            )
         )
 
 
@@ -191,7 +205,9 @@ def test_silence_remains_non_authoritative_absence(tmp_path: Path):
         encountered_partial_evidence=True,
     )
     snap = build_structural_evidence_snapshot(
-        silent, source_authority=derive_git_source_authority(_git_repo(tmp_path / "repo"))
+        _unsafe_bound_for_contract_test(
+            silent, derive_git_source_authority(_git_repo(tmp_path / "repo"))
+        )
     )
     assert snap.paths == ()
     assert snap.coverage.complete_supported_search is False

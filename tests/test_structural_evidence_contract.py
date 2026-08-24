@@ -31,6 +31,7 @@ import pytest
 from graphify.data_flow_query import DataFlowQuery, run_data_flow_query
 from graphify.extract import extract
 from graphify.structural_evidence import (
+    BoundStructuralAnalysis,
     BOUNDARY_KEY_RE,
     DATA_FLOW_KEY_RE,
     DEFAULT_ANALYZER_REVISION,
@@ -53,7 +54,9 @@ from graphify.structural_evidence import (
     SOURCE_REVISION_RE,
     boundary_evidence_key,
     build_structural_evidence_snapshot,
+    build_bound_structural_index,
     derive_git_source_authority,
+    run_bound_data_flow_query,
     df_key,
     df_key_from_edge,
     is_valid_df_key,
@@ -62,6 +65,11 @@ from graphify.structural_evidence import (
     structural_evidence_fingerprint,
     validate_df_key,
     validate_snapshot,
+)
+from graphify.structural_evidence import (
+    _BOUND_ANALYSIS_TOKEN,
+    _binding_fingerprint,
+    _traversal_fingerprint,
 )
 
 
@@ -156,14 +164,24 @@ def _graph():
 # 1. Version, format, namespace, and registry constants
 # --------------------------------------------------------------------------- #
 def test_version_and_format_constants():
-    assert STRUCTURAL_EVIDENCE_SCHEMA_VERSION == 1
-    assert STRUCTURAL_EVIDENCE_FORMAT == "graphify.structural_evidence.v1"
+    assert STRUCTURAL_EVIDENCE_SCHEMA_VERSION == 2
+    assert STRUCTURAL_EVIDENCE_FORMAT == "graphify.structural_evidence.v2"
     assert STRUCTURAL_EVIDENCE_FINGERPRINT_FORMAT.startswith(
         "graphify.structural_evidence"
     )
     assert GRAPHIFY_PROVIDER_ID == "graphify"
     assert SOURCE_CLASS_GIT_COMMIT == "git.commit"
     assert DEFAULT_ANALYZER_REVISION.startswith("graphifyy/")
+
+
+def test_legacy_v1_snapshot_is_rejected_instead_of_silently_reinterpreted():
+    legacy = {
+        "schema_version": 1,
+        "format": "graphify.structural_evidence.v1",
+        "provider_id": GRAPHIFY_PROVIDER_ID,
+    }
+    with pytest.raises(StructuralEvidenceContractError, match="schema_version"):
+        validate_snapshot(legacy)
 
 
 def test_evidence_key_regexes_are_anchored():
@@ -442,12 +460,28 @@ def _authority_repo(content: str = "a") -> Any:
         return derive_git_source_authority(root)
 
 
+def _unsafe_bound_for_contract_test(result: Any, authority: Any) -> BoundStructuralAnalysis:
+    """Test-only construction for unit-testing snapshot normalization in isolation."""
+    traversal_fingerprint = _traversal_fingerprint(result)
+    index_fingerprint = "sha256:" + "1" * 64
+    return BoundStructuralAnalysis(
+        source_authority=authority,
+        index_fingerprint=index_fingerprint,
+        result=result,
+        traversal_fingerprint=traversal_fingerprint,
+        binding_fingerprint=_binding_fingerprint(
+            authority.to_scope(), index_fingerprint, traversal_fingerprint
+        ),
+        _token=_BOUND_ANALYSIS_TOKEN,
+    )
+
+
 def _snapshot(revision: str = "a", root: str = "") -> StructuralEvidenceSnapshot:
     nodes, edges = _graph()
     result = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=5))
     authority = _authority_repo(revision)
     return build_structural_evidence_snapshot(
-        result, source_authority=authority,
+        _unsafe_bound_for_contract_test(result, authority),
     )
 
 
@@ -500,8 +534,9 @@ def test_source_and_analyzer_revisions_are_separate_identity_axes():
     source_b = _snapshot(revision="b")
     authority = _authority_repo("a")
     analyzer_b = build_structural_evidence_snapshot(
-        run_data_flow_query(*_graph(), DataFlowQuery(start="A", max_depth=5)),
-        source_authority=authority,
+        _unsafe_bound_for_contract_test(
+            run_data_flow_query(*_graph(), DataFlowQuery(start="A", max_depth=5)), authority
+        ),
         analyzer_revision="graphifyy/next",
     )
     assert source_a.analyzer_revision == source_b.analyzer_revision
@@ -546,6 +581,7 @@ def test_snapshot_rejects_conflicting_content_under_same_fact_key():
             provider_id=snap.provider_id,
             analyzer_revision=snap.analyzer_revision,
             source_revision_scope=snap.source_revision_scope,
+            analysis_binding=snap.analysis_binding,
             query=snap.query,
             coverage=snap.coverage,
             facts=(original, conflicting),
@@ -558,14 +594,13 @@ def test_correlation_ids_do_not_change_semantic_snapshot_or_fact_identity():
     nodes, edges = _graph()
     result = run_data_flow_query(nodes, edges, DataFlowQuery(start="A", max_depth=5))
     authority = _authority_repo("correlation")
+    bound = _unsafe_bound_for_contract_test(result, authority)
     a = build_structural_evidence_snapshot(
-        result,
-        source_authority=authority,
+        bound,
         snapshot_query={"start": "A", "request_id": "request-a", "run_id": "run-a"},
     )
     b = build_structural_evidence_snapshot(
-        result,
-        source_authority=authority,
+        bound,
         snapshot_query={"start": "A", "request_id": "request-b", "run_id": "run-b"},
     )
     assert a.fingerprint == b.fingerprint
@@ -669,12 +704,14 @@ def _commit_source_fixture(tmp_path: Path) -> tuple[str, Path]:
 
 def _generate_real_fixture_snapshot(tmp_path: Path) -> dict[str, Any]:
     _revision, repo = _commit_source_fixture(tmp_path)
-    authority = derive_git_source_authority(repo)
     files = sorted(repo.rglob("*.java"))
-    result = extract(files, root=repo, cache_root=tmp_path / "cache")
+    authority = derive_git_source_authority(repo)
+    index = build_bound_structural_index(
+        authority, files, cache_root=tmp_path / "cache"
+    )
     # Find the PARAMETER named "in" in run() to seed the forward query.
     start = None
-    for node in result["nodes"]:
+    for node in index.nodes:
         md = node.get("metadata") or {}
         if (node.get("type") == "data_value"
                 and md.get("kind") == "PARAMETER"
@@ -683,12 +720,8 @@ def _generate_real_fixture_snapshot(tmp_path: Path) -> dict[str, Any]:
             start = node["id"]
             break
     assert start is not None, "could not locate parameter 'in' for traversal seed"
-    traversal = run_data_flow_query(
-        result["nodes"], result["edges"], DataFlowQuery(start=start, max_depth=6)
-    )
-    snap = build_structural_evidence_snapshot(
-        traversal, source_authority=authority,
-    )
+    traversal = run_bound_data_flow_query(index, DataFlowQuery(start=start, max_depth=6))
+    snap = build_structural_evidence_snapshot(traversal)
     return snap.to_dict()
 
 

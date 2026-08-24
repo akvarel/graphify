@@ -1,71 +1,107 @@
-# Structural Evidence Snapshot Contract v1
+# Structural Evidence Snapshot Contract v2
 
-`graphify.structural_evidence.v1` is Graphify's deterministic public envelope for exporting source-derived structural evidence to downstream consumers such as the Global Verification Runtime (GVR).
+`graphify.structural_evidence.v2` is Graphify's deterministic public envelope for exporting source-derived structural evidence to downstream consumers such as the Global Verification Runtime (GVR).
+
+Version 2 is an intentional, non-backward-compatible schema revision. Version 1 scoped evidence to a Git revision but did not prove that the traversal result came from that revision. A v1 document is rejected rather than silently reinterpreted as bound evidence.
+
+## Authoritative binding chain
+
+The only authoritative construction path is:
+
+```text
+derive_git_source_authority(clean repository)
+-> build_bound_structural_index(authority, source paths)
+-> run_bound_data_flow_query(index, bounded query)
+-> build_structural_evidence_snapshot(bound analysis)
+```
+
+The public types are:
+
+- `GitSourceAuthority`: captured clean `git.commit` authority.
+- `BoundStructuralIndex`: exact extracted nodes and edges plus a deterministic, checkout-root-independent `index_fingerprint`.
+- `BoundStructuralAnalysis`: traversal result plus its source authority, index fingerprint, traversal fingerprint, and combined binding fingerprint.
+- `StructuralEvidenceSnapshot`: trusted serialized v2 evidence envelope carrying `analysis_binding`.
+
+`build_structural_evidence_snapshot()` rejects an unbound `DataFlowTraversalResult`, even when an independently valid `GitSourceAuthority` is supplied. `source_authority=` and `source_revision=` are confirmation-only inputs for a bound analysis. They cannot relabel it.
+
+Low-level `extract()` and `run_data_flow_query()` remain diagnostic/general-purpose APIs. Their outputs are not authoritative GVR structural evidence and cannot directly produce a trusted snapshot. Unit tests that isolate snapshot normalization use an explicitly private test-only constructor path. Production and fixture generation use only the public bound pipeline.
+
+## Existing Graphify identity and the chosen design
+
+Graphify had no repository revision identity propagated through extraction or traversal. `semantic_search.graph_fingerprint()` fingerprints only semantically indexed node text and omits traversal-relevant edges, so it is insufficient as structural authority.
+
+The v2 index fingerprint therefore covers the exact extracted node and edge state consumed by traversal. Canonicalization removes the checkout-root locator and root-derived ID prefix while retaining semantic extracted content. The traversal fingerprint covers the exact normalized `DataFlowTraversalResult`. The combined binding fingerprint covers:
+
+- serialized source revision scope and its fingerprint;
+- exact extracted/indexed state fingerprint;
+- exact traversal result fingerprint.
+
+Absolute checkout paths, cache locations, timestamps, request IDs, run IDs, and correlation IDs do not participate in public semantic identity.
+
+## TOCTOU semantics
+
+`build_bound_structural_index()` validates the captured authority immediately before extraction and again immediately after extraction.
+
+- Dirty or untracked source fails closed.
+- A checkout or commit movement after authority capture but before or during extraction fails closed and requires a new authority.
+- After a bound index and bound analysis are produced, later checkout movement does not mutate their captured identity.
+- Mutation of the bound index before traversal or the traversal result before snapshot construction is detected by fingerprint recomputation.
+
+The extraction cache should be outside the source repository or ignored by Git. Otherwise its writes correctly make the authoritative worktree dirty and fail closed.
 
 ## Identity and revisions
 
-A snapshot records two independent revision axes:
+A snapshot records independent source and analyzer axes:
 
-- `source_revision_scope` identifies the analyzed source as `git.commit` plus its commit SHA. The local checkout path is intentionally excluded from public serialization and fingerprints.
-- `derive_git_source_authority(repo_root)` must be called against the clean Git source materialization used for analysis. It captures `HEAD` only after proving the index, tracked files, and untracked-file set are clean. Dirty or uncommitted source fails closed rather than being mislabeled as a clean commit.
-- `build_structural_evidence_snapshot(..., source_authority=...)` accepts that captured authority. The optional `source_revision=` compatibility input is confirmation only. It must equal the captured revision and cannot relabel an analyzed result. The builder never re-reads Git, so a later checkout move cannot silently change the captured source identity.
-- `analyzer_revision` identifies the Graphify analyzer release that produced the evidence. It is namespaced as `graphifyy/<revision>` and changes independently of the source revision.
+- `source_revision_scope` identifies the analyzed source as `git.commit` plus its commit SHA. The local checkout path is omitted.
+- `analysis_binding` proves which extracted/indexed graph and traversal were sealed to that source scope.
+- `analyzer_revision` identifies the Graphify analyzer release independently of the source revision.
 
-The snapshot fingerprint covers both axes and all public evidence content. It therefore changes when either the source or analyzer semantics change, while remaining byte-stable across checkout roots and mapping order.
+The snapshot fingerprint covers these axes and all public evidence content. The same commit and extracted state at different checkout roots yields the same identity. A source revision, index state, traversal result, or analyzer revision change advances identity.
 
-Observation-only `request_id`, `query_id`, `run_id`, `correlation_id`, and `observation_id` values are excluded from semantic query identity. They cannot alter immutable fact keys or the snapshot content fingerprint.
+Observation-only `request_id`, `query_id`, `run_id`, `correlation_id`, and `observation_id` values are excluded from semantic query identity.
 
-## Evidence model
+## Evidence and integrity model
 
-- `facts` are direct, typed source facts. Each carries a content-addressed `df:<sha256>` key, relation, endpoints, source location, provenance, analysis completeness, receiver confidence, and optional argument index.
-- `paths` are derived ordered references to direct facts. They do not create new evidence.
-- `coverage` records search bounds, termination, truncation, input resolution, encountered partial or unknown constructs, and whether `MAY` evidence was encountered.
-- `blockers` are first-class unresolved, ambiguous, or unsupported boundaries. They carry deterministic `bnd:<sha256>` keys and `diag:` references instead of fabricating a traversable edge.
+- `facts` are direct typed source facts with content-addressed `df:<sha256>` keys.
+- `paths` are ordered references to direct facts and do not invent evidence.
+- `coverage` records bounds, termination, truncation, input resolution, and epistemic limitations.
+- `blockers` represent unresolved, ambiguous, or unsupported boundaries with `bnd:<sha256>` and `diag:` keys.
 
-Identical duplicate facts, paths, and blockers are collapsed deterministically at the builder boundary. Conflicting payloads under one immutable `df:`, ordered path, or `bnd:` identity fail closed before any candidate can be overwritten.
+Identical duplicates collapse deterministically. Conflicting payloads under one immutable fact, path, or blocker identity fail closed. Every path identity must exactly equal its ordered supporting evidence keys, every referenced `df:` key must exist, and every fact-to-path reference must resolve.
 
-For every path, `path_identity` is exactly the ordered tuple of `supporting_evidence_keys`. Every referenced key must be a `df:` fact present in the same snapshot. Fact-to-path references must resolve, and the source-scope provider must equal the snapshot provider. Construction, serialization loading, and validation all enforce these rules.
+No snapshot contains a verification verdict. Absence remains `UNKNOWN` unless the separate bounded-search coverage contract proves complete supported search.
 
-No snapshot contains a verification verdict. `confidence`, `exactness`, provenance, and coverage describe evidence quality only.
+## Compatibility
 
-Downstream GVR consumers must treat absent evidence as `UNKNOWN` unless the separate bounded traversal/search contract certifies complete supported search. Silence in a structural snapshot is not authoritative `NO_PATH` evidence.
+The `df:<sha256>` and `bnd:<sha256>` canonicalization remains unchanged and GVR-compatible. The schema/format and outer snapshot fingerprint namespace advanced to v2 because `analysis_binding` is mandatory trusted state.
 
-## Exact and partial evidence
+`load_snapshot()` and `validate_snapshot()` verify schema, namespaces, typed fields, content-addressed keys, cross-references, the internal binding fingerprint, and the outer snapshot fingerprint. Recomputing only the outer fingerprint after tampering with binding components does not make a document valid.
 
-Exact paths are emitted only when every supporting hop is exact and the receiver is proven. A path is partial when a supported construct is only partially analyzed, when receiver identity is `MAY`, or when an unresolved boundary prevents complete supported search. The snapshot preserves these distinctions in `path_exactness`, `receiver_confidence`, per-fact `analysis_completeness`, search coverage, and blockers.
-
-Supported provenance values are:
-
-- `STATIC_AST`
-- `CROSS_FILE`
-- `FRAMEWORK_CONTRACT`
-
-Supported construct coverage values are `COMPLETE_FOR_SUPPORTED_CONSTRUCT`, `PARTIAL`, and `UNKNOWN`. Receiver confidence is `PROVEN` or `MAY`.
-
-The v1 traversal-backed export publishes currently proven direct data-flow/reference facts plus persistence/framework blockers already represented by the branch. General `CALL`, general symbol `REFERENCE`, and `IMPORT` export are not promoted to exact structural relations by this contract when the current analyzer cannot prove the target identity. Synthetic architecture edges are out of scope.
-
-## Data-flow key compatibility
-
-`graphify.structural_evidence.df_key_from_edge` is the single implementation used by the public contract and `graphify.data_flow_query._evidence_key`. Its canonical field pairs and SHA-256 encoding remain byte-compatible with GVR's Graphify `df:` validator. Absolute paths and volatile metadata never participate.
-
-## Serialization and validation
-
-Use:
+## Usage
 
 ```python
+from pathlib import Path
+
+from graphify.data_flow_query import DataFlowQuery
 from graphify.structural_evidence import (
+    build_bound_structural_index,
     build_structural_evidence_snapshot,
     derive_git_source_authority,
-    load_snapshot,
+    run_bound_data_flow_query,
     serialize_snapshot,
-    validate_snapshot,
 )
+
+repo = Path("/path/to/clean/repository")
+authority = derive_git_source_authority(repo)
+index = build_bound_structural_index(
+    authority,
+    sorted(repo.rglob("*.java")),
+    cache_root=repo.parent / ".graphify-authoritative-cache",
+)
+analysis = run_bound_data_flow_query(index, DataFlowQuery(start="node-id", max_depth=6))
+snapshot = build_structural_evidence_snapshot(analysis)
+payload = serialize_snapshot(snapshot)
 ```
 
-Derive authority before extraction/traversal from the source materialization that
-will be analyzed, retain the immutable authority object with that analysis state,
-and pass it to the builder. A caller-provided SHA is never source authority.
-
-`serialize_snapshot` emits deterministic compact JSON with sorted keys, UTF-8 content, and non-finite numbers rejected. `load_snapshot` and `validate_snapshot` verify schema, namespaces, typed fields, content-addressed keys, and the snapshot fingerprint.
-
-The generated acceptance fixture is `tests/fixtures/structural_evidence/structural_evidence_snapshot.json`. `test_committed_fixture_is_current` regenerates it from a real deterministic git repository, Java extraction, and bounded data-flow traversal, then requires exact structural equality.
+The committed acceptance fixture is `tests/fixtures/structural_evidence/structural_evidence_snapshot.json`. Its generator creates a deterministic Git repository, derives authority, extracts through `build_bound_structural_index()`, traverses through `run_bound_data_flow_query()`, and exports through the bound snapshot builder.

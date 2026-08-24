@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -115,9 +116,11 @@ def test_new_revision_requires_regenerated_analysis(tmp_path: Path):
     subprocess.run(["git", "commit", "-q", "-m", "revision-b"], cwd=repo, check=True, env=_GIT_ENV)
     authority_b, _index_b, analysis_b = _analysis(repo, tmp_path / "cache-b")
     snapshot_b = build_structural_evidence_snapshot(analysis_b)
+    replayed_a = build_structural_evidence_snapshot(analysis_a)
     assert authority_a.source_revision != authority_b.source_revision
     assert analysis_a.binding_fingerprint != analysis_b.binding_fingerprint
     assert snapshot_a.fingerprint != snapshot_b.fingerprint
+    assert replayed_a.fingerprint == snapshot_a.fingerprint
     with pytest.raises(StructuralEvidenceContractError, match="source authority"):
         build_structural_evidence_snapshot(analysis_a, source_authority=authority_b)
 
@@ -140,7 +143,7 @@ def test_unbound_synthetic_traversal_cannot_create_authoritative_snapshot(tmp_pa
     authority = derive_git_source_authority(repo)
     unbound = run_data_flow_query(*_graph(), DataFlowQuery(start="A", max_depth=5))
     with pytest.raises(StructuralEvidenceContractError, match="bound structural analysis"):
-        build_structural_evidence_snapshot(unbound, source_authority=authority)
+        build_structural_evidence_snapshot(cast(Any, unbound), source_authority=authority)
 
 
 def test_bound_serialization_validates_internal_binding(tmp_path: Path):

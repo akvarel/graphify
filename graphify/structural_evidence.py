@@ -1,4 +1,4 @@
-"""Graphify Structural Evidence Snapshot public contract (v1).
+"""Graphify Structural Evidence Snapshot public contract (v2).
 
 A :class:`StructuralEvidenceSnapshot` is the versioned, deterministic,
 source-revision-scoped public contract through which Graphify exports structural
@@ -20,6 +20,10 @@ Contract pillars
 * **Source-revision scoped.** Every snapshot is sealed to a
   ``(source_class, source_revision)`` pair (``git.commit`` + commit SHA); a
   revision change advances the scope fingerprint.
+* **Source/index/traversal bound.** Trusted snapshots can only be built from a
+  :class:`BoundStructuralAnalysis` created by the authoritative source extraction
+  and traversal pipeline. The serialized binding fingerprints the source scope,
+  exact extracted/indexed graph state, and exact traversal result.
 * **df-compatible.** Fact identity uses the public ``df:<sha256>`` evidence key
   whose canonicalization is identical to :func:`graphify.data_flow_query._evidence_key`
   and to GVR's :func:`gvr.graphify_contract.validate_graphify_df_evidence`, so a
@@ -43,7 +47,8 @@ import hashlib
 import json
 import re
 import subprocess
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -78,6 +83,9 @@ __all__ = [
     "StructuralEvidenceCoverageState",
     "GitSourceAuthority",
     "SourceRevisionScope",
+    "StructuralAnalysisBinding",
+    "BoundStructuralIndex",
+    "BoundStructuralAnalysis",
     # snapshot
     "StructuralEvidenceSnapshot",
     # primitives
@@ -89,6 +97,8 @@ __all__ = [
     "structural_evidence_fingerprint",
     # builders / serializers
     "build_structural_evidence_snapshot",
+    "build_bound_structural_index",
+    "run_bound_data_flow_query",
     "derive_git_source_authority",
     "serialize_snapshot",
     "load_snapshot",
@@ -98,9 +108,12 @@ __all__ = [
 # --------------------------------------------------------------------------- #
 # Contract metadata / namespaces
 # --------------------------------------------------------------------------- #
-STRUCTURAL_EVIDENCE_SCHEMA_VERSION: int = 1
-STRUCTURAL_EVIDENCE_FORMAT: str = "graphify.structural_evidence.v1"
-STRUCTURAL_EVIDENCE_FINGERPRINT_FORMAT: str = "graphify.structural_evidence.fingerprint.v1"
+STRUCTURAL_EVIDENCE_SCHEMA_VERSION: int = 2
+STRUCTURAL_EVIDENCE_FORMAT: str = "graphify.structural_evidence.v2"
+STRUCTURAL_EVIDENCE_FINGERPRINT_FORMAT: str = "graphify.structural_evidence.fingerprint.v2"
+STRUCTURAL_INDEX_FINGERPRINT_FORMAT: str = "graphify.structural_index.fingerprint.v1"
+STRUCTURAL_TRAVERSAL_FINGERPRINT_FORMAT: str = "graphify.structural_traversal.fingerprint.v1"
+STRUCTURAL_ANALYSIS_BINDING_FORMAT: str = "graphify.structural_analysis.binding.v1"
 
 GRAPHIFY_PROVIDER_ID: str = "graphify"
 SOURCE_CLASS_GIT_COMMIT: str = "git.commit"
@@ -132,6 +145,8 @@ class StructuralEvidenceContractError(ValueError):
 
 
 _SOURCE_AUTHORITY_TOKEN = object()
+_BOUND_INDEX_TOKEN = object()
+_BOUND_ANALYSIS_TOKEN = object()
 
 
 # --------------------------------------------------------------------------- #
@@ -765,8 +780,290 @@ class SourceRevisionScope:
         }
 
 
+def _same_source_authority(left: GitSourceAuthority, right: GitSourceAuthority) -> bool:
+    return left.to_scope().to_dict() == right.to_scope().to_dict()
+
+
+def _validate_captured_authority(authority: GitSourceAuthority) -> None:
+    current = derive_git_source_authority(authority.repo_root)
+    if not _same_source_authority(authority, current):
+        raise StructuralEvidenceContractError(
+            "source authority changed after capture; derive a new authority and re-run analysis"
+        )
+
+
+def _portable_binding_value(value: Any, repo_root: str) -> Any:
+    """Canonicalize extracted state without retaining checkout-root locators."""
+    root = str(Path(repo_root).resolve()).replace("\\", "/").rstrip("/")
+    from graphify.ids import normalize_id
+
+    root_id = normalize_id(root)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _portable_binding_value(item, repo_root)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_portable_binding_value(item, repo_root) for item in value]
+    if isinstance(value, set | frozenset):
+        normalized = [_portable_binding_value(item, repo_root) for item in value]
+        return sorted(normalized, key=lambda item: json.dumps(item, sort_keys=True, default=str))
+    if isinstance(value, Path):
+        value = str(value)
+    if isinstance(value, str):
+        portable = value.replace("\\", "/")
+        if portable == root:
+            return "."
+        if root and portable.startswith(root + "/"):
+            return portable[len(root) + 1 :]
+        if root_id and portable.startswith(root_id + "_"):
+            return portable[len(root_id) + 1 :]
+        return portable
+    return value
+
+
+def _index_fingerprint(
+    nodes: Sequence[Mapping[str, Any]],
+    edges: Sequence[Mapping[str, Any]],
+    repo_root: str,
+) -> str:
+    normalized_nodes = [_portable_binding_value(node, repo_root) for node in nodes]
+    normalized_edges = [_portable_binding_value(edge, repo_root) for edge in edges]
+    key = lambda item: json.dumps(item, sort_keys=True, ensure_ascii=False, default=str)
+    digest = structural_evidence_fingerprint(
+        {
+            "nodes": sorted(normalized_nodes, key=key),
+            "edges": sorted(normalized_edges, key=key),
+        },
+        fingerprint_format=STRUCTURAL_INDEX_FINGERPRINT_FORMAT,
+    )
+    return f"sha256:{digest}"
+
+
+def _traversal_fingerprint(result: Any) -> str:
+    try:
+        value = asdict(result)
+    except (TypeError, ValueError) as exc:
+        raise StructuralEvidenceContractError(
+            "bound structural analysis requires a dataclass traversal result"
+        ) from exc
+    digest = structural_evidence_fingerprint(
+        value,
+        fingerprint_format=STRUCTURAL_TRAVERSAL_FINGERPRINT_FORMAT,
+    )
+    return f"sha256:{digest}"
+
+
+def _binding_fingerprint(
+    scope: SourceRevisionScope,
+    index_fingerprint: str,
+    traversal_fingerprint: str,
+) -> str:
+    digest = structural_evidence_fingerprint(
+        {
+            "source_revision_scope": scope.to_dict(),
+            "source_scope_fingerprint": scope.fingerprint,
+            "index_fingerprint": index_fingerprint,
+            "traversal_fingerprint": traversal_fingerprint,
+        },
+        fingerprint_format=STRUCTURAL_ANALYSIS_BINDING_FORMAT,
+    )
+    return f"sha256:{digest}"
+
+
+@dataclass(frozen=True)
+class StructuralAnalysisBinding:
+    """Auditable immutable source -> extracted state -> traversal binding."""
+
+    source_scope_fingerprint: str
+    index_fingerprint: str
+    traversal_fingerprint: str
+    binding_fingerprint: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "source_scope_fingerprint",
+            "index_fingerprint",
+            "traversal_fingerprint",
+            "binding_fingerprint",
+        ):
+            value = str(getattr(self, name) or "")
+            if not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", value):
+                raise StructuralEvidenceContractError(f"invalid analysis binding {name}")
+
+    def validate(self, scope: SourceRevisionScope) -> None:
+        if self.source_scope_fingerprint != scope.fingerprint:
+            raise StructuralEvidenceContractError(
+                "analysis binding source scope does not match snapshot source authority"
+            )
+        expected = _binding_fingerprint(
+            scope, self.index_fingerprint, self.traversal_fingerprint
+        )
+        if self.binding_fingerprint != expected:
+            raise StructuralEvidenceContractError("analysis binding fingerprint mismatch")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "source_scope_fingerprint": self.source_scope_fingerprint,
+            "index_fingerprint": self.index_fingerprint,
+            "traversal_fingerprint": self.traversal_fingerprint,
+            "binding_fingerprint": self.binding_fingerprint,
+        }
+
+
+@dataclass(frozen=True, init=False)
+class BoundStructuralIndex:
+    """Exact extracted/indexed graph state sealed to captured Git authority."""
+
+    source_authority: GitSourceAuthority
+    nodes: tuple[dict[str, Any], ...]
+    edges: tuple[dict[str, Any], ...]
+    index_fingerprint: str
+
+    def __init__(
+        self,
+        *,
+        source_authority: GitSourceAuthority,
+        nodes: Sequence[Mapping[str, Any]],
+        edges: Sequence[Mapping[str, Any]],
+        index_fingerprint: str,
+        _token: object,
+    ) -> None:
+        if _token is not _BOUND_INDEX_TOKEN:
+            raise StructuralEvidenceContractError(
+                "BoundStructuralIndex must be created by build_bound_structural_index"
+            )
+        object.__setattr__(self, "source_authority", source_authority)
+        object.__setattr__(self, "nodes", tuple(deepcopy(dict(node)) for node in nodes))
+        object.__setattr__(self, "edges", tuple(deepcopy(dict(edge)) for edge in edges))
+        object.__setattr__(self, "index_fingerprint", index_fingerprint)
+
+    def validate(self) -> None:
+        actual = _index_fingerprint(
+            self.nodes, self.edges, self.source_authority.repo_root
+        )
+        if actual != self.index_fingerprint:
+            raise StructuralEvidenceContractError("bound structural index fingerprint mismatch")
+
+
+@dataclass(frozen=True, init=False)
+class BoundStructuralAnalysis:
+    """Traversal result inseparably bound to its source authority and index state."""
+
+    source_authority: GitSourceAuthority
+    index_fingerprint: str
+    result: Any
+    traversal_fingerprint: str
+    binding_fingerprint: str
+
+    def __init__(
+        self,
+        *,
+        source_authority: GitSourceAuthority,
+        index_fingerprint: str,
+        result: Any,
+        traversal_fingerprint: str,
+        binding_fingerprint: str,
+        _token: object,
+    ) -> None:
+        if _token is not _BOUND_ANALYSIS_TOKEN:
+            raise StructuralEvidenceContractError(
+                "BoundStructuralAnalysis must be created by run_bound_data_flow_query"
+            )
+        object.__setattr__(self, "source_authority", source_authority)
+        object.__setattr__(self, "index_fingerprint", index_fingerprint)
+        object.__setattr__(self, "result", result)
+        object.__setattr__(self, "traversal_fingerprint", traversal_fingerprint)
+        object.__setattr__(self, "binding_fingerprint", binding_fingerprint)
+
+    @property
+    def analysis_binding(self) -> StructuralAnalysisBinding:
+        return StructuralAnalysisBinding(
+            source_scope_fingerprint=self.source_authority.to_scope().fingerprint,
+            index_fingerprint=self.index_fingerprint,
+            traversal_fingerprint=self.traversal_fingerprint,
+            binding_fingerprint=self.binding_fingerprint,
+        )
+
+    def validate(self) -> None:
+        actual_traversal = _traversal_fingerprint(self.result)
+        if actual_traversal != self.traversal_fingerprint:
+            raise StructuralEvidenceContractError("bound structural analysis traversal binding mismatch")
+        self.analysis_binding.validate(self.source_authority.to_scope())
+
+
+def build_bound_structural_index(
+    source_authority: GitSourceAuthority,
+    paths: Sequence[str | Path],
+    *,
+    cache_root: str | Path | None = None,
+    parallel: bool = False,
+) -> BoundStructuralIndex:
+    """Extract exact source state under captured authority and seal its graph identity.
+
+    Authority is checked both before and after extraction. A dirty worktree or a
+    checkout movement during extraction therefore fails closed instead of binding
+    the produced index to a stale clean commit.
+    """
+    if not isinstance(source_authority, GitSourceAuthority):
+        raise StructuralEvidenceContractError("source_authority must be GitSourceAuthority")
+    _validate_captured_authority(source_authority)
+    root = Path(source_authority.repo_root).resolve()
+    resolved_paths = tuple(Path(path).resolve() for path in paths)
+    for path in resolved_paths:
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise StructuralEvidenceContractError(
+                "authoritative extraction paths must be within the source repository"
+            ) from exc
+
+    from graphify.extract import extract
+
+    extracted = extract(
+        list(resolved_paths),
+        root=root,
+        cache_root=None if cache_root is None else Path(cache_root),
+        parallel=parallel,
+    )
+    _validate_captured_authority(source_authority)
+    nodes = tuple(extracted.get("nodes", ()))
+    edges = tuple(extracted.get("edges", ()))
+    fingerprint = _index_fingerprint(nodes, edges, str(root))
+    return BoundStructuralIndex(
+        source_authority=source_authority,
+        nodes=nodes,
+        edges=edges,
+        index_fingerprint=fingerprint,
+        _token=_BOUND_INDEX_TOKEN,
+    )
+
+
+def run_bound_data_flow_query(index: BoundStructuralIndex, query: Any) -> BoundStructuralAnalysis:
+    """Run bounded traversal over one validated bound extracted/indexed state."""
+    if not isinstance(index, BoundStructuralIndex):
+        raise StructuralEvidenceContractError("authoritative traversal requires BoundStructuralIndex")
+    index.validate()
+    from graphify.data_flow_query import run_data_flow_query
+
+    result = run_data_flow_query(index.nodes, index.edges, query)
+    traversal_fingerprint = _traversal_fingerprint(result)
+    scope = index.source_authority.to_scope()
+    binding_fingerprint = _binding_fingerprint(
+        scope, index.index_fingerprint, traversal_fingerprint
+    )
+    return BoundStructuralAnalysis(
+        source_authority=index.source_authority,
+        index_fingerprint=index.index_fingerprint,
+        result=result,
+        traversal_fingerprint=traversal_fingerprint,
+        binding_fingerprint=binding_fingerprint,
+        _token=_BOUND_ANALYSIS_TOKEN,
+    )
+
+
 # --------------------------------------------------------------------------- #
-# The versioned, deterministic, source-revision-scoped public snapshot
+# The versioned, deterministic, source-bound public snapshot
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class StructuralEvidenceSnapshot:
@@ -783,6 +1080,7 @@ class StructuralEvidenceSnapshot:
     provider_id: str
     analyzer_revision: str
     source_revision_scope: SourceRevisionScope
+    analysis_binding: StructuralAnalysisBinding
     query: Mapping[str, Any]
     coverage: StructuralEvidenceCoverageState
     facts: tuple[StructuralEvidenceFact, ...]
@@ -802,6 +1100,7 @@ class StructuralEvidenceSnapshot:
             raise StructuralEvidenceContractError(
                 "snapshot provider identity must match source revision scope provider identity"
             )
+        self.analysis_binding.validate(self.source_revision_scope)
         if not str(self.analyzer_revision or "").strip():
             raise StructuralEvidenceContractError("analyzer_revision must be non-empty")
         if "/" not in self.analyzer_revision:
@@ -853,6 +1152,7 @@ class StructuralEvidenceSnapshot:
             "provider_id": self.provider_id,
             "analyzer_revision": self.analyzer_revision,
             "source_revision_scope": self.source_revision_scope.to_dict(),
+            "analysis_binding": self.analysis_binding.to_dict(),
             "query": dict(self.query),
             "coverage": self.coverage.to_dict(),
             "facts": [f.to_dict() for f in self.facts],
@@ -924,6 +1224,12 @@ class StructuralEvidenceSnapshot:
         if doc.get("provider_id") != GRAPHIFY_PROVIDER_ID:
             raise StructuralEvidenceContractError("snapshot provider_id mismatch")
         scope = SourceRevisionScope(**doc["source_revision_scope"])  # type: ignore[arg-type]
+        try:
+            binding = StructuralAnalysisBinding(**doc["analysis_binding"])  # type: ignore[arg-type]
+        except (KeyError, TypeError) as exc:
+            raise StructuralEvidenceContractError(
+                "snapshot analysis binding is required"
+            ) from exc
         coverage = _coverage_from_dict(doc["coverage"])
         facts = tuple(_fact_from_dict(item) for item in doc.get("facts", []))
         paths = tuple(_path_from_dict(item) for item in doc.get("paths", []))
@@ -935,6 +1241,7 @@ class StructuralEvidenceSnapshot:
             provider_id=GRAPHIFY_PROVIDER_ID,
             analyzer_revision=str(doc.get("analyzer_revision") or ""),
             source_revision_scope=scope,
+            analysis_binding=binding,
             query=query,
             coverage=coverage,
             facts=facts,
@@ -950,31 +1257,37 @@ class StructuralEvidenceSnapshot:
 # Builders / serializers
 # --------------------------------------------------------------------------- #
 def build_structural_evidence_snapshot(
-    result: Any,
+    analysis: BoundStructuralAnalysis,
     *,
-    source_authority: GitSourceAuthority,
+    source_authority: GitSourceAuthority | None = None,
     source_revision: str | None = None,
     analyzer_revision: str = DEFAULT_ANALYZER_REVISION,
     snapshot_query: Mapping[str, Any] | None = None,
 ) -> StructuralEvidenceSnapshot:
-    """Build a deterministic StructuralEvidenceSnapshot from a traversal result.
+    """Build a trusted snapshot from a validated, source-bound traversal.
 
-    ``result`` is the public :class:`graphify.data_flow_query.DataFlowTraversalResult`
-    (or any compatible mapping exposing ``paths``, ``boundary_events``, the
-    coverage/epistemic fields and ``query_bounds``). Source-derived facts are
-    collected from each path's ``supporting_evidence`` and de-duplicated by their
-    public ``df:`` key; blocking boundaries become :class:`StructuralEvidenceBlocker`
-    records. No truth verdict is computed or emitted.
+    An arbitrary traversal result plus an independently valid authority is not an
+    authoritative input. The source authority, extracted/indexed state fingerprint,
+    and traversal fingerprint must arrive as one :class:`BoundStructuralAnalysis`.
     """
-    if not isinstance(source_authority, GitSourceAuthority):
+    if not isinstance(analysis, BoundStructuralAnalysis):
         raise StructuralEvidenceContractError(
-            "source_authority must be derived from the analyzed source context"
+            "authoritative snapshot requires a bound structural analysis"
         )
-    if source_revision is not None and source_revision != source_authority.source_revision:
+    analysis.validate()
+    bound_authority = analysis.source_authority
+    if source_authority is not None and not _same_source_authority(
+        source_authority, bound_authority
+    ):
+        raise StructuralEvidenceContractError(
+            "source authority confirmation does not match bound structural analysis"
+        )
+    if source_revision is not None and source_revision != bound_authority.source_revision:
         raise StructuralEvidenceContractError(
             "expected source revision does not match authoritative source revision"
         )
-    scope = source_authority.to_scope()
+    scope = bound_authority.to_scope()
+    result = analysis.result
 
     # Collect unique facts across all paths, keyed by their public df key.
     facts_by_key: dict[str, StructuralEvidenceFact] = {}
@@ -1054,6 +1367,7 @@ def build_structural_evidence_snapshot(
         provider_id=GRAPHIFY_PROVIDER_ID,
         analyzer_revision=analyzer_revision,
         source_revision_scope=scope,
+        analysis_binding=analysis.analysis_binding,
         query=query,
         coverage=coverage,
         facts=tuple(facts),
