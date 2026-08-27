@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from graphify.build import build_from_json
 from graphify.extract import extract
 
@@ -830,3 +832,76 @@ def test_java_field_authority_a6_static_field_has_explicit_class_scope(tmp_path:
         assert metadata.get("receiverPath") == "Counter"
         assert metadata.get("instanceAuthority") == "NOT_APPLICABLE"
         assert metadata.get("aliasAuthority") == "NOT_APPLICABLE"
+
+
+@pytest.mark.parametrize(
+    ("edge_case", "relation", "target_kind", "target_name", "target_owner"),
+    [
+        ("assignment READ_FROM", "READ_FROM", "LOCAL", "assigned", "Flow.assign()"),
+        ("return READ_FROM", "READ_FROM", "RETURN_VALUE", "return", "Flow.direct()"),
+        ("return RETURNED_AS", "RETURNED_AS", "RETURN_VALUE", "return", "Flow.direct()"),
+        (
+            "call PASSED_AS_ARGUMENT",
+            "PASSED_AS_ARGUMENT",
+            "PARAMETER",
+            "raw",
+            "Flow.identity(int)",
+        ),
+        (
+            "call TRANSFORMED_BY",
+            "TRANSFORMED_BY",
+            "RETURN_VALUE",
+            "return",
+            "Flow.identity(int)",
+        ),
+    ],
+    ids=[
+        "assignment-READ_FROM",
+        "return-READ_FROM",
+        "return-RETURNED_AS",
+        "call-PASSED_AS_ARGUMENT",
+        "call-TRANSFORMED_BY",
+    ],
+)
+def test_java_field_authority_a7_parenthesized_explicit_this_preserves_metadata(
+    tmp_path: Path,
+    edge_case: str,
+    relation: str,
+    target_kind: str,
+    target_name: str,
+    target_owner: str,
+):
+    result = _extract(tmp_path, """
+        class Flow {
+          int value;
+          void assign() {
+            int assigned = 0;
+            assigned = (this.value);
+          }
+          int direct() { return (this.value); }
+          void call() { identity((this.value)); }
+          int identity(int raw) { return raw; }
+        }
+    """)
+    field = _value(result, "FIELD", "value", "Flow.value")
+    target = _value(result, target_kind, target_name, target_owner)
+    edge = next(
+        edge
+        for edge in _edges(result, relation)
+        if edge["source"] == field and edge["target"] == target
+    )
+
+    metadata = edge.get("metadata", {})
+    assert {
+        "declarationResolution": metadata.get("declarationResolution"),
+        "receiverKind": metadata.get("receiverKind"),
+        "receiverPath": metadata.get("receiverPath"),
+        "instanceAuthority": metadata.get("instanceAuthority"),
+        "aliasAuthority": metadata.get("aliasAuthority"),
+    } == {
+        "declarationResolution": "EXACT",
+        "receiverKind": "THIS",
+        "receiverPath": "Flow",
+        "instanceAuthority": "UNKNOWN",
+        "aliasAuthority": "MAY",
+    }, edge_case
