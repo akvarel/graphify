@@ -107,8 +107,9 @@ rewriting history.
 | R3-A Declaration certainty was treated as runtime instance proof | Round 2 marked `this`, unqualified access, and deterministic `this.<chain>` paths `PROVEN`, although the FIELD node represents a declaration and the extractor performs no heap/instance analysis. | `graphify/extractors/java_data_flow.py`, `tests/test_java_data_flow.py` | Field edges now emit `declarationResolution = EXACT` separately from `instanceAuthority = UNKNOWN` and `aliasAuthority = MAY`. Every ordinary instance access has `receiverConfidence = MAY`, including `this` and unqualified access. | A1 explicit `this.value`; A2 unqualified `value`; A3 named `other.value`. | PASS |
 | R3-B Deterministic nested paths could be laundered into same-instance authority | `this.box.value` had a stable `Flow.box` path and was therefore marked `PROVEN`; left/right receiver paths were not explicitly distinguished from alias evidence. | same | `receiverKind` and `receiverPath` preserve deterministic source access identity, but nested instance paths remain `UNKNOWN`/`MAY`. Distinct `left`/`right` paths prove neither aliasing nor non-aliasing. | A4 nested `this.box.value`; A5 `left.value` versus `right.value`. | PASS |
 | R3-C Static class scope was conflated with instance receiver confidence | Explicit class access used the same `PROVEN` vocabulary as instance accesses and field declarations did not retain the AST `static` modifier. | same | Static modifiers are collected from the Java AST. Explicit `Counter.value` emits `receiverKind = STATIC_CLASS`, `fieldScope = STATIC`, and instance/alias authority `NOT_APPLICABLE`. Explicit class access to a non-static field fails closed. | A6 explicit static class field plus independent invalid `Type.instanceField` omission probe. | PASS |
-| R3-D Field authority could be lost on parallel field-derived relations | Receiver authority was present only on selected `READ_FROM`/`WRITTEN_TO` edges, while field-derived `PASSED_AS_ARGUMENT`, `RETURNED_AS`, and `TRANSFORMED_BY` could retain unqualified confidence. Assignment reads could also use `FLOWS_TO`. | `graphify/extractors/java_data_flow.py` | The same field authority metadata is carried on field-derived call/return/transformation relations. Field-to-local assignments use `READ_FROM`, preserving the frozen field-read semantics and MAY authority. | Existing parallel-relation/build tests plus A1-A6 and the independent adversarial probe. | PASS |
+| R3-D Field authority could be lost on parallel field-derived relations | Receiver authority was present only on selected `READ_FROM`/`WRITTEN_TO` edges, while field-derived `PASSED_AS_ARGUMENT`, `RETURNED_AS`, and `TRANSFORMED_BY` could retain unqualified confidence. Assignment reads could also use `FLOWS_TO`. | `graphify/extractors/java_data_flow.py` | The same field authority metadata is carried on field-derived call/return/transformation relations. Field-to-local assignments use `READ_FROM`, preserving the frozen field-read semantics and MAY authority. | Existing parallel-relation/build tests plus A1-A7 and the independent adversarial probe. | PASS |
 | R3-E Integrate exact current v8 | The branch started 62 commits behind exact v8 `43d54ac`. | merge commit | Merged `43d54acbfa9e731f7a592bb582c1f4b9d48ed73e` normally with the `ort` strategy and `--no-ff`. There were no conflicts and no manual conflict resolutions. | Focused and full validation after integration. | PASS |
+| R3-F Parenthesized field access lost authority metadata | `expr_value` unwrapped `(this.value)` to the field value, but `field_edge_md` received the parenthesized wrapper and therefore emitted no declaration or receiver authority metadata. | `graphify/extractors/java_data_flow.py`, `tests/test_java_data_flow.py` | Added one shared `unwrap_parenthesized_expression` helper used by both value resolution and field-edge metadata resolution. It preserves the existing single-named-child behavior and does not broaden expression semantics. | A7 parameterizes exactly five affected edges: assignment `READ_FROM`; return `READ_FROM` and `RETURNED_AS`; call `PASSED_AS_ARGUMENT` and `TRANSFORMED_BY`. | PASS |
 
 ### Gate 3 semantics for receiver/instance flow (Round-3 contract)
 
@@ -215,7 +216,7 @@ Basic interprocedural extraction is currently bounded to exactly resolved declar
 ## Final Validation — Round 3
 
 Validated production commit:
-`3755c8ad87ed9f8edeb42cebf2871344affc3b60` on
+`25d24717da07193aa591880664e55a34004bfe55` on
 `feature/java-local-data-flow-v8`.
 
 Git evidence:
@@ -228,10 +229,13 @@ Git evidence:
 - normal merge commit: `a5293ec6f7cb1b628b10f43da220a373ccb4dd64`
   (parents `a6734ea18b4580ceb98b2f2defab6883a9541194` and
   `43d54acbfa9e731f7a592bb582c1f4b9d48ed73e`); no conflicts;
-- merge-base(`3755c8a`, `upstream/v8`):
+- initial Round-3 authority GREEN: `3755c8ad87ed9f8edeb42cebf2871344affc3b60`;
+- A7 tests-only RED: `73a686df747bec23e70d158687527e8f5c6ffd4c`;
+- A7 production-only GREEN: `25d24717da07193aa591880664e55a34004bfe55`;
+- merge-base(`25d2471`, `upstream/v8`):
   `43d54acbfa9e731f7a592bb582c1f4b9d48ed73e`;
 - at the validated production commit, v8-only / branch-only commits:
-  **0 / 35**. The branch was therefore behind v8 by **0** commits.
+  **0 / 38**. The branch was therefore behind v8 by **0** commits.
 
 RED/GREEN evidence:
 
@@ -239,11 +243,16 @@ RED/GREEN evidence:
 - authentic RED command:
   `uv run --frozen pytest -q tests/test_java_data_flow.py`:
   **8 failed, 30 passed**;
-- GREEN Java data-flow suite: **38 passed**;
+- authentic A7 RED command targeting the new parameterized regression:
+  **5 failed**, one for each specified field-derived edge; all five lacked
+  `declarationResolution`, `receiverKind`, `receiverPath`, `instanceAuthority`,
+  and `aliasAuthority`;
+- A7 targeted GREEN: **5 passed**;
+- GREEN Java data-flow suite: **43 passed**;
 - Java resolution/member/call group: **106 passed**;
 - build/multigraph group: **118 passed**;
 - public extraction group: **248 passed, 4 skipped**;
-- full suite: **5133 passed, 72 skipped**, 4 warnings;
+- full suite: **5138 passed, 72 skipped**, 3 warnings in 87.74 seconds;
 - `uv run --frozen ruff check graphify tests`: PASS;
 - `uv run --frozen pyright graphify/extractors/java_data_flow.py tests/test_java_data_flow.py`:
   **0 errors, 0 warnings**;
@@ -254,7 +263,7 @@ RED/GREEN evidence:
 - `uv run --frozen graphify update .`: PASS. It reported existing optional-parser
   warnings for 7 SQL files and 1 DM file, plus one recovered Luau fixture.
 
-Independent adversarial extraction, using a fixture distinct from A1-A6, proved:
+Independent adversarial extraction, using a fixture distinct from A1-A7, proved:
 
 - nested instance paths `Flow.box`, `Flow@left.box`, and `Flow@right.box` remain
   distinct and MAY;

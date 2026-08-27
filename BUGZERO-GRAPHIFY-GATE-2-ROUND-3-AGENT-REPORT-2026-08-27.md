@@ -45,12 +45,24 @@ Round 3 commits:
    - commit contains `AI-assisted: Jcode`.
 3. Production GREEN: `3755c8ad87ed9f8edeb42cebf2871344affc3b60`
    - commit contains `AI-assisted: Jcode`.
+4. Initial evidence docs: `54ec03dd9ac94e51ae8671844c144524ddc3c0fa`
+   - docs only;
+   - commit contains `AI-assisted: Jcode`.
+5. A7 RED tests: `73a686df747bec23e70d158687527e8f5c6ffd4c`
+   - parent: `54ec03dd9ac94e51ae8671844c144524ddc3c0fa`;
+   - tests only;
+   - commit contains `AI-assisted: Jcode`.
+6. A7 production GREEN: `25d24717da07193aa591880664e55a34004bfe55`
+   - parent: `73a686df747bec23e70d158687527e8f5c6ffd4c`;
+   - production only;
+   - commit contains `AI-assisted: Jcode`.
 
-At the validated production commit:
+At the final validated production HEAD
+`25d24717da07193aa591880664e55a34004bfe55`:
 
 - `fork/v8` = `upstream/v8` = `43d54acbfa9e731f7a592bb582c1f4b9d48ed73e`;
 - merge-base with v8: `43d54acbfa9e731f7a592bb582c1f4b9d48ed73e`;
-- v8-only / branch-only commits: **0 / 35**;
+- v8-only / branch-only commits: **0 / 38**;
 - branch behind v8: **0**.
 
 ## Changed files authored in Round 3
@@ -80,6 +92,9 @@ The separate RED commit added mandatory public-boundary adversarial cases:
 - **A4**: nested `this.box.value` preserves `Flow.box` but is not definite instance evidence;
 - **A5**: `left.value` and `right.value` preserve distinct access paths without proving aliasing or non-aliasing;
 - **A6**: explicit static `Counter.value` has class scope and no instance/alias question.
+- **A7**: parenthesized `(this.value)` preserves the same field authority metadata
+  on exactly five affected edges: assignment `READ_FROM`; return `READ_FROM` and
+  `RETURNED_AS`; call `PASSED_AS_ARGUMENT` and `TRANSFORMED_BY`.
 
 Two prior Round-2 expectations were also corrected from `PROVEN` to `MAY` for `this` and nested-this access.
 
@@ -88,6 +103,15 @@ Authentic RED result with production code unchanged:
 - **8 failed, 30 passed**, 1 warning.
 
 After the test commit, and before any production change, the checkpoint was sent to the coordinator.
+
+The independent A7 RED commit left production unchanged and ran only the new
+parameterized regression. Authentic result:
+
+- command:
+  `uv run --frozen pytest -q tests/test_java_data_flow.py::test_java_field_authority_a7_parenthesized_explicit_this_preserves_metadata`;
+- **5 failed**, one per specified edge;
+- every failure showed missing `declarationResolution`, `receiverKind`,
+  `receiverPath`, `instanceAuthority`, and `aliasAuthority`.
 
 ## Production design and implementation
 
@@ -137,6 +161,15 @@ Field authority metadata is propagated across field-derived:
 
 Field-to-local assignment reads use `READ_FROM`, not `FLOWS_TO`, preserving the frozen field-read relation and preventing authority laundering through a non-field assignment edge.
 
+### Shared parenthesized-expression normalization
+
+`expr_value` and `field_edge_md` now call the same
+`unwrap_parenthesized_expression` helper before resolving the underlying node.
+The helper preserves the prior single-named-child parenthesis behavior, including
+nested parentheses, and does not add support for any other expression category.
+Consequently, `(this.value)` resolves to the same FIELD declaration and receiver
+authority metadata on assignment, return, and call-derived edges.
+
 A proposed declaration node-ID metadata field was deliberately removed after a public-boundary probe showed that it would retain a pre-canonical ID after extraction remapping. The final metadata uses the portable qualified declaration owner while the FIELD endpoint remains the declaration identity.
 
 ## Gate 3 contract
@@ -161,7 +194,14 @@ All commands used the project uv environment.
 uv run --frozen pytest -q tests/test_java_data_flow.py
 ```
 
-- **38 passed**, 1 warning.
+- **43 passed**, 1 warning.
+
+```bash
+uv run --frozen pytest -q \
+  tests/test_java_data_flow.py::test_java_field_authority_a7_parenthesized_explicit_this_preserves_metadata
+```
+
+- **5 passed**, 1 warning.
 
 ```bash
 uv run --frozen pytest -q \
@@ -198,8 +238,8 @@ uv run --frozen pytest -q \
 uv run --frozen pytest -q
 ```
 
-- **5133 passed, 72 skipped**, 4 warnings;
-- elapsed: 88.03 seconds;
+- **5138 passed, 72 skipped**, 3 warnings;
+- elapsed: 87.74 seconds;
 - result: PASS.
 
 ### Static and diff checks
@@ -245,7 +285,7 @@ uv run --frozen graphify update .
 
 ### Independent adversarial falsification
 
-A separate public extraction fixture, distinct from A1-A6, combined nested `this`, nested left/right receiver paths, explicit static access, and invalid class access to a non-static field.
+A separate public extraction fixture, distinct from A1-A7, combined nested `this`, nested left/right receiver paths, explicit static access, and invalid class access to a non-static field.
 
 Observed assertions:
 
@@ -274,7 +314,7 @@ Known limitations retained deliberately:
 - requested behavior implemented: YES;
 - exact v8 integrated normally: YES;
 - branch behind v8: 0;
-- mandatory A1-A6 public tests: PASS;
+- mandatory A1-A7 public tests: PASS;
 - focused and full pytest: PASS;
 - Ruff: PASS;
 - changed-file Pyright: PASS;
