@@ -142,7 +142,9 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
     simple_class: dict[str, str] = {}
     methods_by_name: dict[str, list[dict[str, Any]]] = defaultdict(list)
     pending_bodies: list[tuple[object, dict[str, Any], str]] = []
-    pending_transformations: list[tuple[str | None, dict[str, Any], int, object]] = []
+    pending_transformations: list[
+        tuple[str | None, dict[str, Any], int, object, dict[str, Any]]
+    ] = []
     pending_field_initializers: list[tuple[object, str, str]] = []
     method_name_counts: dict[tuple[str, str], int] = defaultdict(int)
 
@@ -166,6 +168,12 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
     def first_type_text(n) -> str:
         c = named_child(n, "type")
         return _read_text(c, source).split("<", 1)[0].strip() if c is not None else ""
+
+    def has_modifier(n, modifier: str) -> bool:
+        modifiers = next((child for child in n.children if child.type == "modifiers"), None)
+        if modifiers is None:
+            return False
+        return modifier in _read_text(modifiers, source).split()
 
     def collect_method_name_counts(n, qual: str | None = None) -> None:
         if n.type in {"class_declaration", "interface_declaration", "record_declaration", "enum_declaration", "annotation_type_declaration"}:
@@ -202,12 +210,18 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
                 return
         if n.type == "field_declaration" and qual and qual in classes:
             typ = first_type_text(n)
+            is_static = has_modifier(n, "static")
             for c in n.children:
                 if c.type == "variable_declarator":
                     name_node = named_child(c, "name")
                     name = _read_text(name_node, source) if name_node is not None else ""
                     vid = add_value(f"{qual}.{name}", "field", name, name_node or c, typ)
-                    classes[qual]["fields"][name] = {"id": vid, "type": typ}
+                    classes[qual]["fields"][name] = {
+                        "id": vid,
+                        "type": typ,
+                        "owner": qual,
+                        "static": is_static,
+                    }
                     if named_child(c, "value") is not None:
                         pending_field_initializers.append((c, qual, name))
         if n.type in {"method_declaration", "constructor_declaration"} and qual and qual in classes:
@@ -333,50 +347,82 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         return None
 
     def field_info(n, method, cls: str, locals_map) -> dict[str, Any] | None:
+        if n is None:
+            return None
         field = named_child(n, "field")
-        field_name = name_of(field) if field is not None else ""
-        obj = named_child(n, "object")
+        field_name = name_of(n) if n.type == "identifier" else (
+            name_of(field) if field is not None else ""
+        )
+        obj = named_child(n, "object") if n.type == "field_access" else None
         target_cls = cls if obj is None else receiver_type(obj, method, cls, locals_map)
-        return classes.get(target_cls or "", {}).get("fields", {}).get(field_name)
+        info = classes.get(target_cls or "", {}).get("fields", {}).get(field_name)
+        if not info:
+            return None
+        # An explicit class receiver is valid only for a static field.  Rejecting
+        # ``Type.instanceField`` keeps class scope from laundering an instance
+        # declaration into a definite runtime object access.
+        if obj is not None and obj.type == "identifier" and _class_qual(name_of(obj)):
+            return info if info.get("static") else None
+        return info
 
     def field_value(n, method, cls: str, locals_map) -> str | None:
         return (field_info(n, method, cls, locals_map) or {}).get("id")
 
     def receiver_identity(obj, method, cls: str, locals_map) -> tuple[str, str]:
-        """Return ``(receiver_path, confidence)`` for a field-access object expression.
+        """Return a deterministic ``(receiver_path, receiver_kind)`` pair.
 
-        ``confidence`` is ``"PROVEN"`` when the receiver is deterministically the
-        same instance (`this`/unqualified or a deterministic `this.<chain>` path)
-        and ``"MAY"`` when it is a named receiver of a declared class type whose
-        instance identity cannot be proven (P0-1). Unknown receivers stay ``MAY``
-        with a deterministic access-site path so downstream traversal can
-        distinguish proven same-receiver flow from unknown/alias flow.
+        The path identifies the source access expression, not a runtime object.
+        Runtime instance and alias authority are emitted separately by
+        :func:`field_edge_md` and stay unknown/MAY for every instance field access.
         """
         if obj is None:
-            return cls, "PROVEN"
+            return cls, "UNQUALIFIED"
         on = name_of(obj)
         if obj.type == "this":
-            return cls, "PROVEN"
+            return cls, "THIS"
         if obj.type == "identifier":
-            if _class_qual(on):
-                return on, "PROVEN"  # static class receiver
+            class_qual = _class_qual(on)
+            if class_qual:
+                return class_qual, "STATIC_CLASS"
             typ = receiver_type(obj, method, cls, locals_map)
             if typ in classes:
-                return f"{typ}@{on}", "MAY"
-            return f"@{on}", "MAY"
+                return f"{typ}@{on}", "NAMED"
+            return f"@{on}", "NAMED"
         if obj.type == "field_access":
             inner_obj = named_child(obj, "object")
             fld = named_child(obj, "field")
-            inner_path, inner_conf = receiver_identity(inner_obj, method, cls, locals_map)
+            inner_path, _inner_kind = receiver_identity(inner_obj, method, cls, locals_map)
             fname = name_of(fld) if fld is not None else "?"
-            return f"{inner_path}.{fname}", inner_conf
-        return name_of(obj) or "?", "MAY"
+            return f"{inner_path}.{fname}", "NESTED"
+        return name_of(obj) or "?", "EXPRESSION"
 
     def field_edge_md(field_expr, method, cls: str, locals_map) -> dict[str, Any]:
-        """Receiver/access-site metadata for a field-access expression (P0-1)."""
+        """Declaration certainty and receiver authority for a field access.
+
+        Resolving a source expression to an exact FIELD declaration does not prove
+        which runtime instance owns that field.  All instance accesses therefore
+        remain ``UNKNOWN``/``MAY``, including ``this`` and deterministic nested
+        paths.  Static fields have explicit class scope and no instance question.
+        """
+        info = field_info(field_expr, method, cls, locals_map)
+        if not info:
+            return {}
         obj = named_child(field_expr, "object") if field_expr is not None and field_expr.type == "field_access" else None
-        path, conf = receiver_identity(obj, method, cls, locals_map)
-        return {"receiver": path, "receiverConfidence": conf}
+        path, kind = receiver_identity(obj, method, cls, locals_map)
+        is_static = bool(info.get("static"))
+        receiver_confidence = "STATIC" if is_static else "MAY"
+        return {
+            "declarationResolution": "EXACT",
+            "declarationOwner": info.get("owner"),
+            "fieldScope": "STATIC" if is_static else "INSTANCE",
+            # ``receiver`` is retained for compatibility with the Round-2 shape.
+            "receiver": path,
+            "receiverPath": path,
+            "receiverKind": kind,
+            "receiverConfidence": receiver_confidence,
+            "instanceAuthority": "NOT_APPLICABLE" if is_static else "UNKNOWN",
+            "aliasAuthority": "NOT_APPLICABLE" if is_static else "MAY",
+        }
 
     def expr_value(n, method, cls: str, locals_map) -> str | None:
         if n is None:
@@ -460,19 +506,41 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         for argument_index, (arg, param) in enumerate(zip(args_of(call), target.get("params", []))):
             src = expr_value(arg, method, cls, locals_map)
             call_metadata = {"argumentIndex": argument_index, "callee": target["id"], "calleeSymbol": target["symbol"]}
-            add_edge(src, param.get("id"), "PASSED_AS_ARGUMENT", arg, call_metadata)
-            if is_field_value(src):
-                add_edge(src, param.get("id"), "READ_FROM", arg, {**call_metadata, **field_edge_md(arg, method, cls, locals_map)})
+            field_metadata = (
+                field_edge_md(arg, method, cls, locals_map) if is_field_value(src) else {}
+            )
+            add_edge(
+                src,
+                param.get("id"),
+                "PASSED_AS_ARGUMENT",
+                arg,
+                {**call_metadata, **field_metadata},
+            )
+            if field_metadata:
+                add_edge(
+                    src,
+                    param.get("id"),
+                    "READ_FROM",
+                    arg,
+                    {**call_metadata, **field_metadata},
+                )
             if target.get("returns") and argument_index in target.get("param_return_deps", set()):
                 add_edge(
                     src,
                     target["returns"],
                     "TRANSFORMED_BY",
                     call,
-                    {"transformationSymbol": target["symbol"], "argumentIndex": argument_index, "callee": target["id"]},
+                    {
+                        "transformationSymbol": target["symbol"],
+                        "argumentIndex": argument_index,
+                        "callee": target["id"],
+                        **field_metadata,
+                    },
                 )
             elif target.get("returns"):
-                pending_transformations.append((src, target, argument_index, call))
+                pending_transformations.append(
+                    (src, target, argument_index, call, field_metadata)
+                )
 
     def mark_return_dep(method, source_id: str | None, seen: set[str] | None = None) -> None:
         if not method or not source_id:
@@ -532,6 +600,14 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             writes_field = is_field_value(target)
             if writes_field:
                 add_edge(source_id, target, "WRITTEN_TO", n, field_edge_md(left, method, cls, locals_map))
+            elif is_field_value(source_id):
+                add_edge(
+                    source_id,
+                    target,
+                    "READ_FROM",
+                    n,
+                    field_edge_md(right, method, cls, locals_map),
+                )
             else:
                 add_edge(source_id, target, "FLOWS_TO", n)
             if local_target and not writes_field:
@@ -539,9 +615,26 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         elif n.type == "return_statement":
             val = next((c for c in n.children if c.is_named), None)
             source_id = expr_value(val, method, cls, locals_map)
+            field_metadata = (
+                field_edge_md(val, method, cls, locals_map)
+                if is_field_value(source_id)
+                else {}
+            )
             if is_field_value(source_id):
-                add_edge(source_id, method.get("returns"), "READ_FROM", n, field_edge_md(val, method, cls, locals_map))
-            add_edge(source_id, method.get("returns"), "RETURNED_AS", n)
+                add_edge(
+                    source_id,
+                    method.get("returns"),
+                    "READ_FROM",
+                    n,
+                    field_metadata,
+                )
+            add_edge(
+                source_id,
+                method.get("returns"),
+                "RETURNED_AS",
+                n,
+                field_metadata,
+            )
             mark_return_dep(method, source_id)
         elif n.type == "method_invocation":
             resolve_call(n, method, cls, locals_map)
@@ -567,13 +660,18 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
     for body, method, cls in pending_bodies:
         method["body"] = body
         scan_body(body, method, cls)
-    for src, target, argument_index, call in pending_transformations:
+    for src, target, argument_index, call, field_metadata in pending_transformations:
         if target.get("returns") and argument_index in target.get("param_return_deps", set()):
             add_edge(
                 src,
                 target["returns"],
                 "TRANSFORMED_BY",
                 call,
-                {"transformationSymbol": target["symbol"], "argumentIndex": argument_index, "callee": target["id"]},
+                {
+                    "transformationSymbol": target["symbol"],
+                    "argumentIndex": argument_index,
+                    "callee": target["id"],
+                    **field_metadata,
+                },
             )
     return result
