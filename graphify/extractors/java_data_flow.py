@@ -396,6 +396,14 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             return f"{inner_path}.{fname}", "NESTED"
         return name_of(obj) or "?", "EXPRESSION"
 
+    def unwrap_parenthesized_expression(n):
+        while n is not None and n.type == "parenthesized_expression":
+            children = [child for child in n.children if child.is_named]
+            if len(children) != 1:
+                break
+            n = children[0]
+        return n
+
     def field_edge_md(field_expr, method, cls: str, locals_map) -> dict[str, Any]:
         """Declaration certainty and receiver authority for a field access.
 
@@ -404,6 +412,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         remain ``UNKNOWN``/``MAY``, including ``this`` and deterministic nested
         paths.  Static fields have explicit class scope and no instance question.
         """
+        field_expr = unwrap_parenthesized_expression(field_expr)
         info = field_info(field_expr, method, cls, locals_map)
         if not info:
             return {}
@@ -425,6 +434,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
         }
 
     def expr_value(n, method, cls: str, locals_map) -> str | None:
+        n = unwrap_parenthesized_expression(n)
         if n is None:
             return None
         if n.type == "identifier":
@@ -444,10 +454,6 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             return return_value.get("returns") if return_value else None
         if n.type == "object_creation_expression":
             return object_value(n, method, cls, locals_map)
-        if n.type == "parenthesized_expression":
-            children = [child for child in n.children if child.is_named]
-            if len(children) == 1:
-                return expr_value(children[0], method, cls, locals_map)
         return None
 
     def object_value(n, method, cls, locals_map):
