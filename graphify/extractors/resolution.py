@@ -3230,8 +3230,12 @@ def _resolve_cross_file_java_data_flow(
         if key in seen_edges:
             return
         seen_edges.add(key)
-        conf = md.get("receiverConfidence", "PROVEN")
-        score = 1.0 if conf == "PROVEN" else 0.5
+        score = 1.0
+        if (
+            md.get("instanceAuthority") == "UNKNOWN"
+            or md.get("aliasAuthority") == "MAY"
+        ):
+            score = 0.5
         if md.get("analysisCompleteness") == "PARTIAL":
             score = min(score, 0.8)  # parse-incomplete target: never full trust
         all_edges.append({
@@ -3284,7 +3288,12 @@ def _resolve_cross_file_java_data_flow(
             "callerLocation": loc,
             "receiver": rec.get("receiver") or "",
             "receiverFqn": rec.get("receiverFqn") or "",
-            "receiverConfidence": rec.get("receiverConfidence") or "MAY",
+            "declarationResolution": resolution,
+            "receiverKind": rec.get("receiverKind") or "UNKNOWN",
+            "receiverPath": rec.get("receiverPath") or "",
+            "fieldScope": rec.get("fieldScope") or "NOT_APPLICABLE",
+            "instanceAuthority": rec.get("instanceAuthority") or "UNKNOWN",
+            "aliasAuthority": rec.get("aliasAuthority") or "MAY",
             "importContext": rec.get("importContext") or "unknown",
             "method": rec.get("method") or "",
             "constructor": bool(rec.get("constructor")),
@@ -3378,7 +3387,12 @@ def _resolve_cross_file_java_data_flow(
                 "source_location": rec.get("location"),
                 "cross_file": True,
                 "receiver": rec.get("receiverFqn") or (rec.get("receiver") or ""),
-                "receiverConfidence": rec.get("receiverConfidence", "MAY"),
+                "declarationResolution": "EXACT",
+                "receiverKind": rec.get("receiverKind") or "UNKNOWN",
+                "receiverPath": rec.get("receiverPath") or "",
+                "fieldScope": rec.get("fieldScope") or "NOT_APPLICABLE",
+                "instanceAuthority": rec.get("instanceAuthority") or "UNKNOWN",
+                "aliasAuthority": rec.get("aliasAuthority") or "MAY",
                 "callee": callee["node_id"],
                 "calleeSymbol": callee["symbol"],
                 "constructor": bool(rec.get("constructor")),

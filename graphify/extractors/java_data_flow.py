@@ -280,14 +280,61 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             import_ctx = "same_package"
         else:
             import_ctx = "default_package"
-        if obj is None or (obj is not None and name_of(obj) == "this"):
-            conf = "PROVEN"
-        elif obj is not None and (
-            name_of(obj) in java_imports or (name_of(obj) or "")[0:1].isupper()
-        ):
-            conf = "PROVEN"  # explicit static class receiver (imported or same-package)
+        obj_name = name_of(obj) if obj is not None else ""
+        local_receiver = lookup_local(locals_map, obj_name) if obj_name else None
+        parameter_receiver = next(
+            (p for p in (method or {}).get("params", []) if p.get("name") == obj_name),
+            None,
+        )
+        field_receiver = classes.get(cls, {}).get("fields", {}).get(obj_name)
+        if constructor:
+            receiver_kind = "CONSTRUCTOR"
+            receiver_path = fqn or t_simple
+            field_scope = "NOT_APPLICABLE"
+            instance_authority = "NOT_APPLICABLE"
+            alias_authority = "NOT_APPLICABLE"
+        elif obj is None:
+            receiver_kind = "UNQUALIFIED"
+            receiver_path = cls
+            field_scope = "NOT_APPLICABLE"
+            instance_authority = "UNKNOWN"
+            alias_authority = "MAY"
+        elif obj_name == "this":
+            receiver_kind = "THIS"
+            receiver_path = cls
+            field_scope = "NOT_APPLICABLE"
+            instance_authority = "UNKNOWN"
+            alias_authority = "MAY"
+        elif local_receiver is not None:
+            receiver_kind = "NAMED_LOCAL"
+            receiver_path = f"{target_cls}@{obj_name}"
+            field_scope = "NOT_APPLICABLE"
+            instance_authority = "UNKNOWN"
+            alias_authority = "MAY"
+        elif parameter_receiver is not None:
+            receiver_kind = "NAMED_PARAMETER"
+            receiver_path = f"{target_cls}@{obj_name}"
+            field_scope = "NOT_APPLICABLE"
+            instance_authority = "UNKNOWN"
+            alias_authority = "MAY"
+        elif field_receiver is not None:
+            receiver_kind = "NAMED_FIELD"
+            receiver_path = f"{cls}.{obj_name}"
+            field_scope = "STATIC" if field_receiver.get("static") else "INSTANCE"
+            instance_authority = "UNKNOWN"
+            alias_authority = "MAY"
+        elif obj_name in java_imports or obj_name[0:1].isupper():
+            receiver_kind = "STATIC_CLASS"
+            receiver_path = fqn or t_simple
+            field_scope = "NOT_APPLICABLE"
+            instance_authority = "NOT_APPLICABLE"
+            alias_authority = "NOT_APPLICABLE"
         else:
-            conf = "MAY"
+            receiver_kind = "NAMED"
+            receiver_path = f"{target_cls}@{obj_name}" if obj_name else target_cls
+            field_scope = "NOT_APPLICABLE"
+            instance_authority = "UNKNOWN"
+            alias_authority = "MAY"
         reason = {
             "EXACT": "exact",
             "AMBIGUOUS": "wildcard_import_ambiguous" if java_has_wildcard_import else "receiver_ambiguous",
@@ -300,7 +347,12 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             "receiver": target_cls,
             "receiverFqn": fqn,
             "receiverResolution": state,
-            "receiverConfidence": conf,
+            "declarationResolution": state,
+            "receiverKind": receiver_kind,
+            "receiverPath": receiver_path,
+            "fieldScope": field_scope,
+            "instanceAuthority": instance_authority,
+            "aliasAuthority": alias_authority,
             "importContext": import_ctx,
             "reason": reason,
             "method": name,

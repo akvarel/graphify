@@ -50,6 +50,18 @@ def test_fixture_case_public_boundary(tmp_path: Path, case: dict):
         if (e.get("metadata") or {}).get("cross_file"):
             assert e["source"] in ids, f"{case['name']}: dangling source {e['source']}"
             assert e["target"] in ids, f"{case['name']}: dangling target {e['target']}"
+            md = e["metadata"]
+            assert "receiverConfidence" not in md
+            assert md["declarationResolution"] == "EXACT"
+            assert md["receiverKind"]
+            assert md["receiverPath"]
+            assert md["fieldScope"] in {"INSTANCE", "STATIC", "NOT_APPLICABLE"}
+            if md["instanceAuthority"] == "UNKNOWN":
+                assert md["aliasAuthority"] == "MAY"
+                assert e["confidence_score"] == 0.5
+            else:
+                assert md["instanceAuthority"] == "NOT_APPLICABLE"
+                assert md["aliasAuthority"] == "NOT_APPLICABLE"
 
 
 def test_fixture_case_canonical_ids_are_checkout_root_independent(tmp_path: Path):

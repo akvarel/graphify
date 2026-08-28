@@ -67,15 +67,14 @@ def test_cross_file_instance_call_links_arg_param_return(tmp_path: Path):
     e = passed[0]
     assert e["source"] == base and e["target"] == price
     assert e["source"] in ids and e["target"] in ids
-    assert "receiverConfidence" not in e["metadata"]
-    assert e["metadata"] | {
-        "declarationResolution": "EXACT",
-        "receiverKind": "NAMED_FIELD",
-        "receiverPath": "Order.ps",
-        "fieldScope": "INSTANCE",
-        "instanceAuthority": "UNKNOWN",
-        "aliasAuthority": "MAY",
-    } == e["metadata"]
+    md = e["metadata"]
+    assert "receiverConfidence" not in md
+    assert md["declarationResolution"] == "EXACT"
+    assert md["receiverKind"] == "NAMED_FIELD"
+    assert md["receiverPath"] == "Order.ps"
+    assert md["fieldScope"] == "INSTANCE"
+    assert md["instanceAuthority"] == "UNKNOWN"
+    assert md["aliasAuthority"] == "MAY"
     assert e["confidence_score"] == 0.5
     assert (e["metadata"]).get("argumentIndex") == 0
 
