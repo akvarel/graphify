@@ -46,8 +46,14 @@ A cross-file edge (Gate 2B) carries, via `metadata`:
 
 - `provenance` — `STATIC_AST` (same-file) or `CROSS_FILE`.
 - `receiver` — the resolved receiver FQN (e.g. `acme.PricingService`).
-- `receiverConfidence` — `PROVEN` (static/`this`/constructor) or `MAY`
-  (instance). **Preserved across linkage; never upgraded.**
+- `declarationResolution` — declaration/target identity only (`EXACT` on positive
+  edges). It does not authorize a runtime instance or alias conclusion.
+- `receiverKind` / `receiverPath` — deterministic source access-site shape and
+  path, not a heap-object identity.
+- `fieldScope` — `INSTANCE`, `STATIC`, or `NOT_APPLICABLE`.
+- `instanceAuthority` / `aliasAuthority` — `UNKNOWN` / `MAY` for instance
+  receivers; both `NOT_APPLICABLE` for static-class and constructor boundaries.
+  **EXACT declaration resolution never upgrades these fields.**
 - `callee` / `calleeSymbol` — exact target node id + symbol
   (e.g. `PricingService.calculate(double)`).
 - `argumentIndex` — positional argument index (cross-file parameter mapping).
@@ -57,8 +63,8 @@ A cross-file edge (Gate 2B) carries, via `metadata`:
 - `cross_file` — boolean marker.
 
 Top-level edge fields: `source`, `target`, `relation`, `confidence`
-(`EXTRACTED`/`INFERRED`), `confidence_score` (1.0 PROVEN, 0.5 MAY, capped at
-0.8 for PARTIAL), `source_file`, `source_location`, `weight`.
+(`EXTRACTED`/`INFERRED`), `confidence_score` (1.0 when instance/alias authority
+is not applicable, 0.5 for `UNKNOWN`/`MAY`, capped at 0.8 for PARTIAL), `source_file`, `source_location`, `weight`.
 
 ## 4. Epistemic status
 
@@ -96,7 +102,8 @@ carries:
 - `resolution` — `EXACT` / `AMBIGUOUS` / `UNRESOLVED` / `UNSUPPORTED`.
 - `coverage` — `COMPLETE_FOR_SUPPORTED_CONSTRUCT` / `PARTIAL` / `UNKNOWN`.
 - `callerFile`, `callerLocation`, `receiver` (sanitized type text),
-  `receiverFqn` (when resolved), `receiverConfidence` (`PROVEN`/`MAY`).
+  `receiverFqn` (when resolved), `declarationResolution`, `receiverKind`,
+  `receiverPath`, `fieldScope`, `instanceAuthority`, and `aliasAuthority`.
 - `importContext` — `same_package` / `explicit_import` / `qualified` /
   `wildcard` / `default_package` / `unknown`.
 - `method`, `constructor`, `arity`.
@@ -118,8 +125,10 @@ statistics (`cross_file_resolution_stats`) are derived.
 `confidence_score` describes the strength of the **static evidence**, not a
 verification verdict:
 
-- `1.0` — deterministic static evidence, PROVEN receiver, complete construct.
-- `0.5` — evidence exists but the receiver is `MAY` (same-instance not proven).
+- `1.0` — deterministic static evidence where instance/alias authority is
+  `NOT_APPLICABLE` (for example, a static-class or constructor boundary).
+- `0.5` — exact declaration evidence with `instanceAuthority = UNKNOWN` and
+  `aliasAuthority = MAY`; runtime same-instance identity is not proven.
 - `≤ 0.8` — evidence exists but the target was parse-incomplete.
 
 > `STATIC_AST + EXACT + confidence_score = 1.0` is **not** synonymous with

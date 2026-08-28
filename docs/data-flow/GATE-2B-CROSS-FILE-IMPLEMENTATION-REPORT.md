@@ -4,11 +4,13 @@
 
 - **Repository:** `akvarel/graphify` (OSS source-derived evidence layer)
 - **Branch:** `feature/java-cross-file-data-flow-v8`
-- **Starting SHA:** `d8b663f04092ec1d43eba8e027604bd833c1d957`
-- **Final SHA:** see git log (this branch's HEAD)
-- **Current upstream/v8 SHA:** `b14b52e94ec3d9840413d81777f4c134eac0a40d`
-- **Merge-base (HEAD…upstream/v8):** `b14b52e94ec3d9840413d81777f4c134eac0a40d`
-- **ahead/behind vs upstream/v8:** `32 ahead / 0 behind` (Gate 2 commits already integrated on this branch)
+- **Original Gate 2B starting SHA:** `d8b663f04092ec1d43eba8e027604bd833c1d957`
+- **Pre-finalization branch SHA:** `c6b56a761039f813fe12fbbcddcc7925dc9ee214`
+- **Approved Gate 2 SHA:** `7f4bba86a0991cd15c54e8da2d6494c909c1a3c7`
+- **Validated production SHA:** `9b21e758509af9712c4b3487b9243737b871f4d9`
+- **Validated v8 SHA:** `43d54acbfa9e731f7a592bb582c1f4b9d48ed73e`
+- **Merge-base (production…validated v8):** `43d54acbfa9e731f7a592bb582c1f4b9d48ed73e`
+- **validated-v8-only / branch-only:** `0 / 46` at the production SHA
 
 ---
 
@@ -40,8 +42,8 @@ Implemented deterministically and **without a second Java resolver**:
    - caller-side argument value nodes (with their positional index),
    - the caller-side return sink (captured at `local_variable_declaration`,
      `assignment_expression`, and `return_statement` sites),
-   - `receiverConfidence` (PROVEN for static/`this`/constructor receivers, MAY
-     for instance receivers),
+   - separated receiver evidence: `declarationResolution`, `receiverKind`,
+     `receiverPath`, `fieldScope`, `instanceAuthority`, and `aliasAuthority`,
    - source `file` + `location`.
 
 2. **A new repository-wide pass** (`_resolve_cross_file_java_data_flow` in
@@ -69,7 +71,7 @@ by the source layer.
 | File | Change |
 | --- | --- |
 | `graphify/extractors/java_data_flow.py` | Parse `package` + simple-name→FQN imports + wildcard-import flag; stamp `package` on every data-value node and `param_index` on parameters; record cross-file call/constructor intents; capture caller-side return sinks; stamp `param_return_deps` / `param_value_ids` / `package` on the return node and method node; enrich (rather than duplicate) the generic method node so symbol/param metadata survives node dedup. |
-| `graphify/extractors/resolution.py` | New `_resolve_cross_file_java_data_flow(per_file, paths, all_nodes, all_edges)` pass: global method/constructor index from `data_value` nodes; exact FQN+name+arity matching; emit `PASSED_AS_ARGUMENT` / `TRANSFORMED_BY` / `FLOWS_TO` with `provenance=CROSS_FILE`; propagate `receiverConfidence`, `analysisCompleteness`, and parse-incompleteness. |
+| `graphify/extractors/resolution.py` | New `_resolve_cross_file_java_data_flow(per_file, paths, all_nodes, all_edges)` pass: global method/constructor index from `data_value` nodes; exact FQN+name+arity matching; emit `PASSED_AS_ARGUMENT` / `TRANSFORMED_BY` / `FLOWS_TO` with `provenance=CROSS_FILE`; propagate declaration, receiver-path, field-scope, instance/alias authority, `analysisCompleteness`, and parse-incompleteness. |
 | `graphify/extract.py` | Import + invoke the cross-file pass before the id-remap passes (so pre-remap value-node ids match, and the remap rewrites the added edges' endpoints together with the nodes). |
 
 ### Reused existing resolver components
@@ -92,8 +94,12 @@ by the source layer.
    - `_receiver_fqn(target_cls)`: FQN if the class name contains `.`; explicit
      import FQN if present; same-package FQN when the file has **no** wildcard
      imports; `AMBIGUOUS`/`UNRESOLVED` otherwise (fail closed).
-   - `receiverConfidence`: PROVEN for `this`/unqualified/static-class/constructor
-     receivers, MAY for instance receivers.
+   - `declarationResolution`: identity resolution only; `EXACT` never implies
+     runtime same-instance or alias proof.
+   - `receiverKind` / `receiverPath`: deterministic source access-site identity.
+   - `fieldScope`: `INSTANCE`, `STATIC`, or `NOT_APPLICABLE`.
+   - `instanceAuthority` / `aliasAuthority`: `UNKNOWN` / `MAY` for instance
+     receivers; both `NOT_APPLICABLE` for static-class and constructor boundaries.
    - Caller-side return sink captured at the assignment/local-declaration/return
      sites.
 
@@ -114,7 +120,8 @@ by the source layer.
    - `arg[i] --TRANSFORMED_BY--> callee.return` iff `i ∈ callee.param_return_deps`
    - `callee.return --FLOWS_TO--> caller receiving value`
    - Every edge carries `metadata.provenance = "CROSS_FILE"`,
-     `receiver`, `receiverConfidence`, `callee`, `calleeSymbol`,
+     `receiver`, `declarationResolution`, `receiverKind`, `receiverPath`,
+     `fieldScope`, `instanceAuthority`, `aliasAuthority`, `callee`, `calleeSymbol`,
      `analysisCompleteness`, `argumentIndex` (where relevant), `source_file`,
      `source_location`.
 
@@ -127,8 +134,8 @@ by the source layer.
 3. Fully-qualified references.
 4. Cross-file constructor argument mapping by exact target and position (F).
 5. Cross-file return propagation using existing callee local facts (C).
-6. Static class receivers → PROVEN (N, static-import-like when the static class
-   is named).
+6. Static class receivers → exact declaration identity with instance/alias authority
+   `NOT_APPLICABLE` (N, static-import-like when the static class is named).
 7. `TRANSFORMED_BY` only when the callee's own bounded facts prove
    param → return (D, E).
 
@@ -154,13 +161,15 @@ by the source layer.
 
 The source layer emits **source-derived facts + evidence + epistemic metadata**
 only. It does **not** issue GVR verification verdicts. `provenance = CROSS_FILE`
-(or `STATIC_AST`) + `receiverConfidence` + `analysisCompleteness` +
+(or `STATIC_AST`) + declaration/receiver authority metadata +
+`analysisCompleteness` +
 `confidence_score` describe the strength and coverage of the *static evidence*;
 they are **not** `GVR VERIFIED`. See
 `docs/data-flow/GVR-SOURCE-EVIDENCE-CONTRACT.md`.
 
-`receiverConfidence = MAY` is preserved across linkage; it is never upgraded to
-definite same-instance flow merely because edges connect.
+`declarationResolution = EXACT` is preserved separately from runtime authority.
+For an instance receiver, linkage keeps `instanceAuthority = UNKNOWN` and
+`aliasAuthority = MAY`; exact callee identity never upgrades either value.
 
 ---
 
@@ -336,7 +345,8 @@ were resolved in remediation commit(s) on `feature/java-cross-file-data-flow-v8`
 - **Correction:** `_record_cross_file_call()` now records **every attempt** with
   a machine-visible `receiverResolution` (`EXACT`/`AMBIGUOUS`/`UNRESOLVED`/
   `UNSUPPORTED`), a reason code, and a sanitized context (caller file/location,
-  receiver type, method, arity, import context, `receiverConfidence`). The pass
+  receiver type, method, arity, import context, and the separated declaration /
+  receiver-path / field-scope / instance / alias authority fields). The pass
   emits one bounded **`extraction_diagnostic` node** per attempted boundary with
   `resolution`, `coverage`, `reason`, `candidateCount`, and (only when
   deterministically known) candidate identities. Ambiguity/unresolved/unsupported
@@ -395,12 +405,49 @@ were resolved in remediation commit(s) on `feature/java-cross-file-data-flow-v8`
   implementation, follow-up, remediation final, upstream/v8, merge-base,
   ahead/behind with direction, changed files) in the header block above.
 
+## 2026-08-28 Approved Gate 2 Integration and Authority Finalization
+
+Approved Gate 2 `7f4bba86a0991cd15c54e8da2d6494c909c1a3c7` was
+integrated by normal merge commit
+`2ceee6b86edb64a5a302685110f58a3df54956c1`. Gate 2B then replaced the
+cross-file `receiverConfidence` aggregate with separated declaration,
+receiver-path, field-scope, instance, and alias authority evidence.
+
+The TDD checkpoints are:
+
+- RED: `70bf35d9f5dd9ae78cbccc8f15d36a383ed3335c`;
+- GREEN: `9b21e758509af9712c4b3487b9243737b871f4d9`.
+
+The exact-instance adversarial guarantee is now executable: every positive edge
+may have `declarationResolution = EXACT`, but an instance receiver still has
+`instanceAuthority = UNKNOWN`, `aliasAuthority = MAY`, and score `0.5`. Static
+class and constructor boundaries use `NOT_APPLICABLE` for both authority fields.
+
+Validation at the GREEN production SHA:
+
+- Gate 2 A1-A7 / Java data flow: 43 passed;
+- Gate 2B portability, diagnostic, and adversarial suites: 36 passed;
+- all nine fixture manifest cases compile with `javac 25.0.3`;
+- full pytest: 5174 passed, 72 skipped, 4 warnings;
+- Ruff: pass;
+- Pyright versus integrated base `2ceee6b`: full 569 errors / 5 warnings on
+  both revisions; targeted 24 errors / 0 warnings on both revisions; no
+  diagnostic in changed Gate 2B ranges;
+- validated-v8-only / branch-only: 0 / 46;
+- `git diff --check`: pass;
+- `graphify update .`: pass, 60,470 nodes / 73,519 edges / 2,609 communities.
+
+The self-contained command and evidence record is
+`BUGZERO-GRAPHIFY-GATE-2B-END-TO-END-REPORT-2026-08-28.md`.
+No Gate 3 work was started.
+
 ### Preserved behavior
 
 All Gate 2 / 2B behavior is preserved: constant-return false-`TRANSFORMED_BY`
 protection; only proven parameter→return dependency yields `TRANSFORMED_BY`;
 exact transformation/callee identity; lexical-scope correctness; field
-initializer `WRITTEN_TO` semantics; receiver `PROVEN`/`MAY` distinction;
+initializer `WRITTEN_TO` semantics; separated declaration resolution and
+receiver/instance/alias authority;
 qualified nested-owner identity; same-name/deep-path separation; parse-recovery
 incompleteness; parallel relation preservation; deterministic same-package /
 explicit-import / fully-qualified linkage; cross-file constructor mapping and
