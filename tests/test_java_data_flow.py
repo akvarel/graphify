@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from graphify.build import build_from_json
 from graphify.extract import extract
 
@@ -531,10 +533,8 @@ def test_java_public_extract_reports_first_import_unavailable(tmp_path: Path, mo
 # ---------------------------------------------------------------------------
 
 
-def test_java_field_receiver_flow_is_marked_proven_or_may(tmp_path: Path):
-    """P0-1: `this.field` reads/writes are proven same-receiver; a read through
-    a named receiver of a declared class type is explicit MAY/alias flow, never
-    presented as unqualified definite truth."""
+def test_java_field_receiver_declaration_is_exact_but_instance_is_may(tmp_path: Path):
+    """Round 3: exact declaration resolution is not runtime instance proof."""
     result = _extract(tmp_path, """
         class Flow {
           int value;
@@ -553,8 +553,9 @@ def test_java_field_receiver_flow_is_marked_proven_or_may(tmp_path: Path):
     own_read = [e for e in _edges(result, "READ_FROM") if e["source"] == flow_field and e["target"] == own]
     foreign_read = [e for e in _edges(result, "READ_FROM") if e["source"] == flow_field and e["target"] == foreign]
     assert any(e.get("metadata", {}).get("receiver") == "Flow" for e in own_read)
-    assert any(e.get("metadata", {}).get("receiverConfidence") == "PROVEN" for e in own_read)
-    assert all(e.get("confidence_score", 1.0) == 1.0 for e in own_read)
+    assert any(e.get("metadata", {}).get("declarationResolution") == "EXACT" for e in own_read)
+    assert any(e.get("metadata", {}).get("receiverConfidence") == "MAY" for e in own_read)
+    assert all(e.get("confidence_score", 1.0) == 0.5 for e in own_read)
     assert any(e.get("metadata", {}).get("receiver") == "Flow@other" for e in foreign_read)
     assert any(e.get("metadata", {}).get("receiverConfidence") == "MAY" for e in foreign_read)
     assert all(e.get("confidence_score", 1.0) == 0.5 for e in foreign_read)
@@ -584,9 +585,8 @@ def test_java_field_receiver_two_instances_have_distinct_may_access_sites(tmp_pa
     assert all(e.get("confidence_score", 1.0) == 0.5 for e in writes + reads)
 
 
-def test_java_field_receiver_nested_chain_proven_on_this_only(tmp_path: Path):
-    """P0-1: a nested `this.box.value` chain is a deterministic receiver (PROVEN),
-    while `box.value` through a named receiver stays MAY."""
+def test_java_field_receiver_nested_chain_preserves_path_without_instance_proof(tmp_path: Path):
+    """Round 3: `this.box.value` has a stable path, not definite instance authority."""
     result = _extract(tmp_path, """
         class Box { int value; }
         class Flow {
@@ -602,8 +602,8 @@ def test_java_field_receiver_nested_chain_proven_on_this_only(tmp_path: Path):
     box_field = _value(result, "FIELD", "value", "Box.value")
     via_this = [e.get("metadata", {}) for e in _edges(result, "READ_FROM") if e["source"] == box_field]
     write_md = [e.get("metadata", {}) for e in _edges(result, "WRITTEN_TO") if e["target"] == box_field]
-    assert any(e.get("receiver") == "Flow.box" and e.get("receiverConfidence") == "PROVEN" for e in via_this)
-    assert any(e.get("receiver") == "Flow.box" and e.get("receiverConfidence") == "PROVEN" for e in write_md)
+    assert any(e.get("receiver") == "Flow.box" and e.get("receiverConfidence") == "MAY" for e in via_this)
+    assert any(e.get("receiver") == "Flow.box" and e.get("receiverConfidence") == "MAY" for e in write_md)
     assert any(e.get("receiver") == "Box@param" and e.get("receiverConfidence") == "MAY" for e in via_this)
 
 
@@ -666,3 +666,242 @@ def test_java_nested_classes_with_same_simple_name_keep_distinct_owners(tmp_path
     assert "B.Helper.f(int)" in owners
     assert "A.Helper.use(int)" in owners
     assert "B.Helper.use(int)" in owners
+
+
+# ---------------------------------------------------------------------------
+# Round 3 — declaration resolution versus runtime instance/alias authority
+# ---------------------------------------------------------------------------
+
+
+def test_java_field_authority_a1_explicit_this_is_exact_declaration_not_instance_proof(
+    tmp_path: Path,
+):
+    result = _extract(tmp_path, """
+        class Flow {
+          int value;
+          int run(int input) {
+            this.value = input;
+            return this.value;
+          }
+        }
+    """)
+    field = _value(result, "FIELD", "value", "Flow.value")
+    accesses = [
+        edge
+        for edge in result["edges"]
+        if (edge.get("relation") == "WRITTEN_TO" and edge.get("target") == field)
+        or (edge.get("relation") == "READ_FROM" and edge.get("source") == field)
+    ]
+    assert accesses
+    for edge in accesses:
+        metadata = edge.get("metadata", {})
+        assert metadata.get("declarationResolution") == "EXACT"
+        assert metadata.get("receiverKind") == "THIS"
+        assert metadata.get("receiverPath") == "Flow"
+        assert metadata.get("instanceAuthority") == "UNKNOWN"
+        assert metadata.get("aliasAuthority") == "MAY"
+        assert metadata.get("receiverConfidence") == "MAY"
+
+
+def test_java_field_authority_a2_unqualified_is_exact_declaration_not_instance_proof(
+    tmp_path: Path,
+):
+    result = _extract(tmp_path, """
+        class Flow {
+          int value;
+          int run(int input) {
+            value = input;
+            int seen = value;
+            return seen;
+          }
+        }
+    """)
+    field = _value(result, "FIELD", "value", "Flow.value")
+    seen = _value(result, "LOCAL", "seen", "Flow.run(int)")
+    write = next(edge for edge in _edges(result, "WRITTEN_TO") if edge["target"] == field)
+    read = next(
+        edge
+        for edge in _edges(result, "READ_FROM")
+        if edge["source"] == field and edge["target"] == seen
+    )
+    for edge in (write, read):
+        metadata = edge.get("metadata", {})
+        assert metadata.get("declarationResolution") == "EXACT"
+        assert metadata.get("receiverKind") == "UNQUALIFIED"
+        assert metadata.get("receiverPath") == "Flow"
+        assert metadata.get("instanceAuthority") == "UNKNOWN"
+        assert metadata.get("aliasAuthority") == "MAY"
+
+
+def test_java_field_authority_a3_named_receiver_keeps_exact_declaration_and_may_alias(
+    tmp_path: Path,
+):
+    result = _extract(tmp_path, """
+        class Flow {
+          int value;
+          int run(Flow other) {
+            return other.value;
+          }
+        }
+    """)
+    field = _value(result, "FIELD", "value", "Flow.value")
+    read = next(edge for edge in _edges(result, "READ_FROM") if edge["source"] == field)
+    metadata = read.get("metadata", {})
+    assert metadata.get("declarationResolution") == "EXACT"
+    assert metadata.get("receiverKind") == "NAMED"
+    assert metadata.get("receiverPath") == "Flow@other"
+    assert metadata.get("instanceAuthority") == "UNKNOWN"
+    assert metadata.get("aliasAuthority") == "MAY"
+
+
+def test_java_field_authority_a4_nested_this_path_is_not_definite_instance(
+    tmp_path: Path,
+):
+    result = _extract(tmp_path, """
+        class Box { int value; }
+        class Flow {
+          Box box;
+          int run() {
+            return this.box.value;
+          }
+        }
+    """)
+    field = _value(result, "FIELD", "value", "Box.value")
+    read = next(edge for edge in _edges(result, "READ_FROM") if edge["source"] == field)
+    metadata = read.get("metadata", {})
+    assert metadata.get("declarationResolution") == "EXACT"
+    assert metadata.get("receiverKind") == "NESTED"
+    assert metadata.get("receiverPath") == "Flow.box"
+    assert metadata.get("instanceAuthority") == "UNKNOWN"
+    assert metadata.get("aliasAuthority") == "MAY"
+    assert metadata.get("receiverConfidence") == "MAY"
+
+
+def test_java_field_authority_a5_left_right_paths_are_distinct_without_alias_proof(
+    tmp_path: Path,
+):
+    result = _extract(tmp_path, """
+        class Flow {
+          int value;
+          int run(Flow left, Flow right, int input) {
+            left.value = input;
+            int fromLeft = left.value;
+            int fromRight = right.value;
+            return fromLeft + fromRight;
+          }
+        }
+    """)
+    field = _value(result, "FIELD", "value", "Flow.value")
+    field_accesses = [
+        edge.get("metadata", {})
+        for edge in result["edges"]
+        if (edge.get("relation") == "WRITTEN_TO" and edge.get("target") == field)
+        or (edge.get("relation") == "READ_FROM" and edge.get("source") == field)
+    ]
+    by_path = {metadata.get("receiverPath"): metadata for metadata in field_accesses}
+    assert {"Flow@left", "Flow@right"} <= set(by_path)
+    assert by_path["Flow@left"].get("receiverKind") == "NAMED"
+    assert by_path["Flow@right"].get("receiverKind") == "NAMED"
+    for path in ("Flow@left", "Flow@right"):
+        assert by_path[path].get("instanceAuthority") == "UNKNOWN"
+        assert by_path[path].get("aliasAuthority") == "MAY"
+        assert by_path[path].get("declarationResolution") == "EXACT"
+
+
+def test_java_field_authority_a6_static_field_has_explicit_class_scope(tmp_path: Path):
+    result = _extract(tmp_path, """
+        class Counter { static int value; }
+        class Flow {
+          int run(int input) {
+            Counter.value = input;
+            return Counter.value;
+          }
+        }
+    """)
+    field = _value(result, "FIELD", "value", "Counter.value")
+    accesses = [
+        edge.get("metadata", {})
+        for edge in result["edges"]
+        if (edge.get("relation") == "WRITTEN_TO" and edge.get("target") == field)
+        or (edge.get("relation") == "READ_FROM" and edge.get("source") == field)
+    ]
+    assert accesses
+    for metadata in accesses:
+        assert metadata.get("declarationResolution") == "EXACT"
+        assert metadata.get("receiverKind") == "STATIC_CLASS"
+        assert metadata.get("receiverPath") == "Counter"
+        assert metadata.get("instanceAuthority") == "NOT_APPLICABLE"
+        assert metadata.get("aliasAuthority") == "NOT_APPLICABLE"
+
+
+@pytest.mark.parametrize(
+    ("edge_case", "relation", "target_kind", "target_name", "target_owner"),
+    [
+        ("assignment READ_FROM", "READ_FROM", "LOCAL", "assigned", "Flow.assign()"),
+        ("return READ_FROM", "READ_FROM", "RETURN_VALUE", "return", "Flow.direct()"),
+        ("return RETURNED_AS", "RETURNED_AS", "RETURN_VALUE", "return", "Flow.direct()"),
+        (
+            "call PASSED_AS_ARGUMENT",
+            "PASSED_AS_ARGUMENT",
+            "PARAMETER",
+            "raw",
+            "Flow.identity(int)",
+        ),
+        (
+            "call TRANSFORMED_BY",
+            "TRANSFORMED_BY",
+            "RETURN_VALUE",
+            "return",
+            "Flow.identity(int)",
+        ),
+    ],
+    ids=[
+        "assignment-READ_FROM",
+        "return-READ_FROM",
+        "return-RETURNED_AS",
+        "call-PASSED_AS_ARGUMENT",
+        "call-TRANSFORMED_BY",
+    ],
+)
+def test_java_field_authority_a7_parenthesized_explicit_this_preserves_metadata(
+    tmp_path: Path,
+    edge_case: str,
+    relation: str,
+    target_kind: str,
+    target_name: str,
+    target_owner: str,
+):
+    result = _extract(tmp_path, """
+        class Flow {
+          int value;
+          void assign() {
+            int assigned = 0;
+            assigned = (this.value);
+          }
+          int direct() { return (this.value); }
+          void call() { identity((this.value)); }
+          int identity(int raw) { return raw; }
+        }
+    """)
+    field = _value(result, "FIELD", "value", "Flow.value")
+    target = _value(result, target_kind, target_name, target_owner)
+    edge = next(
+        edge
+        for edge in _edges(result, relation)
+        if edge["source"] == field and edge["target"] == target
+    )
+
+    metadata = edge.get("metadata", {})
+    assert {
+        "declarationResolution": metadata.get("declarationResolution"),
+        "receiverKind": metadata.get("receiverKind"),
+        "receiverPath": metadata.get("receiverPath"),
+        "instanceAuthority": metadata.get("instanceAuthority"),
+        "aliasAuthority": metadata.get("aliasAuthority"),
+    } == {
+        "declarationResolution": "EXACT",
+        "receiverKind": "THIS",
+        "receiverPath": "Flow",
+        "instanceAuthority": "UNKNOWN",
+        "aliasAuthority": "MAY",
+    }, edge_case

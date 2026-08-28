@@ -92,20 +92,46 @@ evidence and v8-integration work (P0-4, P0-5).
 | P0-4 Correct ahead/behind evidence | Round-1 Drive report stated `18 ahead / 59 behind`; supervising review showed the direction was swapped. | report | Re-run with correct semantics: commits only in `v8` = behind, commits only in the feature branch = ahead. | n/a (evidence) | recorded below |
 | P0-5 Integrate current `v8` | Branch was still behind current `v8`. | report | Fetched and merged current `upstream/v8` into `feature/java-local-data-flow-v8`, resolved conflicts, and pushed the updated branch. | n/a (integration) | done |
 
-### Gate 3 semantics for receiver/instance flow (P0-1 contract)
+The Round-2 P0-1 statement that `this`, unqualified access, or a deterministic
+`this.<chain>` proves runtime same-instance identity is superseded by Round 3.
+A deterministic source receiver path is an access-site identity only.
 
-Downstream traversal MUST distinguish proven same-receiver field flow from
-MAY/unknown alias flow:
+## Supervising Review Remediation — Round 3
 
-- A `READ_FROM`/`WRITTEN_TO` edge whose `metadata.receiverConfidence == "PROVEN"`
-  (receiver `this`, unqualified, or a deterministic `this.<chain>`) may be treated
-  as definite same-instance field flow.
-- An edge whose `metadata.receiverConfidence == "MAY"` was produced through a named
-  receiver of a declared class type (or an unknown receiver) and must NOT be
-  presented as proven same-receiver flow. `metadata.receiver` carries the
-  deterministic access-site identity (e.g. `Flow@other`, `Box@param`) so
-  write→read correlation is possible without fabricating instance equivalence.
-- These MAY edges carry `confidence_score = 0.5`; PROVEN field edges carry 1.0.
+Round 3 separates exact field declaration resolution from runtime instance and
+alias authority. It also integrates the exact authorized v8 revision without
+rewriting history.
+
+| Issue | Defect and root cause | Changed files | Correction | Adversarial test | Result |
+|---|---|---|---|---|---|
+| R3-A Declaration certainty was treated as runtime instance proof | Round 2 marked `this`, unqualified access, and deterministic `this.<chain>` paths `PROVEN`, although the FIELD node represents a declaration and the extractor performs no heap/instance analysis. | `graphify/extractors/java_data_flow.py`, `tests/test_java_data_flow.py` | Field edges now emit `declarationResolution = EXACT` separately from `instanceAuthority = UNKNOWN` and `aliasAuthority = MAY`. Every ordinary instance access has `receiverConfidence = MAY`, including `this` and unqualified access. | A1 explicit `this.value`; A2 unqualified `value`; A3 named `other.value`. | PASS |
+| R3-B Deterministic nested paths could be laundered into same-instance authority | `this.box.value` had a stable `Flow.box` path and was therefore marked `PROVEN`; left/right receiver paths were not explicitly distinguished from alias evidence. | same | `receiverKind` and `receiverPath` preserve deterministic source access identity, but nested instance paths remain `UNKNOWN`/`MAY`. Distinct `left`/`right` paths prove neither aliasing nor non-aliasing. | A4 nested `this.box.value`; A5 `left.value` versus `right.value`. | PASS |
+| R3-C Static class scope was conflated with instance receiver confidence | Explicit class access used the same `PROVEN` vocabulary as instance accesses and field declarations did not retain the AST `static` modifier. | same | Static modifiers are collected from the Java AST. Explicit `Counter.value` emits `receiverKind = STATIC_CLASS`, `fieldScope = STATIC`, and instance/alias authority `NOT_APPLICABLE`. Explicit class access to a non-static field fails closed. | A6 explicit static class field plus independent invalid `Type.instanceField` omission probe. | PASS |
+| R3-D Field authority could be lost on parallel field-derived relations | Receiver authority was present only on selected `READ_FROM`/`WRITTEN_TO` edges, while field-derived `PASSED_AS_ARGUMENT`, `RETURNED_AS`, and `TRANSFORMED_BY` could retain unqualified confidence. Assignment reads could also use `FLOWS_TO`. | `graphify/extractors/java_data_flow.py` | The same field authority metadata is carried on field-derived call/return/transformation relations. Field-to-local assignments use `READ_FROM`, preserving the frozen field-read semantics and MAY authority. | Existing parallel-relation/build tests plus A1-A7 and the independent adversarial probe. | PASS |
+| R3-E Integrate exact current v8 | The branch started 62 commits behind exact v8 `43d54ac`. | merge commit | Merged `43d54acbfa9e731f7a592bb582c1f4b9d48ed73e` normally with the `ort` strategy and `--no-ff`. There were no conflicts and no manual conflict resolutions. | Focused and full validation after integration. | PASS |
+| R3-F Parenthesized field access lost authority metadata | `expr_value` unwrapped `(this.value)` to the field value, but `field_edge_md` received the parenthesized wrapper and therefore emitted no declaration or receiver authority metadata. | `graphify/extractors/java_data_flow.py`, `tests/test_java_data_flow.py` | Added one shared `unwrap_parenthesized_expression` helper used by both value resolution and field-edge metadata resolution. It preserves the existing single-named-child behavior and does not broaden expression semantics. | A7 parameterizes exactly five affected edges: assignment `READ_FROM`; return `READ_FROM` and `RETURNED_AS`; call `PASSED_AS_ARGUMENT` and `TRANSFORMED_BY`. | PASS |
+
+### Gate 3 semantics for receiver/instance flow (Round-3 contract)
+
+Downstream traversal MUST keep field declaration certainty separate from runtime
+instance and alias authority:
+
+- `metadata.declarationResolution == "EXACT"` means only that the Java source
+  expression resolved to one exact FIELD declaration.
+- For every ordinary instance field access, including `this.field`, unqualified
+  `field`, named receivers, and nested paths such as `this.box.value`,
+  `metadata.instanceAuthority == "UNKNOWN"`, `metadata.aliasAuthority == "MAY"`,
+  and `metadata.receiverConfidence == "MAY"`.
+- `metadata.receiverKind` and `metadata.receiverPath` are deterministic source
+  access-site descriptors. Equal declaration IDs, equal receiver paths, `this`,
+  or unqualified syntax MUST NOT by themselves authorize definite same-instance
+  write-to-read bridging. Distinct paths such as `Flow@left` and `Flow@right`
+  likewise MUST NOT be presented as proof of non-aliasing.
+- Static field access is not an instance claim. An exactly resolved explicit
+  class receiver has `fieldScope == "STATIC"`, `receiverKind == "STATIC_CLASS"`,
+  and instance/alias authority `NOT_APPLICABLE`.
+- MAY instance field edges carry `confidence_score = 0.5`. This is conservative
+  source-level evidence, not a runtime heap fact.
 
 ## Data Flow Completeness / Failure Semantics
 
@@ -136,7 +162,7 @@ Still missing for safe cross-file flow:
 
 No cross-file value flow, name-only callee matching, Gate 2B, or Gate 3 traversal was implemented in this remediation.
 
-## Final Validation
+## Final Validation — Round 2 (historical)
 
 Status: **GREEN** at `3951406daf8cf9bf0c19cdbf4baedfbf03918553`
 (`feature/java-local-data-flow-v8`, round 2 complete).
@@ -186,6 +212,74 @@ Known limitations: Gate 2 remains same-file local/basic interprocedural extracti
 ## Known baseline limitation
 
 Basic interprocedural extraction is currently bounded to exactly resolved declarations within one Java source file. Cross-file symbol resolution remains a later extraction extension and must not be approximated by name-only matching.
+
+## Final Validation — Round 3
+
+Validated production commit:
+`25d24717da07193aa591880664e55a34004bfe55` on
+`feature/java-local-data-flow-v8`.
+
+Git evidence:
+
+- starting branch HEAD: `d8b663f04092ec1d43eba8e027604bd833c1d957`;
+- RED test commit: `a6734ea18b4580ceb98b2f2defab6883a9541194`
+  (parent `d8b663f04092ec1d43eba8e027604bd833c1d957`);
+- exact integrated `fork/v8` and `upstream/v8`:
+  `43d54acbfa9e731f7a592bb582c1f4b9d48ed73e`;
+- normal merge commit: `a5293ec6f7cb1b628b10f43da220a373ccb4dd64`
+  (parents `a6734ea18b4580ceb98b2f2defab6883a9541194` and
+  `43d54acbfa9e731f7a592bb582c1f4b9d48ed73e`); no conflicts;
+- initial Round-3 authority GREEN: `3755c8ad87ed9f8edeb42cebf2871344affc3b60`;
+- A7 tests-only RED: `73a686df747bec23e70d158687527e8f5c6ffd4c`;
+- A7 production-only GREEN: `25d24717da07193aa591880664e55a34004bfe55`;
+- merge-base(`25d2471`, `upstream/v8`):
+  `43d54acbfa9e731f7a592bb582c1f4b9d48ed73e`;
+- at the validated production commit, v8-only / branch-only commits:
+  **0 / 38**. The branch was therefore behind v8 by **0** commits.
+
+RED/GREEN evidence:
+
+- clean pre-RED Java data-flow baseline: **32 passed**;
+- authentic RED command:
+  `uv run --frozen pytest -q tests/test_java_data_flow.py`:
+  **8 failed, 30 passed**;
+- authentic A7 RED command targeting the new parameterized regression:
+  **5 failed**, one for each specified field-derived edge; all five lacked
+  `declarationResolution`, `receiverKind`, `receiverPath`, `instanceAuthority`,
+  and `aliasAuthority`;
+- A7 targeted GREEN: **5 passed**;
+- GREEN Java data-flow suite: **43 passed**;
+- Java resolution/member/call group: **106 passed**;
+- build/multigraph group: **118 passed**;
+- public extraction group: **248 passed, 4 skipped**;
+- full suite: **5138 passed, 72 skipped**, 3 warnings in 87.74 seconds;
+- `uv run --frozen ruff check graphify tests`: PASS;
+- `uv run --frozen pyright graphify/extractors/java_data_flow.py tests/test_java_data_flow.py`:
+  **0 errors, 0 warnings**;
+- full-project `uv run --frozen pyright` was executed and remains blocked by
+  **568 errors, 5 warnings** in unrelated integrated-branch files, including
+  missing optional `watchdog`; neither changed file reports an error;
+- `git diff --check`: PASS;
+- `uv run --frozen graphify update .`: PASS. It reported existing optional-parser
+  warnings for 7 SQL files and 1 DM file, plus one recovered Luau fixture.
+
+Independent adversarial extraction, using a fixture distinct from A1-A7, proved:
+
+- nested instance paths `Flow.box`, `Flow@left.box`, and `Flow@right.box` remain
+  distinct and MAY;
+- no field edge retains `receiverConfidence = PROVEN`;
+- explicit static class-scope edges are emitted;
+- invalid explicit class access to a non-static field is omitted.
+
+Round-3 limitations and boundaries:
+
+- no cross-file value flow;
+- no Gate 2B work;
+- no Gate 3 traversal or same-instance bridging implementation;
+- no framework, runtime, deployment, persistence, cross-service, or LLM-derived
+  flow;
+- no name-only resolver;
+- no production system or deployment modification, Google Drive upload, or push was performed.
 
 # STOP FOR REVIEW
 
