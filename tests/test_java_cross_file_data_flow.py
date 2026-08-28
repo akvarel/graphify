@@ -32,7 +32,8 @@ def test_cross_file_instance_call_links_arg_param_return(tmp_path: Path):
     # another file. Caller arg `b` must flow to the callee parameter, the callee
     # return (a passthrough) must flow to the caller's receiving local, and the
     # param->return passthrough must be proven as TRANSFORMED_BY. The instance
-    # receiver is not proven same-instance, so confidence is MAY (0.5).
+    # receiver has exact declaration resolution but no proven runtime-instance
+    # or alias authority, so its evidence score remains conservative (0.5).
     service = _write(
         tmp_path / "src/acme/PricingService.java",
         "package acme;\n"
@@ -66,7 +67,15 @@ def test_cross_file_instance_call_links_arg_param_return(tmp_path: Path):
     e = passed[0]
     assert e["source"] == base and e["target"] == price
     assert e["source"] in ids and e["target"] in ids
-    assert (e["metadata"]).get("receiverConfidence") == "MAY"
+    assert "receiverConfidence" not in e["metadata"]
+    assert e["metadata"] | {
+        "declarationResolution": "EXACT",
+        "receiverKind": "NAMED_FIELD",
+        "receiverPath": "Order.ps",
+        "fieldScope": "INSTANCE",
+        "instanceAuthority": "UNKNOWN",
+        "aliasAuthority": "MAY",
+    } == e["metadata"]
     assert e["confidence_score"] == 0.5
     assert (e["metadata"]).get("argumentIndex") == 0
 
@@ -83,9 +92,9 @@ def test_cross_file_instance_call_links_arg_param_return(tmp_path: Path):
     assert flows[0]["source"] == ret and flows[0]["target"] == sink
 
 
-def test_cross_file_static_call_is_proven(tmp_path: Path):
-    # A static class receiver (`MathUtil.doubleIt(x)`) is deterministic: the
-    # class is named explicitly, so the linkage is PROVEN (confidence 1.0).
+def test_cross_file_static_call_has_no_instance_or_alias_question(tmp_path: Path):
+    # A static class receiver (`MathUtil.doubleIt(x)`) has exact declaration
+    # resolution, but instance and alias authority are not applicable.
     util = _write(
         tmp_path / "src/acme/MathUtil.java",
         "package acme;\npublic class MathUtil { public static double doubleIt(double v) { return v; } }\n",
@@ -106,7 +115,14 @@ def test_cross_file_static_call_is_proven(tmp_path: Path):
               if (e["metadata"]).get("calleeSymbol", "").startswith("MathUtil.doubleIt")]
     assert len(passed) == 1
     assert passed[0]["source"] == x and passed[0]["target"] == v
-    assert (passed[0]["metadata"]).get("receiverConfidence") == "PROVEN"
+    md = passed[0]["metadata"]
+    assert "receiverConfidence" not in md
+    assert md["declarationResolution"] == "EXACT"
+    assert md["receiverKind"] == "STATIC_CLASS"
+    assert md["receiverPath"] == "acme.MathUtil"
+    assert md["fieldScope"] == "NOT_APPLICABLE"
+    assert md["instanceAuthority"] == "NOT_APPLICABLE"
+    assert md["aliasAuthority"] == "NOT_APPLICABLE"
     assert passed[0]["confidence_score"] == 1.0
 
     transformed = [e for e in _cross_file_edges(result, "TRANSFORMED_BY")
@@ -123,7 +139,8 @@ def test_cross_file_static_call_is_proven(tmp_path: Path):
 
 def test_cross_file_constructor_argument_link(tmp_path: Path):
     # `new Invoice(amt)` constructs a cross-file class; the constructor argument
-    # must link to the constructor parameter (PROVEN: no instance receiver).
+    # must link to the constructor parameter. There is no receiver instance or
+    # alias question at a construction boundary.
     invoice = _write(
         tmp_path / "src/acme/Invoice.java",
         "package acme;\n"
@@ -154,7 +171,13 @@ def test_cross_file_constructor_argument_link(tmp_path: Path):
     assert len(passed) == 1
     e = passed[0]
     assert e["source"] == amt and e["target"] == ctor_param
-    assert (e["metadata"]).get("receiverConfidence") == "PROVEN"
+    assert "receiverConfidence" not in e["metadata"]
+    assert e["metadata"]["declarationResolution"] == "EXACT"
+    assert e["metadata"]["receiverKind"] == "CONSTRUCTOR"
+    assert e["metadata"]["receiverPath"] == "acme.Invoice"
+    assert e["metadata"]["fieldScope"] == "NOT_APPLICABLE"
+    assert e["metadata"]["instanceAuthority"] == "NOT_APPLICABLE"
+    assert e["metadata"]["aliasAuthority"] == "NOT_APPLICABLE"
     assert e["confidence_score"] == 1.0
 
 

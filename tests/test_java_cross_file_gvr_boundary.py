@@ -26,7 +26,7 @@ def _build(tmp_path: Path):
     return extract([service, order], cache_root=tmp_path)
 
 
-def test_source_layer_preserves_provenance_and_receiver_confidence(tmp_path: Path):
+def test_exact_resolution_never_upgrades_instance_or_alias_authority(tmp_path: Path):
     result = _build(tmp_path)
     passed = [
         e for e in result["edges"]
@@ -36,12 +36,22 @@ def test_source_layer_preserves_provenance_and_receiver_confidence(tmp_path: Pat
     md = passed[0]["metadata"]
     # Provenance and epistemic metadata survive the public boundary.
     assert md["provenance"] == "CROSS_FILE"
-    assert md["receiverConfidence"] in {"PROVEN", "MAY"}
+    assert "receiverConfidence" not in md
+    assert md["declarationResolution"] == "EXACT"
+    assert md["receiverKind"] == "NAMED_FIELD"
+    assert md["receiverPath"] == "Order.ps"
+    assert md["fieldScope"] == "INSTANCE"
+    assert md["instanceAuthority"] == "UNKNOWN"
+    assert md["aliasAuthority"] == "MAY"
     assert md["analysisCompleteness"] in {"COMPLETE_FOR_SUPPORTED_CONSTRUCT", "PARTIAL"}
-    # MAY is not upgraded to a definite same-instance flow.
-    if md["receiverConfidence"] == "MAY":
-        assert passed[0]["confidence_score"] == 0.5
-        assert "PROVEN" != md["receiverConfidence"]
+    assert passed[0]["confidence_score"] == 0.5
+
+    exact = [d for d in _cross_file_diags(result) if d["resolution"] == "EXACT"]
+    assert exact
+    assert exact[0]["declarationResolution"] == "EXACT"
+    assert exact[0]["instanceAuthority"] == "UNKNOWN"
+    assert exact[0]["aliasAuthority"] == "MAY"
+    assert "receiverConfidence" not in exact[0]
 
 
 def test_exact_source_and_target_identity_exposed(tmp_path: Path):
