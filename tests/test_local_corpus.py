@@ -1,4 +1,5 @@
 """Acceptance contracts for private local document indexing, without model calls."""
+
 from __future__ import annotations
 
 import json
@@ -60,12 +61,15 @@ def test_private_files_symlinks_and_cache_do_not_leak(tmp_path):
     assert (out / "corpus.sqlite3").stat().st_mode & 0o077 == 0
 
 
-@pytest.mark.parametrize("suffix,member,xml", [
-    (".odt", "content.xml", '<doc><p>Latvijas rēķins 3049.20</p></doc>'),
-    (".ods", "content.xml", '<doc><cell>Invoice 1851.30</cell></doc>'),
-    (".docx", "word/document.xml", '<doc><p>Agreement MB BUS</p></doc>'),
-    (".xlsx", "xl/sharedStrings.xml", '<sst><si><t>MB BUS</t></si></sst>'),
-])
+@pytest.mark.parametrize(
+    "suffix,member,xml",
+    [
+        (".odt", "content.xml", "<doc><p>Latvijas rēķins 3049.20</p></doc>"),
+        (".ods", "content.xml", "<doc><cell>Invoice 1851.30</cell></doc>"),
+        (".docx", "word/document.xml", "<doc><p>Agreement MB BUS</p></doc>"),
+        (".xlsx", "xl/sharedStrings.xml", "<sst><si><t>MB BUS</t></si></sst>"),
+    ],
+)
 def test_local_office_formats(tmp_path, suffix, member, xml):
     root = tmp_path / "Dropbox"
     root.mkdir()
@@ -120,3 +124,86 @@ def test_search_literals_and_root_binding(tmp_path):
     db = sqlite3.connect(out / "corpus.sqlite3")
     assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     db.close()
+
+
+def test_cli_and_no_network(tmp_path, monkeypatch, capsys):
+    import socket
+    import sys
+    from graphify.__main__ import main
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Network must never be used")
+
+    monkeypatch.setattr(socket.socket, "connect", forbidden)
+    root = tmp_path / "documents"
+    root.mkdir()
+    (root / "evidence.txt").write_text("Searchable local evidence")
+    out = tmp_path / "private-index"
+    for arguments in [
+        ["index", str(root), "--out", str(out)],
+        ["search", "evidence", "--index", str(out)],
+        ["status", "--index", str(out)],
+    ]:
+        monkeypatch.setattr(sys, "argv", ["graphify", "documents", *arguments])
+        main()
+        assert "evidence" in capsys.readouterr().out or arguments[0] != "search"
+
+
+def test_limits_binary_empty_and_pdf_errors(tmp_path, monkeypatch):
+    from graphify import local_corpus
+
+    root = tmp_path / "documents"
+    root.mkdir()
+    (root / "binary.txt").write_bytes(b"binary\x00data")
+    (root / "empty.txt").write_text("")
+    (root / "large.txt").write_text("x" * 101)
+    (root / "broken.pdf").write_bytes(b"not a PDF")
+    monkeypatch.setattr(local_corpus, "LIMIT", 100)
+    report = build_index(root, tmp_path / "private-index")
+    assert report["statuses"] == {
+        "metadata_only": 1,
+        "no_text": 1,
+        "truncated": 1,
+        "extraction_error": 1,
+    }
+    assert len(report["failures"]) == 3
+
+
+def test_private_root_guards_and_nested_output(tmp_path):
+    root = tmp_path / "documents"
+    root.mkdir()
+    with pytest.raises(ValueError, match="differ"):
+        build_index(root, root)
+    with pytest.raises(ValueError, match="existing"):
+        build_index(root / "absent", tmp_path / "index")
+    public = tmp_path / "public"
+    public.mkdir(mode=0o755)
+    with pytest.raises(ValueError, match="private"):
+        build_index(root, public)
+    out = root / "index"
+    (root / "good.txt").write_text("Evidence")
+    assert build_index(root, out)["files"] == 1
+    assert build_index(root, out)["files"] == 1
+
+
+def test_utf16_entity_document_rejected(tmp_path):
+    root = tmp_path / "documents"
+    root.mkdir()
+    with zipfile.ZipFile(root / "unsafe.odt", "w") as archive:
+        archive.writestr(
+            "content.xml", '<!DOCTYPE x [<!ENTITY x "unsafe">]><doc>&x;</doc>'.encode("utf-16")
+        )
+    assert build_index(root, tmp_path / "index")["errors"] == 1
+
+
+def test_invoice_identifier_is_not_independent_prefixes(tmp_path):
+    root = tmp_path / "documents"
+    root.mkdir()
+    (root / "correct.txt").write_text("Invoice 1-4-mb")
+    (root / "other.txt").write_text("Invoice 1-2-mb registration 40203162453")
+    out = tmp_path / "index"
+    build_index(root, out)
+    assert [Path(hit["path"]).name for hit in search_index(out, "1-4-mb")] == ["correct.txt"]
+    with pytest.raises(sqlite3.OperationalError):
+        search_index(tmp_path / "absent", "invoice")
+    assert not (tmp_path / "absent").exists()
