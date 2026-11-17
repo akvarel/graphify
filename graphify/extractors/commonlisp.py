@@ -4,7 +4,8 @@ from __future__ import annotations
 import warnings
 from pathlib import Path
 
-from graphify.extractors.base import _make_id
+from graphify.extractors.base import _file_stem, _make_id, _read_source_bytes
+from graphify.security import redact_secrets
 
 
 # Standard CL definer forms that introduce data/type/variable bindings
@@ -78,13 +79,17 @@ def extract_commonlisp(path: Path) -> dict:
             )
             language = Language(tscl.language())
         parser = Parser(language)
-        source = path.read_bytes()
+        source = _read_source_bytes(path)
         tree = parser.parse(source)
         root = tree.root_node
     except Exception as e:
         return {"nodes": [], "edges": [], "error": str(e)}
 
-    stem = path.stem
+    # Path-qualified, not the bare `path.stem`: same-named .lisp files in
+    # different directories must not collide (#1504). Pre-collapsed through
+    # `_make_id` because `_cl_id` would otherwise map the `/` separators to
+    # `_slash` via _CL_CHAR_MAP.
+    stem = _make_id(_file_stem(path))
     str_path = str(path)
     nodes: list[dict] = []
     edges: list[dict] = []
@@ -153,6 +158,38 @@ def extract_commonlisp(path: Path) -> dict:
                 "origin_file": str_path,
             })
         return nid
+
+    def ensure_class_ref(name: str, line: int) -> str:
+        """Resolve a superclass name to a node id.
+
+        If the class is defined in THIS file, bind to its local node. Otherwise
+        mint a SOURCELESS stub (like `add_import_stub`) so the corpus-level
+        rewire can collapse it onto the real `defclass` in another file. Without
+        this, a cross-file superclass had no matching node and its `inherits`
+        edge was pruned by the dangling-edge filter — silently erasing every
+        inheritance edge whose parent lives in a different file.
+
+        `local` is checked against `local_class_names` (every class this file
+        defines, gathered up front), not just `seen_ids`: forms are walked in
+        file order, so a class referenced before its own `defclass` form is
+        processed — e.g. a subclass listed above its parent — would otherwise
+        still be in `seen_ids` as absent, and this would wrongly mint an
+        external stub for a class that is right here in the same file."""
+        local = _cl_id(stem, name)
+        if local in seen_ids or name in local_class_names:
+            return local
+        stub = _cl_id(name)
+        if stub not in seen_ids:
+            seen_ids.add(stub)
+            nodes.append({
+                "id": stub,
+                "label": name,
+                "file_type": "code",
+                "source_file": "",
+                "source_location": "",
+                "origin_file": str_path,
+            })
+        return stub
 
     def _first_sym(node) -> str | None:
         """Get the first sym_lit text from a list_lit's children."""
@@ -227,7 +264,7 @@ def extract_commonlisp(path: Path) -> dict:
             for sc in superclass_list.children:
                 if sc.type == "sym_lit":
                     sc_name = _text(sc)
-                    sc_nid = _cl_id(stem, sc_name)
+                    sc_nid = ensure_class_ref(sc_name, superclass_list.start_point[0] + 1)
                     add_edge(class_nid, sc_nid, "inherits",
                              superclass_list.start_point[0] + 1)
 
@@ -301,7 +338,7 @@ def extract_commonlisp(path: Path) -> dict:
                 doc_text = _text(child).strip('"')
                 if doc_text:
                     doc_nid = _cl_id(func_nid, "rationale")
-                    add_node(doc_nid, doc_text[:120], child.start_point[0] + 1, file_type="rationale")
+                    add_node(doc_nid, redact_secrets(doc_text)[:120], child.start_point[0] + 1, file_type="rationale")
                     add_edge(doc_nid, func_nid, "rationale_for",
                              child.start_point[0] + 1)
                 break
@@ -391,7 +428,7 @@ def extract_commonlisp(path: Path) -> dict:
                     doc_text = _text(child).strip('"')
                     if doc_text:
                         doc_nid = _cl_id(nid, "rationale")
-                        add_node(doc_nid, doc_text[:120], child.start_point[0] + 1, file_type="rationale")
+                        add_node(doc_nid, redact_secrets(doc_text)[:120], child.start_point[0] + 1, file_type="rationale")
                         add_edge(doc_nid, nid, "rationale_for",
                                  child.start_point[0] + 1)
                     break
@@ -474,6 +511,40 @@ def extract_commonlisp(path: Path) -> dict:
                     _walk_forms(top)
             elif top.type == "include_reader_macro":
                 _walk_forms(top)
+
+    def _prescan_class_names(parent) -> set[str]:
+        """Collect every name this file defines via `defclass`, regardless of
+        where in the file the definition sits, so `ensure_class_ref` can tell
+        a forward-referenced same-file class apart from a genuinely external
+        one before `_walk_forms` reaches the defining form. Mirrors
+        `_walk_forms`'s own recursion rule (stop at a recognized top-level
+        form, descend into anything else) so it finds a `defclass` nested in
+        a wrapper macro the same way the real walk later will."""
+        names: set[str] = set()
+        for top in parent.children:
+            if top.type == "list_lit":
+                first = _first_sym(top)
+                first_lower = (first or "").lower()
+                if first_lower == "defclass":
+                    # Mirror _handle_defclass's own name extraction exactly
+                    # (direct-child sym_lits, second one is the name) so a
+                    # form _handle_defclass would itself skip — e.g. a
+                    # list-style name — isn't prescanned as a local class.
+                    sym_lits = [c for c in top.children if c.type == "sym_lit"]
+                    if len(sym_lits) >= 2:
+                        names.add(_text(sym_lits[1]))
+                elif not first or (
+                    first_lower not in ("defpackage", "in-package", "require", "ql:quickload")
+                    and first_lower not in _CL_DATA_DEFINERS
+                    and first_lower not in _CL_MACRO_DEFINERS
+                    and not _is_def_prefixed(first_lower)
+                ):
+                    names |= _prescan_class_names(top)
+            elif top.type == "include_reader_macro":
+                names |= _prescan_class_names(top)
+        return names
+
+    local_class_names = _prescan_class_names(root)
 
     _walk_forms(root)
 

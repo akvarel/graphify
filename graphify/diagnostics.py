@@ -161,7 +161,15 @@ def diagnose_extraction(
     max_examples: int = 5,
     extract_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Summarize same-endpoint edge-collapse risk for one JSON graph/extraction dict."""
+    """Summarize graph-integrity risks for one JSON graph/extraction dict.
+
+    Missing ``ref_*`` targets are expected external references produced for
+    dependencies outside the scanned corpus. They are counted separately from
+    actionable internal dangling endpoints.
+
+    Non-list node containers contribute no node counts. The original input is
+    still passed to the protected build attempt so its error remains visible.
+    """
     from graphify.build import build_from_json
 
     node_ids = _node_ids(extraction)
@@ -171,8 +179,9 @@ def diagnose_extraction(
     # Code-typed semantic nodes the extractor could not verify against the source
     # it read (#1949): likely-inferred (or hallucinated) symbols surfaced from a
     # document. Count them so the flag on graph.json nodes is actually surfaced.
+    raw_nodes = extraction.get("nodes")
     unverified_node_count = sum(
-        1 for n in extraction.get("nodes", [])
+        1 for n in (raw_nodes if isinstance(raw_nodes, list) else [])
         if isinstance(n, dict) and n.get("verification") == "unverified"
     )
 
@@ -184,6 +193,7 @@ def diagnose_extraction(
     non_object_edges = 0
     missing_endpoint_edges = 0
     dangling_endpoint_edges = 0
+    external_reference_edges = 0
     self_loop_edges = 0
     valid_candidate_edges = 0
 
@@ -197,7 +207,15 @@ def diagnose_extraction(
             missing_endpoint_edges += 1
             continue
         if source not in node_ids or target not in node_ids:
-            dangling_endpoint_edges += 1
+            # Two intentionally-distinct populations of "external": a `ref_`
+            # target here is a JSON/config out-of-corpus reference ($ref /
+            # extends / references), whereas import-family externals are minted
+            # as declared `external=True` stub nodes at build time (#2873) and
+            # therefore never reach this branch. Don't try to unify them.
+            if source in node_ids and target.startswith("ref_"):
+                external_reference_edges += 1
+            else:
+                dangling_endpoint_edges += 1
             continue
         if source == target:
             self_loop_edges += 1
@@ -252,6 +270,7 @@ def diagnose_extraction(
         "non_object_edges": non_object_edges,
         "missing_endpoint_edges": missing_endpoint_edges,
         "dangling_endpoint_edges": dangling_endpoint_edges,
+        "external_reference_edges": external_reference_edges,
         "self_loop_edges": self_loop_edges,
         "valid_candidate_edges": valid_candidate_edges,
         "exact_duplicate_edges": _count_extra(exact_counts),
@@ -358,6 +377,7 @@ def format_diagnostic_report(summary: dict[str, Any]) -> str:
         f"valid_candidate_edges: {summary['valid_candidate_edges']}",
         f"missing_endpoint_edges: {summary['missing_endpoint_edges']}",
         f"dangling_endpoint_edges: {summary['dangling_endpoint_edges']}",
+        f"external_reference_edges: {summary.get('external_reference_edges', 0)}",
         f"self_loop_edges: {summary['self_loop_edges']}",
         f"exact_duplicate_edges: {summary['exact_duplicate_edges']}",
         f"directed_unique_endpoint_pairs: {summary['directed_unique_endpoint_pairs']}",

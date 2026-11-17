@@ -120,7 +120,7 @@ SOURCE_CLASS_GIT_COMMIT: str = "git.commit"
 # Analyzer identity is deliberately separate from the analyzed source revision.
 # This value follows the package release and must be advanced when analyzer
 # semantics change, without pretending that the analyzed git commit changed.
-DEFAULT_ANALYZER_REVISION: str = "graphifyy/0.9.48"
+DEFAULT_ANALYZER_REVISION: str = "graphifyy/0.9.112"
 
 DATA_FLOW_KEY_PREFIX: str = "df:"
 BOUNDARY_KEY_PREFIX: str = "bnd:"

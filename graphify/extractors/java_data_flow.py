@@ -7,7 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from graphify.extractors.base import _file_stem, _make_id, _read_text
+from graphify.extractors.base import _file_stem, _make_id, _read_text, _read_source_bytes
 from graphify.extractors.engine import (  # noqa: E402
     _JAVA_BUILTIN_TYPES,
     _java_annotation_names,
@@ -75,7 +75,7 @@ def augment_java_data_flow(path: Path, result: dict[str, Any]) -> dict[str, Any]
             append_status_node(status["java"], path.stem)
             return result
         parser = Parser(Language(lang_fn()))
-        source = path.read_bytes()
+        source = _read_source_bytes(path, warn=False).replace(b"\r\n", b"\n")
         root = parser.parse(source).root_node
     except Exception as exc:
         if isinstance(exc, ModuleNotFoundError) and getattr(exc, "name", "") == "tree_sitter_java":

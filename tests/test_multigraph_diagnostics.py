@@ -103,6 +103,37 @@ def test_diagnose_extraction_categorizes_same_endpoint_collapse() -> None:
     assert summary["post_build_edge_count"] == 2
 
 
+def test_diagnose_extraction_separates_external_reference_edges() -> None:
+    extraction = {
+        "nodes": [
+            {"id": "app", "label": "app", "file_type": "code", "source_file": "app.ts"},
+        ],
+        "edges": [
+            {
+                "source": "app",
+                "target": "ref_react",
+                "relation": "imports_from",
+                "confidence": "EXTRACTED",
+                "source_file": "app.ts",
+            },
+            {
+                "source": "app",
+                "target": "missing_internal",
+                "relation": "references",
+                "confidence": "INFERRED",
+                "source_file": "app.ts",
+            },
+        ],
+    }
+
+    summary = diagnose_extraction(extraction, directed=True)
+    report = format_diagnostic_report(summary)
+
+    assert summary["external_reference_edges"] == 1
+    assert summary["dangling_endpoint_edges"] == 1
+    assert "external_reference_edges: 1" in report
+
+
 def test_diagnose_extraction_accepts_node_link_links_key() -> None:
     extraction = _diagnostic_fixture()
     extraction["links"] = extraction.pop("edges")
@@ -159,6 +190,65 @@ def test_diagnose_extraction_handles_non_list_nodes_and_edges() -> None:
     assert summary["node_count"] == 0
     assert summary["raw_edge_count"] == 0
     assert summary["valid_candidate_edges"] == 0
+
+
+@pytest.mark.parametrize("nodes", [None, 42, False, 3.14])
+def test_diagnose_extraction_reports_non_iterable_nodes(nodes) -> None:
+    extraction = {"nodes": nodes, "edges": [{"source": "a", "target": "b"}]}
+    original = deepcopy(extraction)
+
+    summary = diagnose_extraction(extraction)
+
+    assert summary["node_count"] == 0
+    assert summary["unverified_node_count"] == 0
+    assert summary["raw_edge_count"] == 1
+    assert summary["dangling_endpoint_edges"] == 1
+    assert summary["post_build_error"]
+    assert extraction == original
+
+
+@pytest.mark.parametrize("nodes", [None, 42])
+@pytest.mark.parametrize("json_output", [False, True])
+def test_diagnose_file_and_cli_report_invalid_nodes_without_writing(
+    nodes, json_output, monkeypatch, tmp_path, capsys,
+) -> None:
+    graph_path = tmp_path / "graph.json"
+    original = json.dumps({"nodes": nodes, "edges": []}).encode("utf-8")
+    graph_path.write_bytes(original)
+
+    summary = diagnose_file(graph_path)
+    assert summary["node_count"] == summary["unverified_node_count"] == 0
+    assert summary["post_build_error"]
+
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    argv = ["graphify", "diagnose", "multigraph", "--graph", str(graph_path)]
+    if json_output:
+        argv.append("--json")
+    monkeypatch.setattr(mainmod.sys, "argv", argv)
+    mainmod.main()
+
+    output = capsys.readouterr().out
+    if json_output:
+        reported = json.loads(output)["summary"]
+        assert reported["node_count"] == reported["unverified_node_count"] == 0
+        assert reported["post_build_error"] == summary["post_build_error"]
+    else:
+        assert "\nnodes: 0\n" in output
+        assert "\nunverified_code_nodes: 0\n" in output
+        assert f"post_build_error: {summary['post_build_error']}" in output
+    assert graph_path.read_bytes() == original
+
+
+def test_diagnose_extraction_still_counts_unverified_nodes_in_mixed_list() -> None:
+    extraction = _diagnostic_fixture()
+    extraction["nodes"][0]["verification"] = "unverified"
+    extraction["nodes"].append(None)
+
+    summary = diagnose_extraction(extraction)
+
+    assert summary["node_count"] == 3
+    assert summary["unverified_node_count"] == 1
+    assert summary["post_build_error"]
 
 
 def test_diagnose_extraction_bounds_examples() -> None:

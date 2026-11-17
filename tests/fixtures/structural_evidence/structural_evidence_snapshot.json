@@ -1,75 +1,62 @@
 {
-  "analysis_binding": {
-    "binding_fingerprint": "sha256:8eff1a6775f283ce95a4a5e908c3878b6042e1f746d8bd23cba3de60b8231401",
-    "index_fingerprint": "sha256:34fe7f3da02f41f00633ddaa4e2bfe14e798c020864a089767ce29a155f449de",
-    "source_scope_fingerprint": "288336be6076df9e61bceacc1673112cf0f1f170b811329316012086335f61a2",
-    "traversal_fingerprint": "sha256:88996d7068f8e4c3e031a0e10fbd193b87351a654694c49f8953d21511691ac4"
+  "schema_version": 2,
+  "format": "graphify.structural_evidence.v2",
+  "provider_id": "graphify",
+  "analyzer_revision": "graphifyy/0.9.112",
+  "source_revision_scope": {
+    "provider_id": "graphify",
+    "source_class": "git.commit",
+    "source_revision": "d4c843fd464174687015527401a3dd40799a1f70"
   },
-  "analyzer_revision": "graphifyy/0.9.48",
-  "blockers": [
-    {
-      "arity": 1,
-      "caller_location": "L5:C38:171-184",
-      "candidate_count": 0,
-      "canonical_caller_file": "src/acme/Pipeline.java",
-      "capability": "cross_file_data_flow",
-      "details": {
-        "arity": 1,
-        "boundary_evidence_key": "bnd:4ade86583378383d49c7ba93be7f49d0e17717865bac175d5e587566b3da0094",
-        "caller_location": "L5:C38:171-184",
-        "candidate_count": 0,
-        "canonical_caller_file": "src/acme/Pipeline.java",
-        "capability": "cross_file_data_flow",
-        "diagnostic_evidence_key": "diag:src_acme_pipeline_cross_file_data_flow_result_1_l5_c38_171_184",
-        "diagnostic_kind": "cross_file_resolution",
-        "diagnostic_node_id": "src_acme_pipeline_cross_file_data_flow_result_1_l5_c38_171_184",
-        "entity_fqn": "",
-        "framework": "",
-        "import_context": "same_package",
-        "mapping_target": "",
-        "method": "Result",
-        "reason": "callee_unresolved",
-        "receiver": "Result",
-        "receiver_confidence": "PROVEN",
-        "receiver_fqn": "acme.Result",
-        "repository_fqn": "",
-        "resolution": "UNRESOLVED",
-        "type": "boundary_event"
-      },
-      "diagnostic_key": "diag:src_acme_pipeline_cross_file_data_flow_result_1_l5_c38_171_184",
-      "diagnostic_kind": "cross_file_resolution",
-      "framework": "",
-      "import_context": "same_package",
-      "key": "bnd:4ade86583378383d49c7ba93be7f49d0e17717865bac175d5e587566b3da0094",
-      "method": "Result",
-      "reason": "callee_unresolved",
-      "reason_code": "callee_unresolved",
-      "receiver_confidence": "PROVEN",
-      "receiver_fqn": "acme.Result",
-      "resolution": "UNRESOLVED"
-    }
-  ],
+  "analysis_binding": {
+    "source_scope_fingerprint": "288336be6076df9e61bceacc1673112cf0f1f170b811329316012086335f61a2",
+    "index_fingerprint": "sha256:67eed77ad22fa48df8f49d6c4db0f8c061f9c11a619e8a730e186d4004cbb75a",
+    "traversal_fingerprint": "sha256:88996d7068f8e4c3e031a0e10fbd193b87351a654694c49f8953d21511691ac4",
+    "binding_fingerprint": "sha256:9d15eda20abfe1c2e548f1784fcfff831b0160dd68c85efc4ae8d2ea5c0f8f29"
+  },
+  "query": {
+    "direction": "FORWARD",
+    "max_depth": 6,
+    "max_paths": 50,
+    "max_expansions": 2000,
+    "requested_allowed_relations": [
+      "FLOWS_TO",
+      "PASSED_AS_ARGUMENT",
+      "READ_FROM",
+      "RETURNED_AS",
+      "TRANSFORMED_BY",
+      "WRITTEN_TO"
+    ],
+    "effective_allowed_relations": [
+      "FLOWS_TO",
+      "PASSED_AS_ARGUMENT",
+      "READ_FROM",
+      "RETURNED_AS",
+      "TRANSFORMED_BY",
+      "WRITTEN_TO"
+    ],
+    "rejected_relations": [],
+    "stop_nodes": [],
+    "start": "src_acme_pipeline_data_value_pipeline_run_value_parameter_in_52_54",
+    "target": null
+  },
   "coverage": {
+    "search_coverage": "PARTIAL",
     "complete_supported_search": false,
-    "encountered_may_evidence": true,
+    "termination_reason": "COMPLETE",
+    "truncated": false,
+    "input_resolution": "RESOLVED",
+    "query_validity": true,
+    "start_node_found": true,
+    "target_node_found": null,
     "encountered_partial_evidence": false,
     "encountered_unknown_evidence": false,
-    "expanded_count": 5,
-    "input_resolution": "RESOLVED",
+    "encountered_may_evidence": true,
     "query_bounds": {
       "direction": "FORWARD",
-      "effective_allowed_relations": [
-        "FLOWS_TO",
-        "PASSED_AS_ARGUMENT",
-        "READ_FROM",
-        "RETURNED_AS",
-        "TRANSFORMED_BY",
-        "WRITTEN_TO"
-      ],
       "max_depth": 6,
-      "max_expansions": 2000,
       "max_paths": 50,
-      "rejected_relations": [],
+      "max_expansions": 2000,
       "requested_allowed_relations": [
         "FLOWS_TO",
         "PASSED_AS_ARGUMENT",
@@ -78,23 +65,34 @@
         "TRANSFORMED_BY",
         "WRITTEN_TO"
       ],
+      "effective_allowed_relations": [
+        "FLOWS_TO",
+        "PASSED_AS_ARGUMENT",
+        "READ_FROM",
+        "RETURNED_AS",
+        "TRANSFORMED_BY",
+        "WRITTEN_TO"
+      ],
+      "rejected_relations": [],
       "stop_nodes": []
     },
-    "query_validity": true,
     "rejected_relations": [],
-    "search_coverage": "PARTIAL",
-    "start_node_found": true,
-    "target_node_found": null,
-    "termination_reason": "COMPLETE",
-    "truncated": false,
-    "visited_count": 4
+    "visited_count": 4,
+    "expanded_count": 5
   },
   "facts": [
     {
+      "key": "df:138eb84fff5566fd7701c1b1ee77cb52099ad18324c7fa3d2a5ee60a639886b7",
+      "relation": "RETURNED_AS",
+      "source": "src_acme_pipeline_data_value_pipeline_transform_value_parameter_v_117_118",
+      "target": "src_acme_pipeline_data_value_pipeline_transform_value_return_return",
+      "source_file": "src/acme/Pipeline.java",
+      "source_location": "L4:C32",
+      "provenance": "STATIC_AST",
       "analysis_completeness": "COMPLETE_FOR_SUPPORTED_CONSTRUCT",
+      "receiver_confidence": "PROVEN",
       "argument_index": null,
       "confidence_score": 1.0,
-      "key": "df:138eb84fff5566fd7701c1b1ee77cb52099ad18324c7fa3d2a5ee60a639886b7",
       "path_identity": [
         [
           "df:a55f383e3667534c3b64293bb1847970536ee52a95be438d00465cacdccbcb65",
@@ -105,20 +103,20 @@
           "df:138eb84fff5566fd7701c1b1ee77cb52099ad18324c7fa3d2a5ee60a639886b7",
           "df:df9fb2307c8d9978fd3a27ef1054b56c113e9e3eea7ec82cae7f48ca180a32e0"
         ]
-      ],
-      "provenance": "STATIC_AST",
-      "receiver_confidence": "PROVEN",
-      "relation": "RETURNED_AS",
-      "source": "src_acme_pipeline_data_value_pipeline_transform_value_parameter_v_117_118",
-      "source_file": "src/acme/Pipeline.java",
-      "source_location": "L4:C32",
-      "target": "src_acme_pipeline_data_value_pipeline_transform_value_return_return"
+      ]
     },
     {
+      "key": "df:5b134f070cce187b3d1d764a18346e95028556a1f82578e377f4cb029223b35c",
+      "relation": "TRANSFORMED_BY",
+      "source": "src_acme_pipeline_data_value_pipeline_run_value_parameter_in_52_54",
+      "target": "src_acme_pipeline_data_value_pipeline_transform_value_return_return",
+      "source_file": "src/acme/Pipeline.java",
+      "source_location": "L3:C43",
+      "provenance": "STATIC_AST",
       "analysis_completeness": "COMPLETE_FOR_SUPPORTED_CONSTRUCT",
+      "receiver_confidence": "PROVEN",
       "argument_index": 0,
       "confidence_score": 1.0,
-      "key": "df:5b134f070cce187b3d1d764a18346e95028556a1f82578e377f4cb029223b35c",
       "path_identity": [
         [
           "df:5b134f070cce187b3d1d764a18346e95028556a1f82578e377f4cb029223b35c"
@@ -127,20 +125,20 @@
           "df:5b134f070cce187b3d1d764a18346e95028556a1f82578e377f4cb029223b35c",
           "df:df9fb2307c8d9978fd3a27ef1054b56c113e9e3eea7ec82cae7f48ca180a32e0"
         ]
-      ],
-      "provenance": "STATIC_AST",
-      "receiver_confidence": "PROVEN",
-      "relation": "TRANSFORMED_BY",
-      "source": "src_acme_pipeline_data_value_pipeline_run_value_parameter_in_52_54",
-      "source_file": "src/acme/Pipeline.java",
-      "source_location": "L3:C43",
-      "target": "src_acme_pipeline_data_value_pipeline_transform_value_return_return"
+      ]
     },
     {
+      "key": "df:a55f383e3667534c3b64293bb1847970536ee52a95be438d00465cacdccbcb65",
+      "relation": "PASSED_AS_ARGUMENT",
+      "source": "src_acme_pipeline_data_value_pipeline_run_value_parameter_in_52_54",
+      "target": "src_acme_pipeline_data_value_pipeline_transform_value_parameter_v_117_118",
+      "source_file": "src/acme/Pipeline.java",
+      "source_location": "L3:C53",
+      "provenance": "STATIC_AST",
       "analysis_completeness": "COMPLETE_FOR_SUPPORTED_CONSTRUCT",
+      "receiver_confidence": "MAY",
       "argument_index": 0,
       "confidence_score": 1.0,
-      "key": "df:a55f383e3667534c3b64293bb1847970536ee52a95be438d00465cacdccbcb65",
       "path_identity": [
         [
           "df:a55f383e3667534c3b64293bb1847970536ee52a95be438d00465cacdccbcb65"
@@ -154,20 +152,20 @@
           "df:138eb84fff5566fd7701c1b1ee77cb52099ad18324c7fa3d2a5ee60a639886b7",
           "df:df9fb2307c8d9978fd3a27ef1054b56c113e9e3eea7ec82cae7f48ca180a32e0"
         ]
-      ],
-      "provenance": "STATIC_AST",
-      "receiver_confidence": "MAY",
-      "relation": "PASSED_AS_ARGUMENT",
-      "source": "src_acme_pipeline_data_value_pipeline_run_value_parameter_in_52_54",
-      "source_file": "src/acme/Pipeline.java",
-      "source_location": "L3:C53",
-      "target": "src_acme_pipeline_data_value_pipeline_transform_value_parameter_v_117_118"
+      ]
     },
     {
+      "key": "df:df9fb2307c8d9978fd3a27ef1054b56c113e9e3eea7ec82cae7f48ca180a32e0",
+      "relation": "PASSED_AS_ARGUMENT",
+      "source": "src_acme_pipeline_data_value_pipeline_transform_value_return_return",
+      "target": "src_acme_pipeline_data_value_pipeline_collect_value_parameter_v_159_160",
+      "source_file": "src/acme/Pipeline.java",
+      "source_location": "L3:C43",
+      "provenance": "STATIC_AST",
       "analysis_completeness": "COMPLETE_FOR_SUPPORTED_CONSTRUCT",
+      "receiver_confidence": "MAY",
       "argument_index": 0,
       "confidence_score": 1.0,
-      "key": "df:df9fb2307c8d9978fd3a27ef1054b56c113e9e3eea7ec82cae7f48ca180a32e0",
       "path_identity": [
         [
           "df:5b134f070cce187b3d1d764a18346e95028556a1f82578e377f4cb029223b35c",
@@ -178,114 +176,116 @@
           "df:138eb84fff5566fd7701c1b1ee77cb52099ad18324c7fa3d2a5ee60a639886b7",
           "df:df9fb2307c8d9978fd3a27ef1054b56c113e9e3eea7ec82cae7f48ca180a32e0"
         ]
-      ],
-      "provenance": "STATIC_AST",
-      "receiver_confidence": "MAY",
-      "relation": "PASSED_AS_ARGUMENT",
-      "source": "src_acme_pipeline_data_value_pipeline_transform_value_return_return",
-      "source_file": "src/acme/Pipeline.java",
-      "source_location": "L3:C43",
-      "target": "src_acme_pipeline_data_value_pipeline_collect_value_parameter_v_159_160"
+      ]
     }
   ],
-  "fingerprint": "35259f0cffdf5522498b71830c298376f6e0029ba51bfb40a646359ef674f192",
-  "format": "graphify.structural_evidence.v2",
   "paths": [
     {
-      "coverage": "COMPLETE_FOR_SUPPORTED_CONSTRUCT",
-      "exactness": "EXACT_FOR_RETURNED_PATH",
       "path_identity": [
         "df:5b134f070cce187b3d1d764a18346e95028556a1f82578e377f4cb029223b35c"
       ],
+      "supporting_evidence_keys": [
+        "df:5b134f070cce187b3d1d764a18346e95028556a1f82578e377f4cb029223b35c"
+      ],
+      "exactness": "EXACT_FOR_RETURNED_PATH",
       "receiver_confidence": "PROVEN",
-      "supporting_evidence_keys": [
-        "df:5b134f070cce187b3d1d764a18346e95028556a1f82578e377f4cb029223b35c"
-      ]
+      "coverage": "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
     },
     {
-      "coverage": "COMPLETE_FOR_SUPPORTED_CONSTRUCT",
-      "exactness": "EXACT_FOR_RETURNED_PATH",
       "path_identity": [
         "df:5b134f070cce187b3d1d764a18346e95028556a1f82578e377f4cb029223b35c",
         "df:df9fb2307c8d9978fd3a27ef1054b56c113e9e3eea7ec82cae7f48ca180a32e0"
       ],
-      "receiver_confidence": "MAY",
       "supporting_evidence_keys": [
         "df:5b134f070cce187b3d1d764a18346e95028556a1f82578e377f4cb029223b35c",
         "df:df9fb2307c8d9978fd3a27ef1054b56c113e9e3eea7ec82cae7f48ca180a32e0"
-      ]
+      ],
+      "exactness": "EXACT_FOR_RETURNED_PATH",
+      "receiver_confidence": "MAY",
+      "coverage": "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
     },
     {
-      "coverage": "COMPLETE_FOR_SUPPORTED_CONSTRUCT",
-      "exactness": "EXACT_FOR_RETURNED_PATH",
       "path_identity": [
         "df:a55f383e3667534c3b64293bb1847970536ee52a95be438d00465cacdccbcb65"
       ],
-      "receiver_confidence": "MAY",
       "supporting_evidence_keys": [
         "df:a55f383e3667534c3b64293bb1847970536ee52a95be438d00465cacdccbcb65"
-      ]
+      ],
+      "exactness": "EXACT_FOR_RETURNED_PATH",
+      "receiver_confidence": "MAY",
+      "coverage": "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
     },
     {
-      "coverage": "COMPLETE_FOR_SUPPORTED_CONSTRUCT",
-      "exactness": "EXACT_FOR_RETURNED_PATH",
       "path_identity": [
         "df:a55f383e3667534c3b64293bb1847970536ee52a95be438d00465cacdccbcb65",
         "df:138eb84fff5566fd7701c1b1ee77cb52099ad18324c7fa3d2a5ee60a639886b7"
       ],
-      "receiver_confidence": "MAY",
       "supporting_evidence_keys": [
         "df:a55f383e3667534c3b64293bb1847970536ee52a95be438d00465cacdccbcb65",
         "df:138eb84fff5566fd7701c1b1ee77cb52099ad18324c7fa3d2a5ee60a639886b7"
-      ]
+      ],
+      "exactness": "EXACT_FOR_RETURNED_PATH",
+      "receiver_confidence": "MAY",
+      "coverage": "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
     },
     {
-      "coverage": "COMPLETE_FOR_SUPPORTED_CONSTRUCT",
-      "exactness": "EXACT_FOR_RETURNED_PATH",
       "path_identity": [
         "df:a55f383e3667534c3b64293bb1847970536ee52a95be438d00465cacdccbcb65",
         "df:138eb84fff5566fd7701c1b1ee77cb52099ad18324c7fa3d2a5ee60a639886b7",
         "df:df9fb2307c8d9978fd3a27ef1054b56c113e9e3eea7ec82cae7f48ca180a32e0"
       ],
-      "receiver_confidence": "MAY",
       "supporting_evidence_keys": [
         "df:a55f383e3667534c3b64293bb1847970536ee52a95be438d00465cacdccbcb65",
         "df:138eb84fff5566fd7701c1b1ee77cb52099ad18324c7fa3d2a5ee60a639886b7",
         "df:df9fb2307c8d9978fd3a27ef1054b56c113e9e3eea7ec82cae7f48ca180a32e0"
-      ]
+      ],
+      "exactness": "EXACT_FOR_RETURNED_PATH",
+      "receiver_confidence": "MAY",
+      "coverage": "COMPLETE_FOR_SUPPORTED_CONSTRUCT"
     }
   ],
-  "provider_id": "graphify",
-  "query": {
-    "direction": "FORWARD",
-    "effective_allowed_relations": [
-      "FLOWS_TO",
-      "PASSED_AS_ARGUMENT",
-      "READ_FROM",
-      "RETURNED_AS",
-      "TRANSFORMED_BY",
-      "WRITTEN_TO"
-    ],
-    "max_depth": 6,
-    "max_expansions": 2000,
-    "max_paths": 50,
-    "rejected_relations": [],
-    "requested_allowed_relations": [
-      "FLOWS_TO",
-      "PASSED_AS_ARGUMENT",
-      "READ_FROM",
-      "RETURNED_AS",
-      "TRANSFORMED_BY",
-      "WRITTEN_TO"
-    ],
-    "start": "src_acme_pipeline_data_value_pipeline_run_value_parameter_in_52_54",
-    "stop_nodes": [],
-    "target": null
-  },
-  "schema_version": 2,
-  "source_revision_scope": {
-    "provider_id": "graphify",
-    "source_class": "git.commit",
-    "source_revision": "d4c843fd464174687015527401a3dd40799a1f70"
-  }
+  "blockers": [
+    {
+      "key": "bnd:4ade86583378383d49c7ba93be7f49d0e17717865bac175d5e587566b3da0094",
+      "diagnostic_key": "diag:src_acme_pipeline_cross_file_data_flow_result_1_l5_c38_171_184",
+      "resolution": "UNRESOLVED",
+      "reason": "callee_unresolved",
+      "reason_code": "callee_unresolved",
+      "canonical_caller_file": "src/acme/Pipeline.java",
+      "caller_location": "L5:C38:171-184",
+      "receiver_fqn": "acme.Result",
+      "method": "Result",
+      "arity": 1,
+      "import_context": "same_package",
+      "candidate_count": 0,
+      "receiver_confidence": "PROVEN",
+      "framework": "",
+      "capability": "cross_file_data_flow",
+      "diagnostic_kind": "cross_file_resolution",
+      "details": {
+        "type": "boundary_event",
+        "diagnostic_kind": "cross_file_resolution",
+        "capability": "cross_file_data_flow",
+        "framework": "",
+        "boundary_evidence_key": "bnd:4ade86583378383d49c7ba93be7f49d0e17717865bac175d5e587566b3da0094",
+        "diagnostic_node_id": "src_acme_pipeline_cross_file_data_flow_result_1_l5_c38_171_184",
+        "diagnostic_evidence_key": "diag:src_acme_pipeline_cross_file_data_flow_result_1_l5_c38_171_184",
+        "canonical_caller_file": "src/acme/Pipeline.java",
+        "caller_location": "L5:C38:171-184",
+        "resolution": "UNRESOLVED",
+        "reason": "callee_unresolved",
+        "receiver": "Result",
+        "receiver_fqn": "acme.Result",
+        "receiver_confidence": "PROVEN",
+        "method": "Result",
+        "arity": 1,
+        "import_context": "same_package",
+        "candidate_count": 0,
+        "repository_fqn": "",
+        "entity_fqn": "",
+        "mapping_target": ""
+      }
+    }
+  ],
+  "fingerprint": "6df625c426ff2d5f3ef5c04dc878e698e3afcda31717bbcbebccc3823afaaaef"
 }
